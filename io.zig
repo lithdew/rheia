@@ -11,13 +11,13 @@ const Submission = os.linux.io_uring_sqe;
 const Completion = os.linux.io_uring_cqe;
 const RingParams = os.linux.io_uring_params;
 
-pub const Waiter = struct {
-    node: std.TailQueue(void).Node = undefined,
-    result: ?isize = null,
-    frame: anyframe,
-};
-
 pub const Loop = struct {
+    pub const Waiter = struct {
+        node: std.TailQueue(void).Node = undefined,
+        result: ?isize = null,
+        frame: anyframe,
+    };
+
     ring: Ring,
 
     notifier: struct {
@@ -37,6 +37,7 @@ pub const Loop = struct {
         errdefer os.close(notifier_fd);
 
         self.* = .{ .ring = ring, .notifier = .{ .fd = notifier_fd } };
+        self.reset();
     }
 
     pub fn deinit(self: *Loop) void {
@@ -47,14 +48,12 @@ pub const Loop = struct {
         if (@atomicRmw(bool, &self.notifier.notified, .Xchg, true, .SeqCst)) {
             return;
         }
-        _ = os.write(self.fd, mem.asBytes(&@as(u64, 1))) catch {};
+        _ = os.write(self.notifier.fd, mem.asBytes(&@as(u64, 1))) catch {};
     }
 
     pub fn reset(self: *Loop) void {
-        if (!@atomicRmw(bool, &self.notifier.notified, .Xchg, false, .SeqCst)) {
-            return;
-        }
         _ = self.ring.read(0, self.notifier.fd, mem.asBytes(&self.notifier.buffer), 0) catch {};
+        @atomicStore(bool, &self.notifier.notified, false, .SeqCst);
     }
 
     pub fn run(self: *Loop) !void {
@@ -100,7 +99,7 @@ pub const Loop = struct {
     }
 
     pub fn read(self: *Loop, fd: os.fd_t, buffer: []u8, offset: u64) !usize {
-        var waiter: Waiter = .{ .frame = @frame() };
+        var waiter: Loop.Waiter = .{ .frame = @frame() };
 
         while (true) {
             var maybe_err: ?anyerror = null;
@@ -140,7 +139,7 @@ pub const Loop = struct {
     }
 
     pub fn recv(self: *Loop, fd: os.socket_t, buffer: []u8, flags: u32) !usize {
-        var waiter: Waiter = .{ .frame = @frame() };
+        var waiter: Loop.Waiter = .{ .frame = @frame() };
 
         while (true) {
             var maybe_err: ?anyerror = null;
@@ -190,7 +189,7 @@ pub const Loop = struct {
         if (set.contains(.close_on_exec)) raw_flags |= os.SOCK_CLOEXEC;
         if (set.contains(.nonblocking)) raw_flags |= os.SOCK_NONBLOCK;
 
-        var waiter: Waiter = .{ .frame = @frame() };
+        var waiter: Loop.Waiter = .{ .frame = @frame() };
 
         while (true) {
             var maybe_err: ?anyerror = null;
