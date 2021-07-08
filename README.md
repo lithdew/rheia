@@ -3,6 +3,7 @@
 A blockchain written in [Zig](https://ziglang.org).
 
 ## design
+
 ### concurrency
 - thread-per-core architecture (thread pools for cpu-bound work, and i/o bound work)
 - async disk and network i/o using io_uring (multi-threaded event loop)
@@ -31,6 +32,7 @@ A blockchain written in [Zig](https://ziglang.org).
 
 ### smart contracts
 - ebpf? webassembly?
+
 ## getting started
 
 ```

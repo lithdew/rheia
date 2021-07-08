@@ -1,6 +1,8 @@
 const std = @import("std");
 
 const os = std.os;
+const ip = std.x.net.ip;
+
 const mem = std.mem;
 const testing = std.testing;
 
@@ -10,6 +12,23 @@ const Ring = os.linux.IO_Uring;
 const Submission = os.linux.io_uring_sqe;
 const Completion = os.linux.io_uring_cqe;
 const RingParams = os.linux.io_uring_params;
+
+pub const Worker = struct {
+    loop: Loop,
+
+    pub fn init(self: *Worker) !void {
+        try self.loop.init(null);
+        errdefer self.loop.deinit();
+    }
+
+    pub fn deinit(self: *Worker) void {
+        self.loop.deinit();
+    }
+
+    pub fn run(self: *Worker) !void {
+        try self.loop.run();
+    }
+};
 
 pub const Loop = struct {
     pub const Waiter = struct {
@@ -109,7 +128,7 @@ pub const Loop = struct {
                     _ = self.ring.read(@ptrToInt(&waiter), fd, buffer, offset) catch |err| {
                         self.submissions.append(&waiter.node);
                         switch (err) {
-                            error.SubmissionQueueFull => break :blk null,
+                            error.SubmissionQueueFull => {},
                             else => break :blk err,
                         }
                         break :blk null;
@@ -149,7 +168,7 @@ pub const Loop = struct {
                     _ = self.ring.recv(@ptrToInt(&waiter), fd, buffer, flags) catch |err| {
                         self.submissions.append(&waiter.node);
                         switch (err) {
-                            error.SubmissionQueueFull => break :blk null,
+                            error.SubmissionQueueFull => {},
                             else => break :blk err,
                         }
                     };
@@ -179,6 +198,111 @@ pub const Loop = struct {
         }
     }
 
+    pub fn send(self: *Loop, fd: os.socket_t, buffer: []const u8, flags: u32) !usize {
+        var waiter: Loop.Waiter = .{ .frame = @frame() };
+
+        while (true) {
+            var maybe_err: ?anyerror = null;
+
+            suspend {
+                maybe_err = blk: {
+                    _ = self.ring.send(@ptrToInt(&waiter), fd, buffer, flags) catch |err| {
+                        switch (err) {
+                            error.SubmissionQueueFull => {},
+                            else => break :blk err,
+                        }
+                    };
+                    break :blk null;
+                };
+            }
+
+            if (maybe_err) |err| return err;
+
+            const result = waiter.result orelse continue;
+            if (result < 0) {
+                return switch (-result) {
+                    os.EACCES => error.AccessDenied,
+                    os.EAGAIN => error.WouldBlock,
+                    os.EALREADY => error.FastOpenAlreadyInProgress,
+                    os.EBADF => unreachable, // always a race condition
+                    os.ECONNRESET => error.ConnectionResetByPeer,
+                    os.EDESTADDRREQ => unreachable, // The socket is not connection-mode, and no peer address is set.
+                    os.EFAULT => unreachable, // An invalid user space address was specified for an argument.
+                    os.EINTR => continue,
+                    os.EINVAL => unreachable, // Invalid argument passed.
+                    os.EISCONN => unreachable, // connection-mode socket was connected already but a recipient was specified
+                    os.EMSGSIZE => error.MessageTooBig,
+                    os.ENOBUFS => error.SystemResources,
+                    os.ENOMEM => error.SystemResources,
+                    os.ENOTSOCK => unreachable, // The file descriptor sockfd does not refer to a socket.
+                    os.EOPNOTSUPP => unreachable, // Some bit in the flags argument is inappropriate for the socket type.
+                    os.EPIPE => error.BrokenPipe,
+                    os.EAFNOSUPPORT => error.AddressFamilyNotSupported,
+                    os.ELOOP => error.SymLinkLoop,
+                    os.ENAMETOOLONG => error.NameTooLong,
+                    os.ENOENT => error.FileNotFound,
+                    os.ENOTDIR => error.NotDir,
+                    os.EHOSTUNREACH => error.NetworkUnreachable,
+                    os.ENETUNREACH => error.NetworkUnreachable,
+                    os.ENOTCONN => error.SocketNotConnected,
+                    os.ENETDOWN => error.NetworkSubsystemFailed,
+                    else => |err| os.unexpectedErrno(err),
+                };
+            }
+            return @intCast(usize, result);
+        }
+    }
+
+    pub fn connect(self: *Loop, fd: os.socket_t, address: Socket.Address) !void {
+        var waiter: Loop.Waiter = .{ .frame = @frame() };
+
+        while (true) {
+            var maybe_err: ?anyerror = null;
+
+            suspend {
+                maybe_err = blk: {
+                    _ = self.ring.connect(@ptrToInt(&waiter), fd, @ptrCast(*const os.sockaddr, &address.toNative()), address.getNativeSize()) catch |err| {
+                        self.submissions.append(&waiter.node);
+                        switch (err) {
+                            error.SubmissionQueueFull => {},
+                            else => break :blk err,
+                        }
+                    };
+                    break :blk null;
+                };
+            }
+
+            if (maybe_err) |err| return err;
+
+            const result = waiter.result orelse continue;
+            if (result < 0) {
+                return switch (-result) {
+                    os.EACCES => error.PermissionDenied,
+                    os.EPERM => error.PermissionDenied,
+                    os.EADDRINUSE => error.AddressInUse,
+                    os.EADDRNOTAVAIL => error.AddressNotAvailable,
+                    os.EAFNOSUPPORT => error.AddressFamilyNotSupported,
+                    os.EAGAIN, os.EINPROGRESS => error.WouldBlock,
+                    os.EALREADY => error.ConnectionPending,
+                    os.EBADF => unreachable, // sockfd is not a valid open file descriptor.
+                    os.ECONNREFUSED => error.ConnectionRefused,
+                    os.ECONNRESET => error.ConnectionResetByPeer,
+                    os.EFAULT => unreachable, // The socket structure address is outside the user's address space.
+                    os.EINTR => continue,
+                    os.EISCONN => unreachable, // The socket is already connected.
+                    os.ENETUNREACH => error.NetworkUnreachable,
+                    os.ENOTSOCK => unreachable, // The file descriptor sockfd does not refer to a socket.
+                    os.EPROTOTYPE => unreachable, // The socket type does not support the requested communications protocol.
+                    os.ETIMEDOUT => error.ConnectionTimedOut,
+                    os.ENOENT => error.FileNotFound, // Returned when socket is AF_UNIX and the given path does not exist.
+                    else => |err| os.unexpectedErrno(err),
+                };
+            }
+
+            return;
+        }
+    }
+
     pub fn accept(self: *Loop, fd: os.socket_t, flags: std.enums.EnumFieldStruct(Socket.InitFlags, bool, false)) !Socket.Connection {
         const set = std.EnumSet(Socket.InitFlags).init(flags);
 
@@ -199,7 +323,7 @@ pub const Loop = struct {
                     _ = self.ring.accept(@ptrToInt(&waiter), fd, @ptrCast(*os.sockaddr, &address), &address_len, raw_flags) catch |err| {
                         self.submissions.append(&waiter.node);
                         switch (err) {
-                            error.SubmissionQueueFull => break :blk null,
+                            error.SubmissionQueueFull => {},
                             else => break :blk err,
                         }
                     };
