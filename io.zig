@@ -6,7 +6,10 @@ const ip = std.x.net.ip;
 const mem = std.mem;
 const testing = std.testing;
 
+const assert = std.debug.assert;
+
 const Socket = std.x.os.Socket;
+const Atomic = std.atomic.Atomic;
 
 const Ring = os.linux.IO_Uring;
 const Submission = os.linux.io_uring_sqe;
@@ -14,19 +17,39 @@ const Completion = os.linux.io_uring_cqe;
 const RingParams = os.linux.io_uring_params;
 
 pub const Worker = struct {
+    const log = std.log.scoped(.io_worker);
+
+    shutdown_requested: Atomic(bool) = .{ .value = false },
     loop: Loop,
 
     pub fn init(self: *Worker) !void {
-        try self.loop.init(null);
-        errdefer self.loop.deinit();
+        var loop: Loop = undefined;
+        try loop.init(null);
+        errdefer loop.deinit();
+
+        self.* = .{ .loop = loop };
     }
 
     pub fn deinit(self: *Worker) void {
         self.loop.deinit();
     }
 
+    pub fn shutdown(self: *Worker) void {
+        self.shutdown_requested.store(true, .Release);
+        self.loop.notify();
+    }
+
     pub fn run(self: *Worker) !void {
-        try self.loop.run();
+        defer log.debug("worker {} is done", .{std.Thread.getCurrentId()});
+
+        log.debug("worker {} started", .{std.Thread.getCurrentId()});
+
+        while (true) {
+            try self.loop.poll();
+            if (self.shutdown_requested.load(.Acquire)) {
+                break;
+            }
+        }
     }
 };
 
@@ -40,19 +63,20 @@ pub const Loop = struct {
     ring: Ring,
 
     notifier: struct {
-        notified: bool = false,
+        notified: Atomic(bool) = .{ .value = false },
         buffer: u64 = undefined,
         fd: os.fd_t,
     },
 
     submissions: std.TailQueue(void) = .{},
     completions: std.TailQueue(void) = .{},
+    pending: usize = 0,
 
     pub fn init(self: *Loop, maybe_params: ?*RingParams) !void {
         var ring = try if (maybe_params) |params| Ring.init_params(256, params) else Ring.init(256, 0);
         errdefer ring.deinit();
 
-        const notifier_fd = try os.eventfd(0, 0);
+        const notifier_fd = try os.eventfd(0, os.O_CLOEXEC);
         errdefer os.close(notifier_fd);
 
         self.* = .{ .ring = ring, .notifier = .{ .fd = notifier_fd } };
@@ -64,57 +88,65 @@ pub const Loop = struct {
     }
 
     pub fn notify(self: *Loop) void {
-        if (@atomicRmw(bool, &self.notifier.notified, .Xchg, true, .SeqCst)) {
+        if (self.notifier.notified.swap(true, .AcqRel)) return;
+
+        const bytes_written = os.write(self.notifier.fd, mem.asBytes(&@as(u64, 1))) catch {
+            self.notifier.notified.store(false, .Release);
             return;
-        }
-        _ = os.write(self.notifier.fd, mem.asBytes(&@as(u64, 1))) catch {};
+        };
+
+        assert(bytes_written == @sizeOf(u64));
     }
 
     pub fn reset(self: *Loop) void {
         _ = self.ring.read(0, self.notifier.fd, mem.asBytes(&self.notifier.buffer), 0) catch {};
-        @atomicStore(bool, &self.notifier.notified, false, .SeqCst);
+        self.notifier.notified.store(false, .Release);
     }
 
-    pub fn run(self: *Loop) !void {
+    pub fn poll(self: *Loop) !void {
         var completions: [256]Completion = undefined;
 
-        while (true) {
-            const wait_count: u32 = if (self.submissions.len == 0 and self.completions.len == 0) 1 else 0;
+        self.pending += self.ring.submit_and_wait(wait_count: {
+            if (self.submissions.len > 0 or self.completions.len > 0 or self.ring.cq_ready() > 0) {
+                break :wait_count 0;
+            }
+            break :wait_count 1;
+        }) catch |err| switch (err) {
+            error.CompletionQueueOvercommitted, error.SystemResources => 0,
+            error.SignalInterrupt => return,
+            else => return err,
+        };
 
-            _ = self.ring.submit_and_wait(wait_count) catch |err| switch (err) {
-                error.SignalInterrupt => continue,
-                error.CompletionQueueOvercommitted, error.SystemResources => {},
-                else => return err,
-            };
-
-            const completion_count = try self.ring.copy_cqes(&completions, 0);
-            for (completions[0..completion_count]) |completion| {
-                if (completion.user_data == 0) {
-                    self.reset();
-                    continue;
-                }
-
-                const waiter = @intToPtr(*Waiter, completion.user_data);
-                waiter.result = completion.res;
-
-                self.completions.append(&waiter.node);
+        const completion_count = try self.ring.copy_cqes(&completions, 0);
+        for (completions[0..completion_count]) |completion| {
+            if (completion.user_data == 0) {
+                self.pending -= 1;
+                self.reset();
+                continue;
             }
 
-            var it: std.TailQueue(void) = .{};
-            mem.swap(std.TailQueue(void), &it, &self.submissions);
-            const process_more_submissions = it.len > 0;
-            while (it.popFirst()) |node| {
-                const waiter = @fieldParentPtr(Waiter, "node", node);
-                resume waiter.frame;
-            }
-            if (process_more_submissions) continue;
+            const waiter = @intToPtr(*Waiter, completion.user_data);
+            waiter.result = completion.res;
 
-            mem.swap(std.TailQueue(void), &it, &self.completions);
-            while (it.popFirst()) |node| {
-                const waiter = @fieldParentPtr(Waiter, "node", node);
-                resume waiter.frame;
-            }
+            self.completions.append(&waiter.node);
         }
+
+        var it: std.TailQueue(void) = .{};
+        mem.swap(std.TailQueue(void), &it, &self.submissions);
+        const num_submissions = it.len;
+        while (it.popFirst()) |node| {
+            const waiter = @fieldParentPtr(Waiter, "node", node);
+            resume waiter.frame;
+        }
+        if (num_submissions > 0) return;
+
+        mem.swap(std.TailQueue(void), &it, &self.completions);
+        const num_completions = it.len;
+        while (it.popFirst()) |node| {
+            const waiter = @fieldParentPtr(Waiter, "node", node);
+            resume waiter.frame;
+        }
+        self.pending -= num_completions;
     }
 
     pub fn read(self: *Loop, fd: os.fd_t, buffer: []u8, offset: u64) !usize {
@@ -131,8 +163,8 @@ pub const Loop = struct {
                             error.SubmissionQueueFull => {},
                             else => break :blk err,
                         }
-                        break :blk null;
                     };
+                    break :blk null;
                 };
             }
             if (maybe_err) |err| return err;
@@ -207,6 +239,7 @@ pub const Loop = struct {
             suspend {
                 maybe_err = blk: {
                     _ = self.ring.send(@ptrToInt(&waiter), fd, buffer, flags) catch |err| {
+                        self.submissions.append(&waiter.node);
                         switch (err) {
                             error.SubmissionQueueFull => {},
                             else => break :blk err,
