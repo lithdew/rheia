@@ -75,15 +75,13 @@ pub fn sizeOf(T: anytype) usize {
     if (comptime @TypeOf(T) != type) {
         if (comptime meta.trait.isZigString(@TypeOf(T))) {
             return T.len;
-        } else if (comptime meta.trait.isIntegral(@TypeOf(T))) {
-            return T;
         }
         return sizeOf(@TypeOf(T));
     }
 
     if (comptime @typeInfo(T) == .Enum) {
         return @sizeOf(@typeInfo(T).Enum.child);
-    } else if (comptime meta.trait.isIntegral(T)) {
+    } else if (comptime @typeInfo(T) == .Int) {
         return @sizeOf(T);
     } else if (comptime @typeInfo(T) == .Array and @typeInfo(T).Array.child == u8) {
         return @sizeOf(T);
@@ -114,7 +112,7 @@ pub fn sliceOf(val: anytype) []const u8 {
     const T = @TypeOf(val);
     if (comptime meta.trait.is(.Enum)(T)) {
         return mem.asBytes(&mem.nativeToLittle(@TypeOf(@enumToInt(val)), @enumToInt(val)));
-    } else if (comptime meta.trait.isIntegral(T)) {
+    } else if (comptime @typeInfo(T) == .Int) {
         return mem.asBytes(&mem.nativeToLittle(T, val));
     } else if (comptime @typeInfo(T) == .Array and @typeInfo(T).Array.child == u8) {
         return &val;
@@ -141,10 +139,10 @@ pub fn writeAll(dst: Buffer, vals: anytype) !Buffer {
 }
 
 test "sizeOfAll" {
-    try testing.expectEqual(@as(usize, 32 + 64 + 4), sizeOfAll(.{ 32, 64, 4 }));
+    try testing.expectEqual(@as(usize, 32 + 64 + 4), sizeOfAll(.{ @as([32]u8, undefined), @as([64]u8, undefined), @as(u32, undefined) }));
     try testing.expectEqual(@as(usize, 32 + 64 + 4), sizeOfAll(.{ [32]u8, [64]u8, u32 }));
     try testing.expectEqual(@as(usize, 32 + 64 + 4), sizeOfAll(.{ .sender = [32]u8, .signature = [64]u8, .data_len = u32 }));
-    try testing.expectEqual(@as(usize, 32 + 64 + 4), sizeOfAll(.{ .sender = [32]u8, .signature = [64]u8, .data_len = 4 }));
+    try testing.expectEqual(@as(usize, 32 + 64 + 4), sizeOfAll(.{ .sender = [32]u8, .signature = [64]u8, .data_len = @as(u32, 4) }));
     try testing.expectEqual(@as(usize, 32 + 64 + 4), sizeOfAll(struct { sender: [32]u8, signature: [64]u8, data_len: u32 }));
     try testing.expectEqual(@as(usize, 32 + 64 + 4), sizeOfAll(.{ .sender = [32]u8, .signature = [64]u8, .random_text = "abcd" }));
 }
