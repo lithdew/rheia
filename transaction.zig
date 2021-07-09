@@ -17,15 +17,6 @@ pub const Transaction = struct {
         created_at: u64,
         tag: Transaction.Tag,
         data: []const u8,
-
-        pub fn append(dst: Buffer, self: Transaction.Data) !Buffer {
-            return writeAll(dst, .{
-                self.sender_nonce,
-                self.created_at,
-                self.tag,
-                self.data,
-            });
-        }
     };
 
     id: [32]u8,
@@ -33,7 +24,7 @@ pub const Transaction = struct {
 
     pub fn signAndAppend(dst: Buffer, keys: Ed25519.KeyPair, data: Transaction.Data) !Buffer {
         const header_size = sizeOfAll(.{ .sender = [32]u8, .signature = [64]u8, .data_len = u32 });
-        const body = try Transaction.Data.append((try dst.allocate(header_size)).sliceFromEnd(), data);
+        const body = try writeAll((try dst.allocate(header_size)).sliceFromEnd(), data);
 
         const header = try writeAll(dst, .{
             .sender = keys.public_key,
@@ -51,12 +42,12 @@ test "transaction: sign and append" {
     var dst = std.ArrayList(u8).init(testing.allocator);
     defer dst.deinit();
 
-    const body = try Transaction.signAndAppend(Buffer.from(&dst), keys, .{
+    const slice = try Transaction.signAndAppend(Buffer.from(&dst), keys, .{
         .sender_nonce = 123,
         .created_at = 456,
         .tag = .no_op,
         .data = "abcedfghijklmnopqrstuvwxyz",
     });
 
-    _ = body;
+    _ = slice;
 }
