@@ -46,7 +46,7 @@ pub const Worker = struct {
 
         while (true) {
             try self.loop.poll();
-            if (self.shutdown_requested.load(.Acquire)) {
+            if (self.shutdown_requested.load(.Acquire) and self.loop.pending == 0) {
                 break;
             }
         }
@@ -107,7 +107,7 @@ pub const Loop = struct {
         var completions: [256]Completion = undefined;
 
         self.pending += self.ring.submit_and_wait(wait_count: {
-            if (self.submissions.len > 0 or self.completions.len > 0 or self.ring.cq_ready() > 0) {
+            if (self.submissions.len > 0 or self.completions.len > 0) {
                 break :wait_count 0;
             }
             break :wait_count 1;
