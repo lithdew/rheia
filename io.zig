@@ -63,7 +63,6 @@ pub const Loop = struct {
     ring: Ring,
 
     notifier: struct {
-        notified: Atomic(bool) = .{ .value = true },
         rearm_required: bool = false,
         buffer: u64 = undefined,
         fd: os.fd_t,
@@ -89,19 +88,11 @@ pub const Loop = struct {
     }
 
     pub fn notify(self: *Loop) void {
-        if (self.notifier.notified.swap(true, .AcqRel)) return;
-
-        const bytes_written = os.write(self.notifier.fd, mem.asBytes(&@as(u64, 1))) catch {
-            self.notifier.notified.store(false, .Release);
-            return;
-        };
-
+        const bytes_written = os.write(self.notifier.fd, mem.asBytes(&@as(u64, 1))) catch unreachable;
         assert(bytes_written == @sizeOf(u64));
     }
 
     pub fn reset(self: *Loop) void {
-        if (!self.notifier.notified.swap(false, .AcqRel)) return;
-
         _ = self.ring.read(0, self.notifier.fd, mem.asBytes(&self.notifier.buffer), 0) catch {};
     }
 
