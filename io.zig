@@ -63,7 +63,8 @@ pub const Loop = struct {
     ring: Ring,
 
     notifier: struct {
-        notified: Atomic(bool) = .{ .value = false },
+        notified: Atomic(bool) = .{ .value = true },
+        rearm_required: bool = false,
         buffer: u64 = undefined,
         fd: os.fd_t,
     },
@@ -99,8 +100,9 @@ pub const Loop = struct {
     }
 
     pub fn reset(self: *Loop) void {
+        if (!self.notifier.notified.swap(false, .AcqRel)) return;
+
         _ = self.ring.read(0, self.notifier.fd, mem.asBytes(&self.notifier.buffer), 0) catch {};
-        self.notifier.notified.store(false, .Release);
     }
 
     pub fn poll(self: *Loop) !void {
@@ -109,6 +111,10 @@ pub const Loop = struct {
         self.pending += self.ring.submit_and_wait(wait_count: {
             if (self.submissions.len > 0 or self.completions.len > 0) {
                 break :wait_count 0;
+            }
+            if (self.notifier.rearm_required) {
+                self.notifier.rearm_required = false;
+                self.reset();
             }
             break :wait_count 1;
         }) catch |err| switch (err) {
@@ -120,8 +126,8 @@ pub const Loop = struct {
         const completion_count = try self.ring.copy_cqes(&completions, 0);
         for (completions[0..completion_count]) |completion| {
             if (completion.user_data == 0) {
+                self.notifier.rearm_required = true;
                 self.pending -= 1;
-                self.reset();
                 continue;
             }
 
@@ -183,6 +189,48 @@ pub const Loop = struct {
                     os.ECONNREFUSED => error.ConnectionRefused,
                     os.ECONNRESET => error.ConnectionResetByPeer,
                     else => |err| os.unexpectedErrno(err),
+                };
+            }
+            return @intCast(usize, result);
+        }
+    }
+
+    pub fn write(self: *Loop, fd: os.fd_t, buffer: []const u8, offset: u64) !usize {
+        var waiter: Loop.Waiter = .{ .frame = @frame() };
+
+        while (true) {
+            var maybe_err: ?anyerror = null;
+
+            suspend {
+                maybe_err = blk: {
+                    _ = self.ring.write(@ptrToInt(&waiter), fd, buffer, offset) catch |err| {
+                        self.submissions.append(&waiter.node);
+                        switch (err) {
+                            error.SubmissionQueueFull => {},
+                            else => break :blk err,
+                        }
+                    };
+                    break :blk null;
+                };
+            }
+
+            const result = waiter.result orelse continue;
+            if (result < 0) {
+                return switch (-result) {
+                    os.EINTR => continue,
+                    os.EINVAL => unreachable,
+                    os.EFAULT => unreachable,
+                    os.EAGAIN => return error.WouldBlock,
+                    os.EBADF => return error.NotOpenForWriting, // can be a race condition.
+                    os.EDESTADDRREQ => unreachable, // `connect` was never called.
+                    os.EDQUOT => return error.DiskQuota,
+                    os.EFBIG => return error.FileTooBig,
+                    os.EIO => return error.InputOutput,
+                    os.ENOSPC => return error.NoSpaceLeft,
+                    os.EPERM => return error.AccessDenied,
+                    os.EPIPE => return error.BrokenPipe,
+                    os.ECONNRESET => return error.ConnectionResetByPeer,
+                    else => |err| return os.unexpectedErrno(err),
                 };
             }
             return @intCast(usize, result);
