@@ -6,6 +6,8 @@ const ip = std.x.net.ip;
 const mem = std.mem;
 const testing = std.testing;
 
+const spsc = @import("spsc.zig");
+
 const assert = std.debug.assert;
 
 const Socket = std.x.os.Socket;
@@ -17,21 +19,48 @@ const Completion = os.linux.io_uring_cqe;
 const RingParams = os.linux.io_uring_params;
 
 pub const Worker = struct {
+    pub const TaskQueue = spsc.UnboundedQueue(*Worker.Task);
+
+    pub const Task = struct {
+        runFn: fn (*Task) void,
+    };
+
     const log = std.log.scoped(.io_worker);
 
-    shutdown_requested: Atomic(bool) = .{ .value = false },
+    id: usize,
     loop: Loop,
+    task_queues: std.ArrayListUnmanaged(TaskQueue) = .{},
 
-    pub fn init(self: *Worker) !void {
+    shutdown_requested: Atomic(bool) = .{ .value = false },
+
+    pub fn init(self: *Worker, gpa: *mem.Allocator, count: usize, id: usize) !void {
         var loop: Loop = undefined;
         try loop.init(null);
         errdefer loop.deinit();
 
-        self.* = .{ .loop = loop };
+        var task_queues = try std.ArrayListUnmanaged(TaskQueue).initCapacity(gpa, count - 1);
+        errdefer task_queues.deinit(gpa);
+
+        var task_queue_index: usize = 0;
+        errdefer for (task_queues.items[0..task_queue_index]) |*task_queue| task_queue.deinit(gpa);
+
+        while (task_queue_index < count - 1) : (task_queue_index += 1) {
+            task_queues.addOneAssumeCapacity().* = try TaskQueue.init(gpa);
+        }
+
+        self.* = .{
+            .id = id,
+            .loop = loop,
+            .task_queues = task_queues,
+        };
     }
 
-    pub fn deinit(self: *Worker) void {
+    pub fn deinit(self: *Worker, gpa: *mem.Allocator) void {
         self.loop.deinit();
+        for (self.task_queues.items) |*task_queue| {
+            task_queue.deinit(gpa);
+        }
+        self.task_queues.deinit(gpa);
     }
 
     pub fn shutdown(self: *Worker) void {
@@ -39,13 +68,34 @@ pub const Worker = struct {
         self.loop.notify();
     }
 
-    pub fn run(self: *Worker) !void {
-        defer log.debug("worker {} is done", .{std.Thread.getCurrentId()});
+    pub fn pollTaskQueues(self: *Worker) usize {
+        var attempts: usize = 0;
+        var num_tasks_processed: usize = 0;
 
-        log.debug("worker {} started", .{std.Thread.getCurrentId()});
+        while (attempts < 128) : (attempts += 1) {
+            var num_tasks_processed_in_attempt: usize = 0;
+
+            for (self.task_queues.items) |*task_queue| {
+                const task = task_queue.pop() orelse continue;
+                num_tasks_processed_in_attempt += 1;
+                task.runFn(task);
+            }
+
+            if (num_tasks_processed_in_attempt == 0) break;
+            num_tasks_processed += num_tasks_processed_in_attempt;
+        }
+
+        return num_tasks_processed;
+    }
+
+    pub fn run(self: *Worker) !void {
+        defer log.debug("worker {} is done", .{self.id});
+
+        log.debug("worker {} started", .{self.id});
 
         while (true) {
-            try self.loop.poll();
+            const num_tasks_processed = self.pollTaskQueues();
+            try self.loop.poll(if (num_tasks_processed > 0) .nonblocking else .blocking);
             if (self.shutdown_requested.load(.Acquire) and self.loop.pending == 0) {
                 break;
             }
@@ -96,7 +146,7 @@ pub const Loop = struct {
         _ = self.ring.read(0, self.notifier.fd, mem.asBytes(&self.notifier.buffer), 0) catch {};
     }
 
-    pub fn poll(self: *Loop) !void {
+    pub fn poll(self: *Loop, method: enum(u32) { blocking = 1, nonblocking = 0 }) !void {
         var completions: [256]Completion = undefined;
 
         self.pending += self.ring.submit_and_wait(wait_count: {
@@ -107,7 +157,7 @@ pub const Loop = struct {
                 self.notifier.rearm_required = false;
                 self.reset();
             }
-            break :wait_count 1;
+            break :wait_count @enumToInt(method);
         }) catch |err| switch (err) {
             error.CompletionQueueOvercommitted, error.SystemResources => 0,
             error.SignalInterrupt => return,

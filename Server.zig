@@ -9,14 +9,11 @@ const Runtime = @import("Runtime.zig");
 
 const Server = @This();
 
-connections: struct {
-    lock: std.Thread.Mutex = .{},
-    entries: std.AutoArrayHashMapUnmanaged(*@Frame(Server.serveConnection), tcp.Connection) = .{},
-},
+connections: std.AutoArrayHashMapUnmanaged(*@Frame(Server.serveConnection), tcp.Connection) = .{},
 
 live_connections: struct {
-    count: Atomic(usize) = .{ .value = 0 },
-    waiter: Atomic(usize) = .{ .value = 0 },
+    count: usize = 0,
+    waiter: ?anyframe = null,
 },
 
 pub fn init() Server {
@@ -24,22 +21,19 @@ pub fn init() Server {
 }
 
 pub fn deinit(self: *Server, gpa: *mem.Allocator) void {
-    self.connections.entries.deinit(gpa);
+    self.connections.deinit(gpa);
 }
 
 pub fn shutdown(self: *Server) void {
-    const held = self.connections.lock.acquire();
-    defer held.release();
-
-    var it = self.connections.entries.iterator();
+    var it = self.connections.iterator();
     while (it.next()) |entry| {
         entry.value_ptr.client.shutdown(.recv) catch {};
     }
 }
 
-pub fn waitForShutdown(self: *Server) void {
-    while (self.live_connections.count.load(.Monotonic) > 0) {
-        suspend self.live_connections.waiter.store(@ptrToInt(@frame()), .Release);
+pub fn waitForShutdown(self: *Server) callconv(.Async) void {
+    if (self.live_connections.count > 0) {
+        suspend self.live_connections.waiter = @frame();
     }
 }
 
@@ -71,7 +65,18 @@ pub fn serve(self: *Server, runtime: *Runtime, listener: tcp.Listener) !void {
 fn serveConnection(self: *Server, runtime: *Runtime, io_worker_index: usize, conn: tcp.Connection) !void {
     defer {
         conn.deinit();
-        suspend self.deregister(&runtime.gpa.allocator, @frame());
+
+        suspend {
+            runtime.runOnWorker(io_worker_index, 0, struct {
+                server_: *Server,
+                gpa_: *mem.Allocator,
+                frame_: *@Frame(Server.serveConnection),
+
+                pub fn run(self_: @This()) void {
+                    return self_.server_.deregister(self_.gpa_, self_.frame_);
+                }
+            }{ .server_ = self, .gpa_ = &runtime.gpa.allocator, .frame_ = @frame() });
+        }
     }
 
     log.debug("new peer connected: {}", .{conn.address});
@@ -88,31 +93,23 @@ fn serveConnection(self: *Server, runtime: *Runtime, io_worker_index: usize, con
 }
 
 fn register(self: *Server, gpa: *mem.Allocator, frame: *@Frame(Server.serveConnection), conn: tcp.Connection) !void {
-    const held = self.connections.lock.acquire();
-    defer held.release();
-
-    try self.connections.entries.put(gpa, frame, conn);
-    _ = self.live_connections.count.fetchAdd(1, .Monotonic);
+    try self.connections.put(gpa, frame, conn);
+    self.live_connections.count += 1;
 }
 
 fn deregister(self: *Server, gpa: *mem.Allocator, frame: *@Frame(Server.serveConnection)) void {
-    const maybe_waiter = grab: {
-        const held = self.connections.lock.acquire();
-        defer held.release();
-
-        if (self.connections.entries.swapRemove(frame)) {
-            gpa.destroy(frame);
-
-            if (self.live_connections.count.fetchSub(1, .Release) == 1) {
-                const maybe_waiter = self.live_connections.waiter.swap(0, .Release);
-                if (maybe_waiter != 0) break :grab maybe_waiter;
-            }
-        }
-
-        break :grab null;
-    };
-
-    if (maybe_waiter) |waiter| {
-        resume @intToPtr(anyframe, waiter);
+    if (!self.connections.swapRemove(frame)) {
+        return;
     }
+    gpa.destroy(frame);
+
+    self.live_connections.count -= 1;
+    if (self.live_connections.count > 0) {
+        return;
+    }
+
+    const waiter = self.live_connections.waiter orelse return;
+    self.live_connections.waiter = null;
+
+    resume waiter;
 }

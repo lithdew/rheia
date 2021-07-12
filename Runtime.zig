@@ -1,8 +1,10 @@
 const std = @import("std");
 
 const os = std.os;
-const io = @import("io.zig");
 const mem = std.mem;
+const builtin = std.builtin;
+
+const io = @import("io.zig");
 
 const assert = std.debug.assert;
 
@@ -25,8 +27,8 @@ pub fn init() !Runtime {
 
     runtime.gpa = .{};
 
-    runtime.worker_count = try std.Thread.getCpuCount();
-    if (runtime.worker_count <= 1) return error.SingleThreaded;
+    runtime.worker_count = if (builtin.single_threaded) 1 else try std.Thread.getCpuCount();
+    if (runtime.worker_count == 0) return error.NoWorkers;
 
     try runtime.initSignalHandler();
     try runtime.initIoWorkers(runtime.worker_count);
@@ -37,7 +39,9 @@ pub fn init() !Runtime {
 pub fn deinit(self: *Runtime) void {
     self.io_worker_threads.deinit(&self.gpa.allocator);
 
-    for (self.io_workers.items) |*io_worker| io_worker.deinit();
+    for (self.io_workers.items) |*io_worker| {
+        io_worker.deinit(&self.gpa.allocator);
+    }
     self.io_workers.deinit(&self.gpa.allocator);
 
     assert(!self.gpa.deinit());
@@ -71,6 +75,27 @@ pub fn waitForSignal(self: *Runtime) !void {
     }
 }
 
+pub fn runOnWorker(self: *Runtime, from: usize, to: usize, closure: anytype) void {
+    const State = @TypeOf(closure);
+
+    if (from == to) return closure.run();
+
+    var runnable: struct {
+        state: if (State == type) void else State,
+        task: io.Worker.Task = .{ .runFn = run },
+
+        pub fn run(task: *io.Worker.Task) void {
+            if (comptime State == type) {
+                return State.run();
+            }
+            return @fieldParentPtr(@This(), "task", task).state.run();
+        }
+    } = .{ .state = if (comptime State == type) @as(void, {}) else closure };
+
+    self.io_workers.items[to].task_queues.items[if (from > to) from - 1 else 0].push(&self.gpa.allocator, &runnable.task) catch unreachable;
+    self.io_workers.items[to].loop.notify();
+}
+
 fn initSignalHandler(self: *Runtime) !void {
     self.signal.set = mem.zeroes(os.sigset_t);
     os.system.sigaddset(&self.signal.set, os.SIGINT);
@@ -95,14 +120,18 @@ fn initIoWorkers(self: *Runtime, count: usize) !void {
     errdefer self.io_worker_threads.deinit(&self.gpa.allocator);
 
     var index: usize = 0;
-    errdefer for (self.io_workers.items[0..index]) |*io_worker| io_worker.deinit();
+    errdefer for (self.io_workers.items[0..index]) |*io_worker| io_worker.deinit(&self.gpa.allocator);
 
     while (index < count) : (index += 1) {
-        try self.io_workers.addOneAssumeCapacity().init();
+        try self.io_workers.addOneAssumeCapacity().init(&self.gpa.allocator, count, index);
     }
 }
 
 fn startIoWorkers(self: *Runtime) !void {
+    if (builtin.single_threaded) {
+        return;
+    }
+
     var thread_index: usize = 0;
     errdefer for (self.io_worker_threads.items[0..thread_index]) |*io_worker_thread| io_worker_thread.join();
     errdefer for (self.io_workers.items) |*io_worker| io_worker.shutdown();
