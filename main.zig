@@ -13,19 +13,21 @@ const IPv4 = std.x.os.IPv4;
 
 const Runtime = @import("Runtime.zig");
 const Server = @import("Server.zig");
+const Client = @import("Client.zig");
 
 pub fn main() !void {
     var runtime = try Runtime.init();
-    defer runtime.deinit();
+    defer {
+        runtime.waitForShutdown();
+        log.info("shutdown successful", .{});
+        runtime.deinit();
+    }
 
     try runtime.start();
 
     var frame = async run(&runtime);
     try runtime.io_workers.items[0].run();
     try nosuspend await frame;
-    runtime.waitForShutdown();
-
-    log.info("shutdown successful", .{});
 }
 
 pub fn run(runtime: *Runtime) !void {
@@ -50,31 +52,26 @@ pub fn run(runtime: *Runtime) !void {
     const listen_address = try listener.getLocalAddress();
 
     var listener_frame = async server.serve(runtime, listener);
-    defer await listener_frame catch |err| log.warn("listener error: {}", .{err});
+    defer {
+        listener.shutdown() catch |err| log.warn("listener shutdown error: {}", .{err});
+        await listener_frame catch |err| log.warn("listener error: {}", .{err});
+    }
 
     log.info("tcp: listening for peers on {}", .{listen_address});
 
-    var client = try tcp.Client.init(.ip, .{ .close_on_exec = true });
-    defer client.deinit();
+    var client = try Client.init(&runtime.gpa.allocator, ip.Address.initIPv4(IPv4.localhost, 9000));
+    defer {
+        client.shutdown(runtime);
+        client.waitForShutdown();
+        client.deinit(&runtime.gpa.allocator);
+    }
 
-    try runtime.io_workers.items[0].loop.connect(client.socket.fd, listen_address.into());
-
-    var client_frame = async runClient(runtime, client);
-    defer await client_frame catch |err| log.warn("client error: {}", .{err});
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        try client.write(runtime, "hello world!\n");
+    }
 
     try runtime.waitForSignal();
 
     log.info("gracefully shutting down...", .{});
-
-    try listener.shutdown();
-    try client.shutdown(.both);
-}
-
-pub fn runClient(runtime: *Runtime, client: tcp.Client) !void {
-    const message = "hello world!\n";
-
-    var bytes_written: usize = 0;
-    while (bytes_written < message.len) {
-        bytes_written += try runtime.io_workers.items[0].loop.send(client.socket.fd, message, os.MSG_NOSIGNAL);
-    }
 }

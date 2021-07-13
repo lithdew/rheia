@@ -89,9 +89,8 @@ pub const Worker = struct {
     }
 
     pub fn run(self: *Worker) !void {
-        defer log.debug("worker {} is done", .{self.id});
-
         log.debug("worker {} started", .{self.id});
+        defer log.debug("worker {} is done", .{self.id});
 
         while (true) {
             const num_tasks_processed = self.pollTaskQueues();
@@ -113,7 +112,7 @@ pub const Loop = struct {
     ring: Ring,
 
     notifier: struct {
-        rearm_required: bool = false,
+        rearm_required: bool = true,
         buffer: u64 = undefined,
         fd: os.fd_t,
     },
@@ -130,7 +129,6 @@ pub const Loop = struct {
         errdefer os.close(notifier_fd);
 
         self.* = .{ .ring = ring, .notifier = .{ .fd = notifier_fd } };
-        self.reset();
     }
 
     pub fn deinit(self: *Loop) void {

@@ -4,20 +4,20 @@ const mem = std.mem;
 const tcp = std.x.net.tcp;
 const log = std.log.scoped(.server);
 
-const Atomic = std.atomic.Atomic;
+const assert = std.debug.assert;
+
 const Runtime = @import("Runtime.zig");
 
 const Server = @This();
 
 connections: std.AutoArrayHashMapUnmanaged(*@Frame(Server.serveConnection), tcp.Connection) = .{},
 
-live_connections: struct {
-    count: usize = 0,
-    waiter: ?anyframe = null,
-},
+pending: struct {
+    shutdown: std.SinglyLinkedList(anyframe) = .{},
+} = .{},
 
 pub fn init() Server {
-    return .{ .connections = .{}, .live_connections = .{} };
+    return .{};
 }
 
 pub fn deinit(self: *Server, gpa: *mem.Allocator) void {
@@ -32,8 +32,9 @@ pub fn shutdown(self: *Server) void {
 }
 
 pub fn waitForShutdown(self: *Server) callconv(.Async) void {
-    if (self.live_connections.count > 0) {
-        suspend self.live_connections.waiter = @frame();
+    if (self.connections.count() > 0) {
+        var waiter: std.SinglyLinkedList(anyframe).Node = .{ .data = @frame() };
+        suspend self.pending.shutdown.prepend(&waiter);
     }
 }
 
@@ -64,18 +65,11 @@ pub fn serve(self: *Server, runtime: *Runtime, listener: tcp.Listener) !void {
 
 fn serveConnection(self: *Server, runtime: *Runtime, io_worker_index: usize, conn: tcp.Connection) !void {
     defer {
-        conn.deinit();
+        runtime.yield(io_worker_index, 0);
 
         suspend {
-            runtime.runOnWorker(io_worker_index, 0, struct {
-                server_: *Server,
-                gpa_: *mem.Allocator,
-                frame_: *@Frame(Server.serveConnection),
-
-                pub fn run(self_: @This()) void {
-                    return self_.server_.deregister(self_.gpa_, self_.frame_);
-                }
-            }{ .server_ = self, .gpa_ = &runtime.gpa.allocator, .frame_ = @frame() });
+            conn.deinit();
+            self.deregister(&runtime.gpa.allocator, @frame());
         }
     }
 
@@ -94,22 +88,16 @@ fn serveConnection(self: *Server, runtime: *Runtime, io_worker_index: usize, con
 
 fn register(self: *Server, gpa: *mem.Allocator, frame: *@Frame(Server.serveConnection), conn: tcp.Connection) !void {
     try self.connections.put(gpa, frame, conn);
-    self.live_connections.count += 1;
 }
 
 fn deregister(self: *Server, gpa: *mem.Allocator, frame: *@Frame(Server.serveConnection)) void {
-    if (!self.connections.swapRemove(frame)) {
-        return;
-    }
+    assert(self.connections.swapRemove(frame));
+
     gpa.destroy(frame);
 
-    self.live_connections.count -= 1;
-    if (self.live_connections.count > 0) {
-        return;
+    if (self.connections.count() == 0) {
+        while (self.pending.shutdown.popFirst()) |node| {
+            resume node.data;
+        }
     }
-
-    const waiter = self.live_connections.waiter orelse return;
-    self.live_connections.waiter = null;
-
-    resume waiter;
 }

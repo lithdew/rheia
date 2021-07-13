@@ -26,6 +26,9 @@ pub fn init() !Runtime {
     var runtime: Runtime = undefined;
 
     runtime.gpa = .{};
+    if (builtin.link_libc) {
+        runtime.gpa.backing_allocator = std.heap.c_allocator;
+    }
 
     runtime.worker_count = if (builtin.single_threaded) 1 else try std.Thread.getCpuCount();
     if (runtime.worker_count == 0) return error.NoWorkers;
@@ -75,31 +78,28 @@ pub fn waitForSignal(self: *Runtime) !void {
     }
 }
 
-pub fn runOnWorker(self: *Runtime, from: usize, to: usize, closure: anytype) void {
-    const State = @TypeOf(closure);
-
-    if (from == to) return closure.run();
+pub fn yield(self: *Runtime, from: usize, to: usize) void {
+    if (from == to) return;
 
     var runnable: struct {
-        state: if (State == type) void else State,
         task: io.Worker.Task = .{ .runFn = run },
+        frame: anyframe,
 
         pub fn run(task: *io.Worker.Task) void {
-            if (comptime State == type) {
-                return State.run();
-            }
-            return @fieldParentPtr(@This(), "task", task).state.run();
+            resume @fieldParentPtr(@This(), "task", task).frame;
         }
-    } = .{ .state = if (comptime State == type) @as(void, {}) else closure };
+    } = .{ .frame = @frame() };
 
-    self.io_workers.items[to].task_queues.items[if (from > to) from - 1 else 0].push(&self.gpa.allocator, &runnable.task) catch unreachable;
-    self.io_workers.items[to].loop.notify();
+    suspend {
+        self.io_workers.items[to].task_queues.items[if (from > to) from - 1 else 0].push(&self.gpa.allocator, &runnable.task) catch unreachable;
+        self.io_workers.items[to].loop.notify();
+    }
 }
 
 fn initSignalHandler(self: *Runtime) !void {
     self.signal.set = mem.zeroes(os.sigset_t);
-    os.system.sigaddset(&self.signal.set, os.SIGINT);
-    os.system.sigaddset(&self.signal.set, os.SIGQUIT);
+    os.linux.sigaddset(&self.signal.set, os.SIGINT);
+    os.linux.sigaddset(&self.signal.set, os.SIGQUIT);
 
     if (os.system.sigprocmask(os.SIG_BLOCK, &self.signal.set, &self.signal.prev_set) != 0) {
         return error.SignalMaskFailed;
