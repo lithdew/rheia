@@ -80,6 +80,13 @@ pub fn run(runtime: *Runtime) !void {
 }
 
 fn runClient(runtime: *Runtime, client: *Client) !void {
+    log.info("starting benchmark in 3...", .{});
+    runtime.io_workers.items[0].loop.timeout(.{ .seconds = 1 }) catch {};
+    log.info("starting benchmark in 2...", .{});
+    runtime.io_workers.items[0].loop.timeout(.{ .seconds = 1 }) catch {};
+    log.info("starting benchmark in 1...", .{});
+    runtime.io_workers.items[0].loop.timeout(.{ .seconds = 1 }) catch {};
+
     var i: usize = 0;
     while (i < 1_000_000) : (i += 1) {
         try await async client.write(runtime, "hello world!\n");

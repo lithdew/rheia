@@ -194,6 +194,48 @@ pub const Loop = struct {
         self.pending -= num_completions;
     }
 
+    pub fn timeout(
+        self: *Loop,
+        params: struct {
+            seconds: i64 = 0,
+            nanoseconds: i64 = 0,
+            count: u32 = 0,
+            mode: enum(u32) {
+                relative = 0,
+                absolute = os.IORING_TIMEOUT_ABS,
+            } = .relative,
+        },
+    ) !void {
+        var waiter: Loop.Waiter = .{ .frame = @frame() };
+        var timespec: os.__kernel_timespec = .{ .tv_sec = params.seconds, .tv_nsec = params.nanoseconds };
+
+        while (true) {
+            var maybe_err: ?anyerror = null;
+
+            suspend {
+                maybe_err = blk: {
+                    _ = self.ring.timeout(@ptrToInt(&waiter.node), &timespec, params.count, @enumToInt(params.mode)) catch |err| {
+                        self.submissions.append(&waiter.node);
+                        switch (err) {
+                            error.SubmissionQueueFull => {},
+                            else => break :blk err,
+                        }
+                    };
+                    break :blk null;
+                };
+            }
+            if (maybe_err) |err| return err;
+
+            const result = waiter.result orelse continue;
+            return switch (-result) {
+                0 => {},
+                os.ETIME => error.Timeout,
+                os.ECANCELED => error.TimeoutCancelled,
+                else => |err| os.unexpectedErrno(err),
+            };
+        }
+    }
+
     pub fn read(self: *Loop, fd: os.fd_t, buffer: []u8, offset: u64) !usize {
         var waiter: Loop.Waiter = .{ .frame = @frame() };
 
