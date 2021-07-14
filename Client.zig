@@ -228,6 +228,7 @@ fn connect(self: *Client, runtime: *Runtime, conn: *Client.Connection, timeout_m
     const client = try tcp.Client.init(.ip, .{ .close_on_exec = true });
     errdefer client.deinit();
 
+    try client.setNoDelay(true);
     try client.setWriteTimeout(timeout_milliseconds);
     try runtime.io_workers.items[conn.worker_index].loop.connect(client.socket.fd, self.address.into());
 

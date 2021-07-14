@@ -95,7 +95,7 @@ pub const Worker = struct {
         while (true) {
             const num_tasks_processed = self.pollTaskQueues();
             try self.loop.poll(if (num_tasks_processed > 0) .nonblocking else .blocking);
-            if (self.shutdown_requested.load(.Acquire) and self.loop.pending == 0) {
+            if (self.shutdown_requested.load(.Acquire) and self.loop.submissions.len == 0 and self.loop.completions.len == 0) {
                 break;
             }
         }
@@ -215,10 +215,9 @@ pub const Loop = struct {
 
     submissions: std.TailQueue(void) = .{},
     completions: std.TailQueue(void) = .{},
-    pending: usize = 0,
 
     pub fn init(self: *Loop, maybe_params: ?*RingParams) !void {
-        var ring = try if (maybe_params) |params| Ring.init_params(256, params) else Ring.init(256, 0);
+        var ring = try if (maybe_params) |params| Ring.init_params(4096, params) else Ring.init(4096, 0);
         errdefer ring.deinit();
 
         const notifier_fd = try os.eventfd(0, os.O_CLOEXEC);
@@ -241,13 +240,13 @@ pub const Loop = struct {
     }
 
     pub fn poll(self: *Loop, method: enum(u32) { blocking = 1, nonblocking = 0 }) !void {
-        var completions: [256]Completion = undefined;
+        var completions: [4096]Completion = undefined;
 
-        self.pending += self.ring.submit_and_wait(wait_count: {
+        _ = self.ring.submit_and_wait(wait_count: {
             if (self.submissions.len > 0 or self.completions.len > 0) {
                 break :wait_count 0;
             }
-            if (self.notifier.rearm_required) {
+            if (self.notifier.rearm_required and method == .blocking) {
                 self.notifier.rearm_required = false;
                 self.reset();
             }
@@ -262,7 +261,6 @@ pub const Loop = struct {
         for (completions[0..completion_count]) |completion| {
             if (completion.user_data == 0) {
                 self.notifier.rearm_required = true;
-                self.pending -= 1;
                 continue;
             }
 
@@ -282,12 +280,10 @@ pub const Loop = struct {
         if (num_submissions > 0) return;
 
         mem.swap(std.TailQueue(void), &it, &self.completions);
-        const num_completions = it.len;
         while (it.popFirst()) |node| {
             const waiter = @fieldParentPtr(Waiter, "node", node);
             resume waiter.frame;
         }
-        self.pending -= num_completions;
     }
 
     pub fn read(self: *Loop, fd: os.fd_t, buffer: []u8, offset: u64) !usize {

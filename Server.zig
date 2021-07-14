@@ -76,13 +76,15 @@ fn serveConnection(self: *Server, runtime: *Runtime, io_worker_index: usize, con
     log.debug("new peer connected: {}", .{conn.address});
     defer log.debug("peer disconnected: {}", .{conn.address});
 
+    try conn.client.setNoDelay(true);
+
     var buffer: [256]u8 = undefined;
 
     while (true) {
         const num_bytes_read = runtime.io_workers.items[io_worker_index].loop.recv(conn.client.socket.fd, &buffer, 0) catch |err| return err;
         if (num_bytes_read == 0) break;
 
-        log.debug("{}: got message: '{s}'", .{ conn.address, mem.trim(u8, buffer[0..num_bytes_read], " \t\r\n") });
+        // log.debug("{}: got message: '{s}'", .{ conn.address, mem.trim(u8, buffer[0..num_bytes_read], " \t\r\n") });
     }
 }
 
