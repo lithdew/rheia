@@ -79,7 +79,9 @@ pub fn waitForSignal(self: *Runtime) !void {
 }
 
 pub fn yield(self: *Runtime, from: usize, to: usize) void {
-    if (from == to) return;
+    // TODO: fast-path yield if target worker is the same worker, and if there are no other pending tasks
+    // that need to be processed on the target worker
+    // if (from == to) return;
 
     var runnable: struct {
         task: io.Worker.Task = .{ .runFn = run },
@@ -91,7 +93,7 @@ pub fn yield(self: *Runtime, from: usize, to: usize) void {
     } = .{ .frame = @frame() };
 
     suspend {
-        self.io_workers.items[to].task_queues.items[if (from > to) from - 1 else 0].push(&self.gpa.allocator, &runnable.task) catch unreachable;
+        self.io_workers.items[to].task_queues.items[from].push(&self.gpa.allocator, &runnable.task) catch unreachable;
         self.io_workers.items[to].loop.notify();
     }
 }

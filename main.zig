@@ -15,11 +15,14 @@ const Runtime = @import("Runtime.zig");
 const Server = @import("Server.zig");
 const Client = @import("Client.zig");
 
+pub const log_level = .debug;
+
 pub fn main() !void {
+    defer log.info("shutdown successful", .{});
+
     var runtime = try Runtime.init();
     defer {
         runtime.waitForShutdown();
-        log.info("shutdown successful", .{});
         runtime.deinit();
     }
 
@@ -61,17 +64,25 @@ pub fn run(runtime: *Runtime) !void {
 
     var client = try Client.init(&runtime.gpa.allocator, ip.Address.initIPv4(IPv4.localhost, 9000));
     defer {
-        client.shutdown(runtime);
         client.waitForShutdown();
         client.deinit(&runtime.gpa.allocator);
     }
 
-    var i: usize = 0;
-    while (i < 16) : (i += 1) {
-        try client.write(runtime, "hello world!\n");
+    var client_frame = async runClient(runtime, &client);
+    defer {
+        client.shutdown(runtime);
+        await client_frame catch |err| log.warn("client error: {}", .{err});
     }
 
     try runtime.waitForSignal();
 
     log.info("gracefully shutting down...", .{});
+}
+
+fn runClient(runtime: *Runtime, client: *Client) !void {
+    var i: usize = 0;
+    while (i < 1_000_000) : (i += 1) {
+        try await async client.write(runtime, "hello world!\n");
+        runtime.yield(0, 0);
+    }
 }

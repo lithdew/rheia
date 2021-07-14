@@ -38,13 +38,13 @@ pub const Worker = struct {
         try loop.init(null);
         errdefer loop.deinit();
 
-        var task_queues = try std.ArrayListUnmanaged(TaskQueue).initCapacity(gpa, count - 1);
+        var task_queues = try std.ArrayListUnmanaged(TaskQueue).initCapacity(gpa, count);
         errdefer task_queues.deinit(gpa);
 
         var task_queue_index: usize = 0;
         errdefer for (task_queues.items[0..task_queue_index]) |*task_queue| task_queue.deinit(gpa);
 
-        while (task_queue_index < count - 1) : (task_queue_index += 1) {
+        while (task_queue_index < count) : (task_queue_index += 1) {
             task_queues.addOneAssumeCapacity().* = try TaskQueue.init(gpa);
         }
 

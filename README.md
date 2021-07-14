@@ -38,5 +38,5 @@ A blockchain written in [Zig](https://ziglang.org).
 ## getting started
 
 ```
-$ zig run main.zig
+$ zig run main.zig --name rheia
 ```

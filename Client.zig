@@ -190,7 +190,14 @@ fn runReadLoop(_: *Client, runtime: *Runtime, conn: *Client.Connection) !void {
 
 fn runWriteLoop(self: *Client, runtime: *Runtime, conn: *Client.Connection) !void {
     var popped_nodes: std.SinglyLinkedList([]const u8) = .{};
-    defer while (popped_nodes.popFirst()) |node| self.queue.prepend(node);
+    defer {
+        runtime.yield(conn.worker_index, 0);
+        defer runtime.yield(0, conn.worker_index);
+
+        while (popped_nodes.popFirst()) |node| {
+            self.queue.prepend(node);
+        }
+    }
 
     while (conn.client) |client| {
         runtime.yield(conn.worker_index, 0);
