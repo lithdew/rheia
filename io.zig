@@ -109,6 +109,102 @@ pub const Loop = struct {
         frame: anyframe,
     };
 
+    pub const Timer = struct {
+        pub const Params = struct {
+            seconds: i64 = 0,
+            nanoseconds: i64 = 0,
+            mode: enum(u32) {
+                relative = 0,
+                absolute = os.IORING_TIMEOUT_ABS,
+            } = .relative,
+        };
+
+        loop: *Loop,
+        waiter: Loop.Waiter,
+        frame: @Frame(Loop.Timer.handle),
+
+        pub fn init(loop: *Loop) Loop.Timer {
+            return .{ .loop = loop, .waiter = undefined, .frame = undefined };
+        }
+
+        pub fn start(self: *Loop.Timer, params: Loop.Timer.Params) void {
+            self.frame = async self.handle(params);
+        }
+
+        pub fn wait(self: *Loop.Timer) !void {
+            return await self.frame catch |err| switch (err) {
+                error.Timeout => {},
+                else => err,
+            };
+        }
+
+        pub fn waitFor(self: *Loop.Timer, params: Loop.Timer.Params) !void {
+            self.start(params);
+            return self.wait();
+        }
+
+        pub fn cancel(self: *Loop.Timer) !void {
+            var waiter: Loop.Waiter = .{ .frame = @frame() };
+
+            while (true) {
+                var maybe_err: ?anyerror = null;
+
+                suspend {
+                    maybe_err = blk: {
+                        _ = self.loop.ring.timeout_remove(@ptrToInt(&waiter.node), @ptrToInt(&self.waiter.node), 0) catch |err| {
+                            self.loop.submissions.append(&waiter.node);
+                            switch (err) {
+                                error.SubmissionQueueFull => {},
+                                else => break :blk err,
+                            }
+                        };
+                        break :blk null;
+                    };
+                }
+                if (maybe_err) |err| return err;
+
+                const result = waiter.result orelse continue;
+                return switch (-result) {
+                    0 => {},
+                    os.EBUSY => error.TimeoutAlreadyCancelled,
+                    os.ENOENT => error.TimeoutNotFound,
+                };
+            }
+        }
+
+        fn handle(self: *Loop.Timer, params: Loop.Timer.Params) !void {
+            const timespec: os.__kernel_timespec = .{ .tv_sec = params.seconds, .tv_nsec = params.nanoseconds };
+
+            self.waiter = .{ .frame = @frame() };
+
+            while (true) {
+                var maybe_err: ?anyerror = null;
+
+                suspend {
+                    maybe_err = blk: {
+                        _ = self.loop.ring.timeout(@ptrToInt(&self.waiter.node), &timespec, 0, @enumToInt(params.mode)) catch |err| {
+                            self.loop.submissions.append(&self.waiter.node);
+                            switch (err) {
+                                error.SubmissionQueueFull => {},
+                                else => break :blk err,
+                            }
+                        };
+                        break :blk null;
+                    };
+                }
+                if (maybe_err) |err| return err;
+
+                const result = self.waiter.result orelse continue;
+                return switch (-result) {
+                    0 => {},
+                    os.ETIME => error.Timeout,
+                    os.ECANCELED => error.TimeoutCancelled,
+                    else => |err| os.unexpectedErrno(err),
+                };
+            }
+        }
+    };
+
     ring: Ring,
 
     notifier: struct {
@@ -192,48 +288,6 @@ pub const Loop = struct {
             resume waiter.frame;
         }
         self.pending -= num_completions;
-    }
-
-    pub fn timeout(
-        self: *Loop,
-        params: struct {
-            seconds: i64 = 0,
-            nanoseconds: i64 = 0,
-            count: u32 = 0,
-            mode: enum(u32) {
-                relative = 0,
-                absolute = os.IORING_TIMEOUT_ABS,
-            } = .relative,
-        },
-    ) !void {
-        var waiter: Loop.Waiter = .{ .frame = @frame() };
-        var timespec: os.__kernel_timespec = .{ .tv_sec = params.seconds, .tv_nsec = params.nanoseconds };
-
-        while (true) {
-            var maybe_err: ?anyerror = null;
-
-            suspend {
-                maybe_err = blk: {
-                    _ = self.ring.timeout(@ptrToInt(&waiter.node), &timespec, params.count, @enumToInt(params.mode)) catch |err| {
-                        self.submissions.append(&waiter.node);
-                        switch (err) {
-                            error.SubmissionQueueFull => {},
-                            else => break :blk err,
-                        }
-                    };
-                    break :blk null;
-                };
-            }
-            if (maybe_err) |err| return err;
-
-            const result = waiter.result orelse continue;
-            return switch (-result) {
-                0 => {},
-                os.ETIME => error.Timeout,
-                os.ECANCELED => error.TimeoutCancelled,
-                else => |err| os.unexpectedErrno(err),
-            };
-        }
     }
 
     pub fn read(self: *Loop, fd: os.fd_t, buffer: []u8, offset: u64) !usize {

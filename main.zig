@@ -7,6 +7,8 @@ const ip = std.x.net.ip;
 const tcp = std.x.net.tcp;
 const log = std.log.scoped(.rheia);
 
+const io = @import("io.zig");
+
 const assert = std.debug.assert;
 
 const IPv4 = std.x.os.IPv4;
@@ -80,12 +82,14 @@ pub fn run(runtime: *Runtime) !void {
 }
 
 fn runClient(runtime: *Runtime, client: *Client) !void {
+    var timer = io.Loop.Timer.init(&runtime.io_workers.items[0].loop);
+
     log.info("starting benchmark in 3...", .{});
-    runtime.io_workers.items[0].loop.timeout(.{ .seconds = 1 }) catch {};
+    try timer.waitFor(.{ .seconds = 1 });
     log.info("starting benchmark in 2...", .{});
-    runtime.io_workers.items[0].loop.timeout(.{ .seconds = 1 }) catch {};
+    try timer.waitFor(.{ .seconds = 1 });
     log.info("starting benchmark in 1...", .{});
-    runtime.io_workers.items[0].loop.timeout(.{ .seconds = 1 }) catch {};
+    try timer.waitFor(.{ .seconds = 1 });
 
     var i: usize = 0;
     while (i < 1_000_000) : (i += 1) {
