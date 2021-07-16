@@ -74,7 +74,7 @@ pub fn run(runtime: *Runtime) !void {
     var client_frame = async runClient(runtime, &timer, &client);
     defer {
         timer.cancel();
-        client.shutdown(runtime);
+        client.shutdown();
         await client_frame catch |err| log.warn("client error: {}", .{err});
     }
 
