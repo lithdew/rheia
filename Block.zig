@@ -37,7 +37,7 @@ pub fn unmarshal(buffer: []const u8) !Block {
 }
 
 pub fn validate(self: Block) !usize {
-    if (self.buffer.len < header_size) {
+    if (self.buffer.len < Block.header_size) {
         return error.ShortBuffer;
     }
     const transaction_ids_len = self.get(.transaction_ids_len);

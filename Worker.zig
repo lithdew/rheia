@@ -98,7 +98,6 @@ pub fn run(self: *Worker) !void {
         const num_processed_event_loop_tasks = try self.pollEventLoop(num_processed_incoming_tasks == 0);
 
         if (shutdown: {
-            if (num_processed_incoming_tasks > 0) break :shutdown false;
             if (num_processed_event_loop_tasks > 0) break :shutdown false;
             if (self.loop.hasPendingTasks()) break :shutdown false;
             if (!self.shutdown_requested.load(.Acquire)) break :shutdown false;

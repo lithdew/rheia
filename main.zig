@@ -16,6 +16,9 @@ const Server = @import("Server.zig");
 const Client = @import("Client.zig");
 const Runtime = @import("Runtime.zig");
 
+const binary = @import("binary.zig");
+const Packet = @import("Packet.zig");
+
 pub const log_level = .debug;
 
 pub fn main() !void {
@@ -54,15 +57,11 @@ pub fn run(runtime: *Runtime) !void {
     try listener.bind(ip.Address.initIPv4(IPv4.localhost, 9000));
     try listener.listen(128);
 
-    const listen_address = try listener.getLocalAddress();
-
     var listener_frame = async server.serve(runtime, listener);
     defer {
         listener.shutdown() catch |err| log.warn("listener shutdown error: {}", .{err});
         await listener_frame catch |err| log.warn("listener error: {}", .{err});
     }
-
-    log.info("tcp: listening for peers on {}", .{listen_address});
 
     var client = try Client.init(runtime.gpa, runtime, ip.Address.initIPv4(IPv4.localhost, 9000));
     defer {
@@ -93,8 +92,21 @@ fn runClient(runtime: *Runtime, _: *Loop.Timer, client: *Client) !void {
 
     var i: usize = 0;
     while (i < 100_000_000) : (i += 1) {
-        try await async client.write(runtime, "hello world!\n");
-        runtime.yield(0, 0);
+        defer runtime.yield(0, 0);
+
+        var buf = std.ArrayList(u8).init(runtime.gpa);
+        errdefer buf.deinit();
+
+        const node_data = try binary.Buffer.from(&buf).allocate(@sizeOf(std.SinglyLinkedList([]const u8).Node));
+        const node = @ptrCast(*std.SinglyLinkedList([]const u8).Node, @alignCast(@alignOf(*std.SinglyLinkedList([]const u8).Node), node_data.ptr()));
+
+        var size_data = try binary.allocate(node_data.sliceFromEnd(), u32);
+        var body_data = try Packet.append(size_data.sliceFromEnd(), .{ .nonce = 0, .@"type" = .command, .tag = .ping });
+        node.* = .{ .data = size_data.ptr()[0 .. size_data.len + body_data.len] };
+
+        size_data = binary.writeAssumeCapacity(node_data.sliceFromEnd(), @intCast(u32, size_data.len + body_data.len));
+
+        try await async client.write(runtime, node);
     }
 
     log.info("done!", .{});

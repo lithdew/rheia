@@ -171,6 +171,7 @@ fn reset(self: *Loop) void {
 
 pub fn poll(self: *Loop, blocking: bool) !usize {
     var completions: [4096]Completion = undefined;
+    var count: usize = 0;
 
     _ = self.ring.submit_and_wait(wait_count: {
         if (self.hasPendingTasks()) {
@@ -183,7 +184,7 @@ pub fn poll(self: *Loop, blocking: bool) !usize {
         break :wait_count @as(u32, if (blocking) 1 else 0);
     }) catch |err| switch (err) {
         error.CompletionQueueOvercommitted, error.SystemResources => 0,
-        error.SignalInterrupt => return 0,
+        error.SignalInterrupt => return count,
         else => return err,
     };
 
@@ -202,21 +203,21 @@ pub fn poll(self: *Loop, blocking: bool) !usize {
 
     var it: std.TailQueue(void) = .{};
     mem.swap(std.TailQueue(void), &it, &self.submissions);
-    const num_submissions = it.len;
+    count += it.len;
     while (it.popFirst()) |node| {
         const waiter = @fieldParentPtr(Waiter, "node", node);
         resume waiter.frame;
     }
-    if (num_submissions > 0) return 0;
+    if (count > 0) return count;
 
     mem.swap(std.TailQueue(void), &it, &self.completions);
-    const num_completions = it.len;
+    count += it.len;
     while (it.popFirst()) |node| {
         const waiter = @fieldParentPtr(Waiter, "node", node);
         resume waiter.frame;
     }
 
-    return num_completions;
+    return count;
 }
 
 pub fn read(self: *Loop, fd: os.fd_t, buffer: []u8, offset: u64) !usize {

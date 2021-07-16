@@ -11,6 +11,8 @@ const testing = std.testing;
 
 const assert = std.debug.assert;
 
+const binary = @import("binary.zig");
+
 const Loop = @import("Loop.zig");
 const Worker = @import("Worker.zig");
 const Runtime = @import("Runtime.zig");
@@ -80,11 +82,17 @@ pending: struct {
         if (self.writers.first != &conn.writer and conn.writer.prev == null and conn.writer.next == null) return;
 
         self.writers.remove(&conn.writer);
+        conn.writer.next = null;
+        conn.writer.prev = null;
+
         runtime.schedule(0, conn.worker_index, &conn.writer.data);
     }
 
     fn wakeUpWriter(self: *@This(), runtime: *Runtime) void {
         const writer = self.writers.popFirst() orelse return;
+        writer.next = null;
+        writer.prev = null;
+
         const conn = @fieldParentPtr(Client.Connection, "writer", writer);
         runtime.schedule(0, conn.worker_index, &writer.data);
     }
@@ -182,13 +190,10 @@ pub fn waitForShutdown(self: *Client) void {
     }
 }
 
-pub fn write(self: *Client, runtime: *Runtime, message: []const u8) !void {
+pub fn write(self: *Client, runtime: *Runtime, node: *std.SinglyLinkedList([]const u8).Node) !void {
     try self.ensureConnectionAvailable(runtime);
 
-    const buf = try runtime.gpa.create(std.SinglyLinkedList([]const u8).Node);
-    buf.* = .{ .data = message };
-    self.queue.prepend(buf);
-
+    self.queue.prepend(node);
     self.pending.wakeUpWriter(runtime);
 }
 
@@ -243,40 +248,74 @@ fn serve(self: *Client, runtime: *Runtime, conn: *Client.Connection) void {
 }
 
 fn runIoLoops(self: *Client, runtime: *Runtime, conn: *Client.Connection) void {
-    runtime.yield(0, conn.worker_index);
-    defer runtime.yield(conn.worker_index, 0);
-
     var writer_done = false;
     var writer_frame = async self.runWriteLoop(runtime, conn, &writer_done);
     var reader_frame = async self.runReadLoop(runtime, conn);
 
     await reader_frame catch {};
+    runtime.yield(conn.worker_index, 0);
 
     {
         writer_done = true;
-
-        runtime.yield(conn.worker_index, 0);
-        defer runtime.yield(0, conn.worker_index);
-
         self.pending.removeWriter(runtime, conn);
     }
 
     await writer_frame catch {};
+    runtime.yield(conn.worker_index, 0);
 }
 
 fn runReadLoop(_: *Client, runtime: *Runtime, conn: *Client.Connection) !void {
+    runtime.yield(0, conn.worker_index);
+
     const loop = &runtime.workers.items[conn.worker_index].loop;
     const client = conn.client orelse unreachable;
 
-    var buffer: [65536]u8 = undefined;
+    var buffer = std.fifo.LinearFifo(u8, .Dynamic).init(runtime.gpa);
+    defer buffer.deinit();
 
     while (true) {
-        const num_bytes_read = try loop.recv(client.socket.fd, &buffer, 0);
-        if (num_bytes_read == 0) break;
+        try buffer.ensureUnusedCapacity(@sizeOf(u32));
+
+        while (buffer.count < @sizeOf(u32)) {
+            const num_bytes_read = try loop.recv(client.socket.fd, buffer.writableSlice(0), 0);
+            if (num_bytes_read == 0) return error.EndOfFile;
+            buffer.update(num_bytes_read);
+        }
+
+        var size: u32 = undefined;
+
+        var size_pos: usize = 0;
+        while (size_pos < @sizeOf(u32)) {
+            size_pos += buffer.read(mem.asBytes(&size)[size_pos..]);
+        }
+
+        size = try binary.decode(u32, mem.asBytes(&size));
+        if (size < @sizeOf(u32)) return error.MessageSizeTooSmall;
+        if (size > 65536) return error.MessageSizeTooLarge;
+
+        size -= @sizeOf(u32);
+
+        try buffer.ensureUnusedCapacity(size);
+
+        while (buffer.count < size) {
+            const num_bytes_read = try loop.recv(client.socket.fd, buffer.writableSlice(0), 0);
+            if (num_bytes_read == 0) return error.EndOfFile;
+            buffer.update(num_bytes_read);
+        }
+
+        const message = try runtime.gpa.alloc(u8, size);
+        defer runtime.gpa.free(message); // make it errdefer after implementing message handling
+
+        var message_pos: usize = 0;
+        while (message_pos < size) {
+            message_pos += buffer.read(message[message_pos..]);
+        }
     }
 }
 
 fn runWriteLoop(self: *Client, runtime: *Runtime, conn: *Client.Connection, writer_done: *const bool) !void {
+    runtime.yield(0, conn.worker_index);
+
     const loop = &runtime.workers.items[conn.worker_index].loop;
     const client = conn.client orelse unreachable;
 
@@ -300,9 +339,10 @@ fn runWriteLoop(self: *Client, runtime: *Runtime, conn: *Client.Connection, writ
             pending.first = first;
             self.queue.first = null;
         } else {
-            if (self.closed) return error.Closed;
+            if (self.closed or writer_done.*) {
+                return error.Closed;
+            }
             self.pending.parkUntilWriterNeeded(conn);
-            if (writer_done.*) return error.Closed;
             continue;
         }
 
