@@ -4,17 +4,18 @@ const os = std.os;
 const mem = std.mem;
 const builtin = std.builtin;
 
-const io = @import("io.zig");
-
 const assert = std.debug.assert;
+
+const Worker = @import("Worker.zig");
 
 const Runtime = @This();
 
-gpa: std.heap.GeneralPurposeAllocator(.{}),
+gpa_instance: std.heap.GeneralPurposeAllocator(.{}),
+gpa: *mem.Allocator,
 
 worker_count: usize,
-io_workers: std.ArrayListUnmanaged(io.Worker),
-io_worker_threads: std.ArrayListUnmanaged(std.Thread),
+workers: std.ArrayListUnmanaged(Worker),
+worker_threads: std.ArrayListUnmanaged(std.Thread),
 
 signal: struct {
     fd: os.fd_t,
@@ -22,45 +23,46 @@ signal: struct {
     prev_set: os.sigset_t,
 },
 
-pub fn init() !Runtime {
-    var runtime: Runtime = undefined;
-
-    runtime.gpa = .{};
+pub fn init(self: *Runtime) !void {
+    self.gpa_instance = .{};
     if (builtin.link_libc) {
-        runtime.gpa.backing_allocator = std.heap.c_allocator;
+        self.gpa_instance.backing_allocator = std.heap.c_allocator;
+    }
+    if (builtin.link_libc) {
+        self.gpa = std.heap.c_allocator;
+    } else {
+        self.gpa = &self.gpa_instance.allocator;
     }
 
-    runtime.worker_count = if (builtin.single_threaded) 1 else try std.Thread.getCpuCount();
-    if (runtime.worker_count == 0) return error.NoWorkers;
+    self.worker_count = if (builtin.single_threaded) 1 else try std.Thread.getCpuCount();
+    if (self.worker_count == 0) return error.NoWorkers;
 
-    try runtime.initSignalHandler();
-    try runtime.initIoWorkers(runtime.worker_count);
-
-    return runtime;
+    try self.initSignalHandler();
+    try self.initWorkers(self.worker_count);
 }
 
 pub fn deinit(self: *Runtime) void {
-    self.io_worker_threads.deinit(&self.gpa.allocator);
+    self.worker_threads.deinit(self.gpa);
 
-    for (self.io_workers.items) |*io_worker| {
-        io_worker.deinit(&self.gpa.allocator);
+    for (self.workers.items) |*worker| {
+        worker.deinit(self.gpa);
     }
-    self.io_workers.deinit(&self.gpa.allocator);
+    self.workers.deinit(self.gpa);
 
-    assert(!self.gpa.deinit());
+    assert(!self.gpa_instance.deinit());
 }
 
 pub fn start(self: *Runtime) !void {
     try self.startSignalHandler();
-    try self.startIoWorkers();
+    try self.startWorkers();
 }
 
 pub fn shutdown(self: *Runtime) void {
-    for (self.io_workers.items) |*io_worker| io_worker.shutdown();
+    for (self.workers.items) |*worker| worker.shutdown();
 }
 
 pub fn waitForShutdown(self: *Runtime) void {
-    for (self.io_worker_threads.items) |*io_worker_thread| io_worker_thread.join();
+    for (self.worker_threads.items) |*worker_thread| worker_thread.join();
 }
 
 pub fn waitForSignal(self: *Runtime) !void {
@@ -68,7 +70,7 @@ pub fn waitForSignal(self: *Runtime) !void {
 
     var bytes_read: usize = 0;
     while (bytes_read < @sizeOf(os.signalfd_siginfo)) {
-        const num_bytes = try self.io_workers.items[0].loop.read(self.signal.fd, mem.asBytes(&info), 0);
+        const num_bytes = try self.workers.items[0].loop.read(self.signal.fd, mem.asBytes(&info), 0);
         if (num_bytes == 0) return error.EndOfFile;
         bytes_read += num_bytes;
     }
@@ -79,23 +81,13 @@ pub fn waitForSignal(self: *Runtime) !void {
 }
 
 pub fn yield(self: *Runtime, from: usize, to: usize) void {
-    // TODO: fast-path yield if target worker is the same worker, and if there are no other pending tasks
-    // that need to be processed on the target worker
-    // if (from == to) return;
+    var task: Worker.Task = .{ .value = @frame() };
+    suspend self.schedule(from, to, &task);
+}
 
-    var runnable: struct {
-        task: io.Worker.Task = .{ .runFn = run },
-        frame: anyframe,
-
-        pub fn run(task: *io.Worker.Task) void {
-            resume @fieldParentPtr(@This(), "task", task).frame;
-        }
-    } = .{ .frame = @frame() };
-
-    suspend {
-        self.io_workers.items[to].task_queues.items[from].push(&self.gpa.allocator, &runnable.task) catch unreachable;
-        self.io_workers.items[to].loop.notify();
-    }
+pub fn schedule(self: *Runtime, from: usize, to: usize, task: *Worker.Task) void {
+    self.workers.items[to].task_queues.items[from].push(task);
+    if (from != to) self.workers.items[to].loop.notify();
 }
 
 fn initSignalHandler(self: *Runtime) !void {
@@ -114,32 +106,30 @@ fn initSignalHandler(self: *Runtime) !void {
 
 fn startSignalHandler(_: *Runtime) !void {}
 
-fn initIoWorkers(self: *Runtime, count: usize) !void {
-    self.io_workers = try std.ArrayListUnmanaged(io.Worker).initCapacity(&self.gpa.allocator, count);
-    errdefer self.io_workers.deinit(&self.gpa.allocator);
+fn initWorkers(self: *Runtime, count: usize) !void {
+    self.workers = try std.ArrayListUnmanaged(Worker).initCapacity(self.gpa, count);
+    errdefer self.workers.deinit(self.gpa);
 
-    self.io_worker_threads = try std.ArrayListUnmanaged(std.Thread).initCapacity(&self.gpa.allocator, count - 1);
-    errdefer self.io_worker_threads.deinit(&self.gpa.allocator);
+    self.worker_threads = try std.ArrayListUnmanaged(std.Thread).initCapacity(self.gpa, count - 1);
+    errdefer self.worker_threads.deinit(self.gpa);
 
     var index: usize = 0;
-    errdefer for (self.io_workers.items[0..index]) |*io_worker| io_worker.deinit(&self.gpa.allocator);
+    errdefer for (self.workers.items[0..index]) |*worker| worker.deinit(self.gpa);
 
     while (index < count) : (index += 1) {
-        try self.io_workers.addOneAssumeCapacity().init(&self.gpa.allocator, count, index);
+        try self.workers.addOneAssumeCapacity().init(self.gpa, self.workers.items.ptr[0..count], index);
     }
 }
 
-fn startIoWorkers(self: *Runtime) !void {
-    if (builtin.single_threaded) {
-        return;
-    }
+fn startWorkers(self: *Runtime) !void {
+    if (builtin.single_threaded) return;
 
     var thread_index: usize = 0;
-    errdefer for (self.io_worker_threads.items[0..thread_index]) |*io_worker_thread| io_worker_thread.join();
-    errdefer for (self.io_workers.items) |*io_worker| io_worker.shutdown();
+    errdefer for (self.worker_threads.items[0..thread_index]) |*worker_thread| worker_thread.join();
+    errdefer for (self.workers.items) |*worker| worker.shutdown();
 
-    while (thread_index < self.io_workers.items.len - 1) : (thread_index += 1) {
-        const io_worker = &self.io_workers.items[thread_index + 1];
-        self.io_worker_threads.addOneAssumeCapacity().* = try std.Thread.spawn(.{}, io.Worker.run, .{io_worker});
+    while (thread_index < self.workers.items.len - 1) : (thread_index += 1) {
+        const worker = &self.workers.items[thread_index + 1];
+        self.worker_threads.addOneAssumeCapacity().* = try std.Thread.spawn(.{}, Worker.run, .{worker});
     }
 }

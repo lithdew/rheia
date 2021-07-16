@@ -41,35 +41,35 @@ pub fn waitForShutdown(self: *Server) callconv(.Async) void {
 pub fn serve(self: *Server, runtime: *Runtime, listener: tcp.Listener) !void {
     defer log.info("listener: successfully shut down", .{});
 
-    var next_io_worker_index: usize = 0;
+    var next_worker_index: usize = 0;
 
     while (true) {
-        const conn = runtime.io_workers.items[0].loop.accept(listener.socket.fd, .{ .close_on_exec = true }) catch |err| switch (err) {
+        const conn = runtime.workers.items[0].loop.accept(listener.socket.fd, .{ .close_on_exec = true }) catch |err| switch (err) {
             error.SocketNotListening => return,
             else => return err,
         };
         errdefer conn.socket.deinit();
 
-        const frame = try runtime.gpa.allocator.create(@Frame(Server.serveConnection));
-        errdefer runtime.gpa.allocator.destroy(frame);
+        const frame = try runtime.gpa.create(@Frame(Server.serveConnection));
+        errdefer runtime.gpa.destroy(frame);
 
-        try self.register(&runtime.gpa.allocator, frame, tcp.Connection.from(conn));
-        errdefer self.deregister(&runtime.gpa.allocator, frame);
+        try self.register(runtime.gpa, frame, tcp.Connection.from(conn));
+        errdefer self.deregister(runtime.gpa, frame);
 
-        frame.* = async self.serveConnection(runtime, next_io_worker_index, tcp.Connection.from(conn));
-        runtime.io_workers.items[next_io_worker_index].loop.notify();
+        frame.* = async self.serveConnection(runtime, next_worker_index, tcp.Connection.from(conn));
+        runtime.workers.items[next_worker_index].loop.notify();
 
-        next_io_worker_index = (next_io_worker_index + 1) % runtime.io_workers.items.len;
+        next_worker_index = (next_worker_index + 1) % runtime.workers.items.len;
     }
 }
 
-fn serveConnection(self: *Server, runtime: *Runtime, io_worker_index: usize, conn: tcp.Connection) !void {
+fn serveConnection(self: *Server, runtime: *Runtime, worker_index: usize, conn: tcp.Connection) !void {
     defer {
-        runtime.yield(io_worker_index, 0);
+        runtime.yield(worker_index, 0);
 
         suspend {
             conn.deinit();
-            self.deregister(&runtime.gpa.allocator, @frame());
+            self.deregister(runtime.gpa, @frame());
         }
     }
 
@@ -78,10 +78,10 @@ fn serveConnection(self: *Server, runtime: *Runtime, io_worker_index: usize, con
 
     try conn.client.setNoDelay(true);
 
-    var buffer: [256]u8 = undefined;
+    var buffer: [65536]u8 = undefined;
 
     while (true) {
-        const num_bytes_read = runtime.io_workers.items[io_worker_index].loop.recv(conn.client.socket.fd, &buffer, 0) catch |err| return err;
+        const num_bytes_read = runtime.workers.items[worker_index].loop.recv(conn.client.socket.fd, &buffer, 0) catch |err| return err;
         if (num_bytes_read == 0) break;
 
         // log.debug("{}: got message: '{s}'", .{ conn.address, mem.trim(u8, buffer[0..num_bytes_read], " \t\r\n") });
