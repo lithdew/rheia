@@ -14,6 +14,7 @@ const assert = std.debug.assert;
 const binary = @import("binary.zig");
 
 const Loop = @import("Loop.zig");
+const Packet = @import("Packet.zig");
 const Worker = @import("Worker.zig");
 const Runtime = @import("Runtime.zig");
 
@@ -310,6 +311,10 @@ fn runReadLoop(_: *Client, runtime: *Runtime, conn: *Client.Connection) !void {
         while (message_pos < size) {
             message_pos += buffer.read(message[message_pos..]);
         }
+
+        const packet = try Packet.unmarshal(message);
+
+        _ = packet;
     }
 }
 
