@@ -2,11 +2,13 @@ const std = @import("std");
 
 const os = std.os;
 const mem = std.mem;
+const time = std.time;
 const testing = std.testing;
 
 const assert = std.debug.assert;
 
 const Socket = std.x.os.Socket;
+const Atomic = std.atomic.Atomic;
 
 const Ring = os.linux.IO_Uring;
 const Submission = os.linux.io_uring_sqe;
@@ -132,6 +134,7 @@ pub const Timer = struct {
 ring: Ring,
 
 notifier: struct {
+    armed: Atomic(bool) = .{ .value = false },
     rearm_required: bool = true,
     buffer: u64 = undefined,
     fd: os.fd_t,
@@ -159,14 +162,18 @@ pub fn hasPendingTasks(self: *Loop) bool {
 }
 
 pub fn notify(self: *Loop) void {
+    if (!self.notifier.armed.swap(false, .AcqRel)) return;
     const bytes_written = os.write(self.notifier.fd, mem.asBytes(&@as(u64, 1))) catch unreachable;
     assert(bytes_written == @sizeOf(u64));
 }
 
 fn reset(self: *Loop) void {
-    _ = self.ring.read(0, self.notifier.fd, mem.asBytes(&self.notifier.buffer), 0) catch {
+    if (self.ring.read(0, self.notifier.fd, mem.asBytes(&self.notifier.buffer), 0)) |_| {
+        self.notifier.armed.store(true, .Release);
+        self.notifier.rearm_required = false;
+    } else |_| {
         self.notifier.rearm_required = true;
-    };
+    }
 }
 
 pub fn poll(self: *Loop, blocking: bool) !usize {
@@ -178,8 +185,8 @@ pub fn poll(self: *Loop, blocking: bool) !usize {
             break :wait_count 0;
         }
         if (self.notifier.rearm_required and blocking) {
-            self.notifier.rearm_required = false;
             self.reset();
+            break :wait_count 0;
         }
         break :wait_count @as(u32, if (blocking) 1 else 0);
     }) catch |err| switch (err) {
@@ -197,7 +204,6 @@ pub fn poll(self: *Loop, blocking: bool) !usize {
 
         const waiter = @intToPtr(*Waiter, completion.user_data);
         waiter.result = completion.res;
-
         self.completions.append(&waiter.node);
     }
 
@@ -546,7 +552,7 @@ test "loop: start timeout" {
 
     var timer = Loop.Timer.init(&loop);
 
-    var submit_frame = async timer.waitFor(.{ .nanoseconds = 100 * std.time.ns_per_ms });
+    var submit_frame = async timer.waitFor(.{ .nanoseconds = 100 * time.ns_per_ms });
     try testing.expectEqual(@as(usize, 0), try loop.poll(true));
 
     try testing.expectEqual(@as(usize, 1), try loop.poll(true));

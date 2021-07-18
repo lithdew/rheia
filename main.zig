@@ -43,7 +43,7 @@ pub fn run(runtime: *Runtime) !void {
 
     var server = Server.init();
     defer {
-        server.shutdown();
+        server.shutdown(runtime);
         server.waitForShutdown();
         server.deinit(runtime.gpa);
     }
@@ -73,7 +73,7 @@ pub fn run(runtime: *Runtime) !void {
     var client_frame = async runClient(runtime, &timer, &client);
     defer {
         timer.cancel();
-        client.shutdown();
+        client.shutdown(runtime);
         await client_frame catch |err| log.warn("client error: {}", .{err});
     }
 
@@ -90,24 +90,40 @@ fn runClient(runtime: *Runtime, _: *Loop.Timer, client: *Client) !void {
     // log.info("starting benchmark in 1...", .{});
     // try timer.waitFor(.{ .seconds = 1 });
 
+    var timer = try std.time.Timer.start();
+    var packets_per_second: usize = 0;
+    var last_print_time: usize = 0;
+
     var i: usize = 0;
     while (i < 100_000_000) : (i += 1) {
-        defer runtime.yield(0, 0);
+        defer await async runtime.yield(0, 0);
 
         var buf = std.ArrayList(u8).init(runtime.gpa);
         errdefer buf.deinit();
 
         const node_data = try binary.Buffer.from(&buf).allocate(@sizeOf(std.SinglyLinkedList([]const u8).Node));
-        const node = @ptrCast(*std.SinglyLinkedList([]const u8).Node, @alignCast(@alignOf(*std.SinglyLinkedList([]const u8).Node), node_data.ptr()));
 
         var size_data = try binary.allocate(node_data.sliceFromEnd(), u32);
-        var body_data = try Packet.append(size_data.sliceFromEnd(), .{ .nonce = 0, .@"type" = .command, .tag = .ping });
-        node.* = .{ .data = size_data.ptr()[0 .. size_data.len + body_data.len] };
-
+        var body_data = try Packet.append(size_data.sliceFromEnd(), .{ .nonce = 0, .@"type" = .request, .tag = .ping });
         size_data = binary.writeAssumeCapacity(node_data.sliceFromEnd(), @intCast(u32, size_data.len + body_data.len));
 
+        const Node = std.SinglyLinkedList([]const u8).Node;
+        const node = @ptrCast(*Node, @alignCast(@alignOf(*Node), node_data.ptr()));
+        node.* = .{ .data = size_data.ptr()[0 .. size_data.len + body_data.len] };
+
         try await async client.write(runtime, node);
+
+        packets_per_second += 1;
+
+        const current_time = timer.read();
+
+        if (current_time - last_print_time > 1 * std.time.ns_per_s) {
+            log.info("spammed {} ping packets in the last second", .{packets_per_second});
+
+            last_print_time = current_time;
+            packets_per_second = 0;
+        }
     }
 
-    log.info("done!", .{});
+    log.info("done! took {}", .{std.fmt.fmtDuration(timer.read())});
 }

@@ -3,6 +3,7 @@ const std = @import("std");
 const os = std.os;
 const mem = std.mem;
 const math = std.math;
+const time = std.time;
 const log = std.log.scoped(.client);
 
 const ip = std.x.net.ip;
@@ -13,6 +14,7 @@ const assert = std.debug.assert;
 
 const binary = @import("binary.zig");
 
+const RPC = @import("RPC.zig");
 const Loop = @import("Loop.zig");
 const Packet = @import("Packet.zig");
 const Worker = @import("Worker.zig");
@@ -35,16 +37,21 @@ pub const Connection = struct {
 address: ip.Address,
 
 timer: Loop.Timer,
-queue: std.SinglyLinkedList([]const u8) = .{},
-next_worker_index: usize = 0,
 closed: bool = false,
 
-pool: []*Client.Connection,
 capacity: usize,
+
+queue: std.SinglyLinkedList([]const u8) = .{},
+queue_len: usize = 0,
+
+rpc: RPC,
+pool: []*Client.Connection,
+next_worker_index: usize = 0,
 
 pending: struct {
     connection_available: std.SinglyLinkedList(Client.Connection.Waiter) = .{},
     connecting: std.SinglyLinkedList(anyframe) = .{},
+    writes: std.SinglyLinkedList(Worker.Task) = .{},
     writers: std.TailQueue(Worker.Task) = .{},
     shutdown: std.SinglyLinkedList(anyframe) = .{},
 
@@ -76,6 +83,17 @@ pending: struct {
     fn parkUntilWriterNeeded(self: *@This(), conn: *Client.Connection) void {
         conn.writer = .{ .data = .{ .value = @frame() } };
         suspend self.writers.append(&conn.writer);
+    }
+
+    fn parkUntilMayWrite(self: *@This()) void {
+        var waiter: std.SinglyLinkedList(Worker.Task).Node = .{ .data = .{ .value = @frame() } };
+        suspend self.writes.prepend(&waiter);
+    }
+
+    fn unparkWriteRequests(self: *@This(), runtime: *Runtime) void {
+        while (self.writes.popFirst()) |waiter| {
+            runtime.schedule(0, 0, &waiter.data);
+        }
     }
 
     fn removeWriter(self: *@This(), runtime: *Runtime, conn: *Client.Connection) void {
@@ -119,7 +137,7 @@ circuit_breaker: struct {
 
     pub fn reportFailure(self: *@This()) void {
         self.num_failed_attempts = math.add(u64, self.num_failed_attempts, 1) catch self.num_failed_attempts;
-        self.last_time_attempt_failed = std.time.milliTimestamp();
+        self.last_time_attempt_failed = time.milliTimestamp();
     }
 
     pub fn tripped(self: @This()) bool {
@@ -132,7 +150,7 @@ circuit_breaker: struct {
         closed,
     } {
         if (self.num_failed_attempts <= 10) return .closed;
-        if (std.time.milliTimestamp() - self.last_time_attempt_failed > 30_000) return .half_open;
+        if (time.milliTimestamp() - self.last_time_attempt_failed > 30_000) return .half_open;
         return .open;
     }
 } = .{},
@@ -150,11 +168,17 @@ pub fn init(gpa: *mem.Allocator, runtime: *Runtime, address: ip.Address) !Client
         pool[pool_index] = try gpa.create(Client.Connection);
     }
 
+    const rpc = try RPC.init(gpa, 65536);
+    errdefer rpc.deinit(gpa);
+
     var timer = Loop.Timer.init(&runtime.workers.items[0].loop);
 
     var client = Client{
         .address = address,
+
         .timer = timer,
+
+        .rpc = rpc,
         .pool = pool,
         .capacity = capacity,
     };
@@ -165,9 +189,13 @@ pub fn init(gpa: *mem.Allocator, runtime: *Runtime, address: ip.Address) !Client
 }
 
 pub fn deinit(self: *Client, gpa: *mem.Allocator) void {
+    self.rpc.deinit(gpa);
+
     while (self.queue.popFirst()) |node| {
         gpa.destroy(node);
     }
+    self.queue_len = 0;
+
     self.pool.len = self.capacity;
     for (self.pool) |conn| {
         gpa.destroy(conn);
@@ -175,14 +203,16 @@ pub fn deinit(self: *Client, gpa: *mem.Allocator) void {
     gpa.free(self.pool);
 }
 
-pub fn shutdown(self: *Client) void {
+pub fn shutdown(self: *Client, runtime: *Runtime) void {
     self.closed = true;
-    self.timer.cancel();
 
     for (self.pool) |conn| {
         const client = conn.client orelse continue;
         client.shutdown(.recv) catch {};
     }
+
+    self.rpc.shutdown(runtime);
+    self.timer.cancel();
 }
 
 pub fn waitForShutdown(self: *Client) void {
@@ -191,17 +221,10 @@ pub fn waitForShutdown(self: *Client) void {
     }
 }
 
-pub fn write(self: *Client, runtime: *Runtime, node: *std.SinglyLinkedList([]const u8).Node) !void {
-    try self.ensureConnectionAvailable(runtime);
-
-    self.queue.prepend(node);
-    self.pending.wakeUpWriter(runtime);
-}
-
 pub fn ensureConnectionAvailable(self: *Client, runtime: *Runtime) !void {
     if (self.closed) return error.Closed;
 
-    if (self.pool.len == 0 or (self.queue.first != null and self.pool.len < self.capacity)) {
+    if (self.pool.len == 0 or (self.queue_len > 0 and self.pool.len < self.capacity)) {
         self.pool.len += 1;
 
         self.pool[self.pool.len - 1].worker_index = self.next_worker_index;
@@ -220,6 +243,19 @@ pub fn ensureConnectionAvailable(self: *Client, runtime: *Runtime) !void {
     if (connection_available) return;
 
     try self.pending.parkUntilConnectionAvailable();
+}
+
+pub fn write(self: *Client, runtime: *Runtime, node: *std.SinglyLinkedList([]const u8).Node) !void {
+    try self.ensureConnectionAvailable(runtime);
+
+    while (node.data.len + self.queue_len > 4 * 1024 * 1024) {
+        if (self.closed) return error.Closed;
+        self.pending.parkUntilMayWrite();
+    }
+    self.queue.prepend(node);
+    self.queue_len += node.data.len;
+
+    self.pending.wakeUpWriter(runtime);
 }
 
 fn serve(self: *Client, runtime: *Runtime, conn: *Client.Connection) void {
@@ -265,7 +301,7 @@ fn runIoLoops(self: *Client, runtime: *Runtime, conn: *Client.Connection) void {
     runtime.yield(conn.worker_index, 0);
 }
 
-fn runReadLoop(_: *Client, runtime: *Runtime, conn: *Client.Connection) !void {
+fn runReadLoop(self: *Client, runtime: *Runtime, conn: *Client.Connection) !void {
     runtime.yield(0, conn.worker_index);
 
     const loop = &runtime.workers.items[conn.worker_index].loop;
@@ -275,10 +311,8 @@ fn runReadLoop(_: *Client, runtime: *Runtime, conn: *Client.Connection) !void {
     defer buffer.deinit();
 
     while (true) {
-        try buffer.ensureUnusedCapacity(@sizeOf(u32));
-
         while (buffer.count < @sizeOf(u32)) {
-            const num_bytes_read = try loop.recv(client.socket.fd, buffer.writableSlice(0), 0);
+            const num_bytes_read = try loop.recv(client.socket.fd, try buffer.writableWithSize(65536), 0);
             if (num_bytes_read == 0) return error.EndOfFile;
             buffer.update(num_bytes_read);
         }
@@ -296,10 +330,8 @@ fn runReadLoop(_: *Client, runtime: *Runtime, conn: *Client.Connection) !void {
 
         size -= @sizeOf(u32);
 
-        try buffer.ensureUnusedCapacity(size);
-
         while (buffer.count < size) {
-            const num_bytes_read = try loop.recv(client.socket.fd, buffer.writableSlice(0), 0);
+            const num_bytes_read = try loop.recv(client.socket.fd, try buffer.writableWithSize(65536), 0);
             if (num_bytes_read == 0) return error.EndOfFile;
             buffer.update(num_bytes_read);
         }
@@ -314,7 +346,17 @@ fn runReadLoop(_: *Client, runtime: *Runtime, conn: *Client.Connection) !void {
 
         const packet = try Packet.unmarshal(message);
 
-        _ = packet;
+        switch (packet.get(.type)) {
+            .response => {
+                // await async runtime.yield(conn.worker_index, 0);
+                // defer await async runtime.yield(0, conn.worker_index);
+
+                if (self.rpc.unpark(runtime, packet, message[packet.buffer.len..])) {
+                    continue;
+                }
+            },
+            else => {},
+        }
     }
 }
 
@@ -332,17 +374,19 @@ fn runWriteLoop(self: *Client, runtime: *Runtime, conn: *Client.Connection, writ
         runtime.yield(conn.worker_index, 0);
         defer runtime.yield(0, conn.worker_index);
 
-        while (pending.popFirst()) |node| {
+        while (pending.popFirst()) |node| : (self.queue_len += node.data.len) {
             self.queue.prepend(node);
         }
     };
 
     while (true) {
-        runtime.yield(conn.worker_index, 0);
+        await async runtime.yield(conn.worker_index, 0);
 
         if (self.queue.first) |first| {
             pending.first = first;
             self.queue.first = null;
+            self.queue_len = 0;
+            self.pending.unparkWriteRequests(runtime);
         } else {
             if (self.closed or writer_done.*) {
                 return error.Closed;
@@ -351,9 +395,11 @@ fn runWriteLoop(self: *Client, runtime: *Runtime, conn: *Client.Connection, writ
             continue;
         }
 
-        runtime.yield(0, conn.worker_index);
+        await async runtime.yield(0, conn.worker_index);
 
-        while (pending.popFirst()) |node| {
+        var count: usize = 0;
+
+        while (pending.popFirst()) |node| : (count += 1) {
             defer runtime.gpa.destroy(node);
 
             if (node.data.len >= buffer[pos..].len) {
@@ -387,15 +433,15 @@ fn connect(self: *Client, runtime: *Runtime, conn: *Client.Connection) !tcp.Clie
     if (self.circuit_breaker.tripped()) return error.CircuitBreakerTripped;
 
     if (self.circuit_breaker.num_failed_attempts > 0 and self.circuit_breaker.last_time_attempt_failed > 0) {
-        const delay_max: i64 = 3000 * std.time.ns_per_ms;
-        const delay_step: i64 = 10 * std.time.ns_per_ms;
+        const delay_max: i64 = 3000 * time.ns_per_ms;
+        const delay_step: i64 = 10 * time.ns_per_ms;
         const delay = math.min(delay_max, delay_step * math.shl(i64, 1, self.circuit_breaker.num_failed_attempts - 1));
 
         log.debug("{} [{}] reconnection attempt #{}: will retry in {} milliseconds", .{
             self.address,
             conn.worker_index,
             self.circuit_breaker.num_failed_attempts,
-            @divTrunc(delay, std.time.ns_per_ms),
+            @divTrunc(delay, time.ns_per_ms),
         });
 
         try self.timer.waitFor(.{ .nanoseconds = delay });

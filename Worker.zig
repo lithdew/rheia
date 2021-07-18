@@ -15,7 +15,7 @@ const Atomic = std.atomic.Atomic;
 const Worker = @This();
 
 pub const Task = Worker.TaskQueue.Node;
-pub const TaskQueue = mpsc.UnboundedQueue(anyframe);
+pub const TaskQueue = mpsc.UnboundedStack(anyframe);
 
 const log = std.log.scoped(.worker);
 
@@ -66,20 +66,14 @@ pub fn shutdown(self: *Worker) void {
 }
 
 pub fn pollIncomingTasks(self: *Worker) usize {
-    var attempts: usize = 0;
     var num_tasks_processed: usize = 0;
 
-    while (attempts < 128) : (attempts += 1) {
-        var num_tasks_processed_in_attempt: usize = 0;
-
-        for (self.task_queues.items) |*task_queue| {
-            const node = task_queue.pop() orelse continue;
-            num_tasks_processed_in_attempt += 1;
+    for (self.task_queues.items) |*task_queue| {
+        var it = task_queue.popBatch();
+        while (it) |node| : (num_tasks_processed += 1) {
+            it = node.next;
             resume node.value;
         }
-
-        if (num_tasks_processed_in_attempt == 0) break;
-        num_tasks_processed += num_tasks_processed_in_attempt;
     }
 
     return num_tasks_processed;
@@ -93,9 +87,27 @@ pub fn run(self: *Worker) !void {
     log.debug("worker {} started", .{self.id});
     defer log.debug("worker {} is done", .{self.id});
 
+    var timer = try std.time.Timer.start();
+    var incoming_task_count: usize = 0;
+    var event_loop_task_count: usize = 0;
+
     while (true) {
         const num_processed_incoming_tasks = self.pollIncomingTasks();
         const num_processed_event_loop_tasks = try self.pollEventLoop(num_processed_incoming_tasks == 0);
+
+        incoming_task_count += num_processed_incoming_tasks;
+        event_loop_task_count += num_processed_event_loop_tasks;
+
+        if (timer.read() > 1 * std.time.ns_per_s) {
+            log.info("worker {}: in the last second, processed {} incoming task(s) and {} event loop task(s)", .{
+                self.id,
+                incoming_task_count,
+                event_loop_task_count,
+            });
+            incoming_task_count = 0;
+            event_loop_task_count = 0;
+            timer.reset();
+        }
 
         if (shutdown: {
             if (num_processed_event_loop_tasks > 0) break :shutdown false;

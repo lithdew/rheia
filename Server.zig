@@ -23,8 +23,11 @@ pub const Connection = struct {
     address: ip.Address,
     frame: @Frame(Server.serveConnection),
 
+    done: bool,
     writer: ?*Worker.Task,
-    queue: std.SinglyLinkedList([]const u8),
+    queuer: ?*Worker.Task,
+
+    queue: std.fifo.LinearFifo(u8, .Dynamic),
 };
 
 connections: std.AutoArrayHashMapUnmanaged(*Server.Connection, void) = .{},
@@ -41,7 +44,7 @@ pub fn deinit(self: *Server, gpa: *mem.Allocator) void {
     self.connections.deinit(gpa);
 }
 
-pub fn shutdown(self: *Server) void {
+pub fn shutdown(self: *Server, _: *Runtime) void {
     var it = self.connections.iterator();
     while (it.next()) |entry| {
         entry.key_ptr.*.client.shutdown(.recv) catch {};
@@ -56,8 +59,10 @@ pub fn waitForShutdown(self: *Server) callconv(.Async) void {
 }
 
 pub fn serve(self: *Server, runtime: *Runtime, listener: tcp.Listener) !void {
-    log.info("listening for peers on {}", .{try listener.getLocalAddress()});
-    defer log.info("successfully shut down", .{});
+    const address = try listener.getLocalAddress();
+
+    log.info("listening for peers on {}", .{address});
+    defer log.info("stopped listening for peers on {}", .{address});
 
     const loop = &runtime.workers.items[0].loop;
 
@@ -82,8 +87,11 @@ pub fn serve(self: *Server, runtime: *Runtime, listener: tcp.Listener) !void {
         server_conn.client = tcp.Client.from(conn.socket);
         server_conn.address = ip.Address.from(conn.address);
 
+        server_conn.done = false;
         server_conn.writer = null;
-        server_conn.queue = .{};
+        server_conn.queuer = null;
+
+        server_conn.queue = std.fifo.LinearFifo(u8, .Dynamic).init(runtime.gpa);
 
         server_conn.frame = async self.serveConnection(runtime, server_conn);
     }
@@ -94,10 +102,6 @@ fn serveConnection(self: *Server, runtime: *Runtime, conn: *Server.Connection) !
     defer log.debug("peer disconnected: {}", .{conn.address});
 
     defer {
-        while (conn.queue.popFirst()) |node| {
-            runtime.gpa.destroy(node);
-        }
-
         suspend {
             conn.client.deinit();
             self.deregister(runtime.gpa, conn);
@@ -109,32 +113,32 @@ fn serveConnection(self: *Server, runtime: *Runtime, conn: *Server.Connection) !
 
     try conn.client.setNoDelay(true);
 
-    var writer_done = false;
-    var writer_frame = async self.runWriteLoop(runtime, conn, &writer_done);
+    var writer_frame = async self.runWriteLoop(runtime, conn);
     var reader_frame = async self.runReadLoop(runtime, conn);
 
     await reader_frame catch {};
-
-    writer_done = true;
-    if (conn.writer) |writer| {
-        conn.writer = null;
-        runtime.schedule(conn.worker_index, conn.worker_index, writer);
-    }
-
     await writer_frame catch {};
+
+    conn.queue.deinit();
 }
 
 fn runReadLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
+    defer {
+        conn.done = true;
+        if (conn.writer) |writer| {
+            conn.writer = null;
+            runtime.schedule(conn.worker_index, conn.worker_index, writer);
+        }
+    }
+
     const loop = &runtime.workers.items[conn.worker_index].loop;
 
     var buffer = std.fifo.LinearFifo(u8, .Dynamic).init(runtime.gpa);
     defer buffer.deinit();
 
     while (true) {
-        try buffer.ensureUnusedCapacity(@sizeOf(u32));
-
         while (buffer.count < @sizeOf(u32)) {
-            const num_bytes_read = try loop.recv(conn.client.socket.fd, buffer.writableSlice(0), 0);
+            const num_bytes_read = try loop.recv(conn.client.socket.fd, try buffer.writableWithSize(65536), 0);
             if (num_bytes_read == 0) return error.EndOfFile;
             buffer.update(num_bytes_read);
         }
@@ -152,10 +156,8 @@ fn runReadLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
 
         size -= @sizeOf(u32);
 
-        try buffer.ensureUnusedCapacity(size);
-
         while (buffer.count < size) {
-            const num_bytes_read = try loop.recv(conn.client.socket.fd, buffer.writableSlice(0), 0);
+            const num_bytes_read = try loop.recv(conn.client.socket.fd, try buffer.writableWithSize(65536), 0);
             if (num_bytes_read == 0) return error.EndOfFile;
             buffer.update(num_bytes_read);
         }
@@ -171,24 +173,26 @@ fn runReadLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
         const packet = try Packet.unmarshal(message);
 
         switch (packet.get(.type)) {
-            .command => switch (packet.get(.tag)) {
+            .request => switch (packet.get(.tag)) {
                 .ping => {
                     var buf = std.ArrayList(u8).init(runtime.gpa);
-                    errdefer buf.deinit();
+                    defer buf.deinit();
 
-                    const node_data = try binary.Buffer.from(&buf).allocate(@sizeOf(std.SinglyLinkedList([]const u8).Node));
-                    const node = @ptrCast(*std.SinglyLinkedList([]const u8).Node, @alignCast(@alignOf(*std.SinglyLinkedList([]const u8).Node), node_data.ptr()));
+                    var size_data = try binary.allocate(binary.Buffer.from(&buf), u32);
+                    var body_data = try Packet.append(size_data.sliceFromEnd(), .{ .nonce = packet.get(.nonce), .@"type" = .response, .tag = .ping });
+                    size_data = binary.writeAssumeCapacity(size_data.sliceFromStart(), @intCast(u32, size_data.len + body_data.len));
 
-                    var size_data = try binary.allocate(node_data.sliceFromEnd(), u32);
-                    var body_data = try Packet.append(size_data.sliceFromEnd(), .{ .nonce = packet.get(.nonce), .@"type" = .command, .tag = .ping });
-                    node.* = .{ .data = size_data.ptr()[0 .. size_data.len + body_data.len] };
+                    while (buf.items.len + conn.queue.count > 1 * 1024 * 1024) {
+                        if (conn.done) return error.Closed;
+                        var waiter: Worker.Task = .{ .value = @frame() };
+                        suspend conn.queuer = &waiter;
+                    }
 
-                    size_data = binary.writeAssumeCapacity(node_data.sliceFromEnd(), @intCast(u32, size_data.len + body_data.len));
+                    try conn.queue.writer().writeAll(buf.items);
 
-                    conn.queue.prepend(node);
-                    if (conn.writer) |writer| {
+                    if (conn.writer) |waiter| {
                         conn.writer = null;
-                        runtime.schedule(conn.worker_index, conn.worker_index, writer);
+                        runtime.schedule(conn.worker_index, conn.worker_index, waiter);
                     }
                 },
                 else => {},
@@ -198,43 +202,35 @@ fn runReadLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
     }
 }
 
-fn runWriteLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection, writer_done: *const bool) !void {
+fn runWriteLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
+    defer {
+        conn.done = true;
+        if (conn.queuer) |queuer| {
+            conn.queuer = null;
+            runtime.schedule(conn.worker_index, conn.worker_index, queuer);
+        }
+    }
+
     const loop = &runtime.workers.items[conn.worker_index].loop;
 
     var buffer: [65536]u8 = undefined;
-    var pos: usize = 0;
 
     while (true) {
-        if (conn.queue.first == null) {
-            if (writer_done.*) return error.Closed;
+        if (conn.queue.count == 0) {
+            if (conn.done) return error.Closed;
             var task: Worker.Task = .{ .value = @frame() };
             suspend conn.writer = &task;
             continue;
         }
 
-        while (conn.queue.popFirst()) |node| {
-            defer runtime.gpa.destroy(node);
-
-            if (node.data.len >= buffer[pos..].len) {
-                // If a queued message cannot fit into the buffer, do a dedicated send() on
-                // the message rather than attempt to have it fit inside the buffer.
-
-                if (node.data.len > buffer.len) {
-                    @setCold(true);
-                    try writeAll(loop, conn.client, node.data);
-                    continue;
-                }
-
-                try writeAll(loop, conn.client, buffer[0..pos]);
-                pos = 0;
-            }
-
-            mem.copy(u8, buffer[pos..], node.data);
-            pos += node.data.len;
+        while (conn.queue.count > 0) {
+            try writeAll(loop, conn.client, buffer[0..try conn.queue.reader().readAll(&buffer)]);
         }
 
-        try writeAll(loop, conn.client, buffer[0..pos]);
-        pos = 0;
+        if (conn.queuer) |waiter| {
+            conn.queuer = null;
+            runtime.schedule(conn.worker_index, conn.worker_index, waiter);
+        }
     }
 }
 
