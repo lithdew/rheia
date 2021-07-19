@@ -92,7 +92,7 @@ pending: struct {
 
     fn unparkWriteRequests(self: *@This(), runtime: *Runtime) void {
         while (self.writes.popFirst()) |waiter| {
-            runtime.schedule(0, 0, &waiter.data);
+            runtime.schedule(0, &waiter.data);
         }
     }
 
@@ -104,7 +104,7 @@ pending: struct {
         conn.writer.next = null;
         conn.writer.prev = null;
 
-        runtime.schedule(0, conn.worker_index, &conn.writer.data);
+        runtime.schedule(conn.worker_index, &conn.writer.data);
     }
 
     fn wakeUpWriter(self: *@This(), runtime: *Runtime) void {
@@ -113,7 +113,7 @@ pending: struct {
         writer.prev = null;
 
         const conn = @fieldParentPtr(Client.Connection, "writer", writer);
-        runtime.schedule(0, conn.worker_index, &writer.data);
+        runtime.schedule(conn.worker_index, &writer.data);
     }
 
     fn parkUntilShutdownCompleted(self: *@This()) void {
@@ -290,7 +290,7 @@ fn runIoLoops(self: *Client, runtime: *Runtime, conn: *Client.Connection) void {
     var reader_frame = async self.runReadLoop(runtime, conn);
 
     await reader_frame catch {};
-    runtime.yield(conn.worker_index, 0);
+    runtime.yield(0);
 
     {
         writer_done = true;
@@ -298,11 +298,11 @@ fn runIoLoops(self: *Client, runtime: *Runtime, conn: *Client.Connection) void {
     }
 
     await writer_frame catch {};
-    runtime.yield(conn.worker_index, 0);
+    runtime.yield(0);
 }
 
 fn runReadLoop(self: *Client, runtime: *Runtime, conn: *Client.Connection) !void {
-    runtime.yield(0, conn.worker_index);
+    runtime.yield(conn.worker_index);
 
     const loop = &runtime.workers.items[conn.worker_index].loop;
     const client = conn.client orelse unreachable;
@@ -348,9 +348,6 @@ fn runReadLoop(self: *Client, runtime: *Runtime, conn: *Client.Connection) !void
 
         switch (packet.get(.type)) {
             .response => {
-                // await async runtime.yield(conn.worker_index, 0);
-                // defer await async runtime.yield(0, conn.worker_index);
-
                 if (self.rpc.unpark(runtime, packet, message[packet.buffer.len..])) {
                     continue;
                 }
@@ -361,7 +358,7 @@ fn runReadLoop(self: *Client, runtime: *Runtime, conn: *Client.Connection) !void
 }
 
 fn runWriteLoop(self: *Client, runtime: *Runtime, conn: *Client.Connection, writer_done: *const bool) !void {
-    runtime.yield(0, conn.worker_index);
+    runtime.yield(conn.worker_index);
 
     const loop = &runtime.workers.items[conn.worker_index].loop;
     const client = conn.client orelse unreachable;
@@ -371,8 +368,8 @@ fn runWriteLoop(self: *Client, runtime: *Runtime, conn: *Client.Connection, writ
 
     var pending: std.SinglyLinkedList([]const u8) = .{};
     defer if (pending.first != null) {
-        runtime.yield(conn.worker_index, 0);
-        defer runtime.yield(0, conn.worker_index);
+        runtime.yield(0);
+        defer runtime.yield(conn.worker_index);
 
         while (pending.popFirst()) |node| : (self.queue_len += node.data.len) {
             self.queue.prepend(node);
@@ -380,7 +377,7 @@ fn runWriteLoop(self: *Client, runtime: *Runtime, conn: *Client.Connection, writ
     };
 
     while (true) {
-        await async runtime.yield(conn.worker_index, 0);
+        await async runtime.yield(0);
 
         if (self.queue.first) |first| {
             pending.first = first;
@@ -395,7 +392,7 @@ fn runWriteLoop(self: *Client, runtime: *Runtime, conn: *Client.Connection, writ
             continue;
         }
 
-        await async runtime.yield(0, conn.worker_index);
+        await async runtime.yield(conn.worker_index);
 
         var count: usize = 0;
 

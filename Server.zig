@@ -108,8 +108,8 @@ fn serveConnection(self: *Server, runtime: *Runtime, conn: *Server.Connection) !
         }
     }
 
-    runtime.yield(0, conn.worker_index);
-    defer runtime.yield(conn.worker_index, 0);
+    runtime.yield(conn.worker_index);
+    defer runtime.yield(0);
 
     try conn.client.setNoDelay(true);
 
@@ -127,7 +127,7 @@ fn runReadLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
         conn.done = true;
         if (conn.writer) |writer| {
             conn.writer = null;
-            runtime.schedule(conn.worker_index, conn.worker_index, writer);
+            runtime.schedule(conn.worker_index, writer);
         }
     }
 
@@ -135,6 +135,9 @@ fn runReadLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
 
     var buffer = std.fifo.LinearFifo(u8, .Dynamic).init(runtime.gpa);
     defer buffer.deinit();
+
+    var buf = std.ArrayList(u8).init(runtime.gpa);
+    defer buf.deinit();
 
     while (true) {
         while (buffer.count < @sizeOf(u32)) {
@@ -175,8 +178,7 @@ fn runReadLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
         switch (packet.get(.type)) {
             .request => switch (packet.get(.tag)) {
                 .ping => {
-                    var buf = std.ArrayList(u8).init(runtime.gpa);
-                    defer buf.deinit();
+                    buf.clearRetainingCapacity();
 
                     var size_data = try binary.allocate(binary.Buffer.from(&buf), u32);
                     var body_data = try Packet.append(size_data.sliceFromEnd(), .{ .nonce = packet.get(.nonce), .@"type" = .response, .tag = .ping });
@@ -192,7 +194,7 @@ fn runReadLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
 
                     if (conn.writer) |waiter| {
                         conn.writer = null;
-                        runtime.schedule(conn.worker_index, conn.worker_index, waiter);
+                        runtime.schedule(conn.worker_index, waiter);
                     }
                 },
                 else => {},
@@ -207,7 +209,7 @@ fn runWriteLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
         conn.done = true;
         if (conn.queuer) |queuer| {
             conn.queuer = null;
-            runtime.schedule(conn.worker_index, conn.worker_index, queuer);
+            runtime.schedule(conn.worker_index, queuer);
         }
     }
 
@@ -229,7 +231,7 @@ fn runWriteLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
 
         if (conn.queuer) |waiter| {
             conn.queuer = null;
-            runtime.schedule(conn.worker_index, conn.worker_index, waiter);
+            runtime.schedule(conn.worker_index, waiter);
         }
     }
 }

@@ -96,7 +96,7 @@ fn runClient(runtime: *Runtime, _: *Loop.Timer, client: *Client) !void {
 
     var i: usize = 0;
     while (i < 100_000_000) : (i += 1) {
-        defer await async runtime.yield(0, 0);
+        defer await async runtime.yield(0);
 
         var buf = std.ArrayList(u8).init(runtime.gpa);
         errdefer buf.deinit();

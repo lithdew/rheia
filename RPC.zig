@@ -6,6 +6,7 @@ const testing = std.testing;
 
 const assert = std.debug.assert;
 
+const Lock = @import("Lock.zig");
 const Worker = @import("Worker.zig");
 const Packet = @import("Packet.zig");
 const Runtime = @import("Runtime.zig");
@@ -23,7 +24,7 @@ pub const Waiter = struct {
     } = null,
 };
 
-lock: std.Thread.Mutex = .{},
+lock: Lock = .{},
 head: u32 = 0,
 tail: u32 = 0,
 entries: []?*RPC.Waiter,
@@ -44,20 +45,20 @@ pub fn deinit(self: *RPC, gpa: *mem.Allocator) void {
 }
 
 pub fn shutdown(self: *RPC, runtime: *Runtime) void {
-    const held = self.lock.acquire();
-    defer held.release();
+    self.lock.acquire();
+    defer self.lock.release(runtime);
 
     for (self.entries) |*maybe_waiter| {
         if (maybe_waiter.*) |waiter| {
             maybe_waiter.* = null;
-            runtime.schedule(0, waiter.worker_index, &waiter.task);
+            runtime.schedule(waiter.worker_index, &waiter.task);
         }
     }
 }
 
-pub fn park(self: *RPC, waiter: *RPC.Waiter) !u32 {
-    const held = self.lock.acquire();
-    defer held.release();
+pub fn park(self: *RPC, runtime: *Runtime, waiter: *RPC.Waiter) !u32 {
+    self.lock.acquire();
+    defer self.lock.release(runtime);
 
     const nonce = self.head;
     if (nonce -% self.tail == self.entries.len) {
@@ -69,8 +70,8 @@ pub fn park(self: *RPC, waiter: *RPC.Waiter) !u32 {
 }
 
 pub fn cancel(self: *RPC, nonce: u32) ?*RPC.Waiter {
-    const held = self.lock.acquire();
-    defer held.release();
+    self.lock.acquire();
+    defer self.lock.release(runtime);
 
     const distance = nonce -% self.tail;
     if (distance >= self.entries.len) return null;
@@ -83,8 +84,8 @@ pub fn cancel(self: *RPC, nonce: u32) ?*RPC.Waiter {
 }
 
 pub fn unpark(self: *RPC, runtime: *Runtime, packet: Packet, data: []const u8) bool {
-    const held = self.lock.acquire();
-    defer held.release();
+    self.lock.acquire();
+    defer self.lock.release(runtime);
 
     const nonce = packet.get(.nonce);
 
@@ -98,7 +99,7 @@ pub fn unpark(self: *RPC, runtime: *Runtime, packet: Packet, data: []const u8) b
     if (distance == 0) self.tail +%= 1;
 
     waiter.result = .{ .header = packet, .data = data };
-    runtime.schedule(0, waiter.worker_index, &waiter.task);
+    runtime.schedule(waiter.worker_index, &waiter.task);
 
     return true;
 }

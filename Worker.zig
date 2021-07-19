@@ -17,6 +17,8 @@ const Worker = @This();
 pub const Task = Worker.TaskQueue.Node;
 pub const TaskQueue = mpsc.UnboundedStack(anyframe);
 
+pub threadlocal var current: ?*Worker = null;
+
 const log = std.log.scoped(.worker);
 
 id: usize,
@@ -65,6 +67,10 @@ pub fn shutdown(self: *Worker) void {
     self.loop.notify();
 }
 
+pub inline fn getCurrent() *Worker {
+    return Worker.current orelse unreachable;
+}
+
 pub fn pollIncomingTasks(self: *Worker) usize {
     var num_tasks_processed: usize = 0;
 
@@ -84,6 +90,8 @@ pub fn pollEventLoop(self: *Worker, blocking: bool) !usize {
 }
 
 pub fn run(self: *Worker) !void {
+    Worker.current = self;
+
     log.debug("worker {} started", .{self.id});
     defer log.debug("worker {} is done", .{self.id});
 

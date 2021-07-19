@@ -80,21 +80,24 @@ pub fn waitForSignal(self: *Runtime) !void {
     }
 }
 
-pub fn yield(self: *Runtime, from: usize, to: usize) void {
-    const same_worker = from == to;
-    if (same_worker and self.workers.items[to].task_queues.items[from].isEmpty()) {
-        return;
-    }
+pub fn yield(self: *Runtime, to: usize) void {
+    const worker = Worker.getCurrent();
+
+    const same_worker = worker.id == to;
+    if (same_worker) return;
+
     var task: Worker.Task = .{ .value = @frame() };
     suspend {
-        self.workers.items[to].task_queues.items[from].push(&task);
+        self.workers.items[to].task_queues.items[worker.id].push(&task);
         if (!same_worker) self.workers.items[to].loop.notify();
     }
 }
 
-pub fn schedule(self: *Runtime, from: usize, to: usize, task: *Worker.Task) void {
-    const same_worker = from == to;
-    self.workers.items[to].task_queues.items[from].push(task);
+pub inline fn schedule(self: *Runtime, to: usize, task: *Worker.Task) void {
+    const worker = Worker.getCurrent();
+
+    const same_worker = worker.id == to;
+    self.workers.items[to].task_queues.items[worker.id].push(task);
     if (!same_worker) self.workers.items[to].loop.notify();
 }
 
