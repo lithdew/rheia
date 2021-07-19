@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const builtin = std.builtin;
 const testing = std.testing;
 
 const Atomic = std.atomic.Atomic;
@@ -16,7 +17,7 @@ pub const queue_mask: usize = ~@as(usize, 3);
 
 pub const Waiter = struct {
     task: Worker.Task,
-    worker_index: usize,
+    worker_id: usize,
 
     queue_tail: ?*Lock.Waiter = null,
     prev: ?*Lock.Waiter = null,
@@ -26,6 +27,8 @@ pub const Waiter = struct {
 state: Atomic(usize) = .{ .value = 0 },
 
 pub fn acquire(self: *Lock) void {
+    if (builtin.single_threaded) return;
+
     if (self.tryAcquire()) {
         return;
     }
@@ -33,6 +36,8 @@ pub fn acquire(self: *Lock) void {
 }
 
 pub inline fn tryAcquire(self: *Lock) bool {
+    if (builtin.single_threaded) return true;
+
     return self.state.tryCompareAndSwap(
         0,
         locked_bit,
@@ -44,7 +49,7 @@ pub inline fn tryAcquire(self: *Lock) bool {
 fn acquireSlow(self: *Lock) void {
     @setCold(true);
 
-    var spin_wait: SpinWait = .{};
+    // var spin_wait: SpinWait = .{};
     var state = self.state.load(.Monotonic);
     while (true) {
         if (state & locked_bit == 0) {
@@ -60,14 +65,14 @@ fn acquireSlow(self: *Lock) void {
             continue;
         }
 
-        if (@intToPtr(?*Lock.Waiter, state & queue_mask) == null and spin_wait.spin()) {
-            state = self.state.load(.Monotonic);
-            continue;
-        }
+        // if (@intToPtr(?*Lock.Waiter, state & queue_mask) == null and spin_wait.spin()) {
+        //     state = self.state.load(.Monotonic);
+        //     continue;
+        // }
 
         var waiter: Lock.Waiter = .{
             .task = .{ .value = @frame() },
-            .worker_index = Worker.getCurrent().id,
+            .worker_id = Worker.getCurrent().id,
         };
 
         suspend {
@@ -91,12 +96,14 @@ fn acquireSlow(self: *Lock) void {
             }
         }
 
-        spin_wait.reset();
+        // spin_wait.reset();
         state = self.state.load(.Monotonic);
     }
 }
 
 pub inline fn release(self: *Lock, runtime: *Runtime) void {
+    if (builtin.single_threaded) return;
+
     const state = self.state.fetchSub(locked_bit, .Release);
     if (state & queue_locked_bit != 0 or @intToPtr(?*Lock.Waiter, state & queue_mask) == null) {
         return;
@@ -170,7 +177,7 @@ fn releaseSlow(self: *Lock, runtime: *Runtime) void {
             continue :outer;
         }
 
-        break runtime.schedule(queue_tail.worker_index, &queue_tail.task);
+        break runtime.scheduleTo(queue_tail.worker_id, &queue_tail.task);
     }
 }
 

@@ -16,7 +16,7 @@ const RPC = @This();
 pub const max_num_pending_entries = 65536;
 
 pub const Waiter = struct {
-    worker_index: usize,
+    worker_id: usize,
     task: Worker.Task,
     result: ?struct {
         header: Packet,
@@ -51,7 +51,7 @@ pub fn shutdown(self: *RPC, runtime: *Runtime) void {
     for (self.entries) |*maybe_waiter| {
         if (maybe_waiter.*) |waiter| {
             maybe_waiter.* = null;
-            runtime.schedule(waiter.worker_index, &waiter.task);
+            runtime.scheduleTo(waiter.worker_id, &waiter.task);
         }
     }
 }
@@ -99,7 +99,7 @@ pub fn unpark(self: *RPC, runtime: *Runtime, packet: Packet, data: []const u8) b
     if (distance == 0) self.tail +%= 1;
 
     waiter.result = .{ .header = packet, .data = data };
-    runtime.schedule(waiter.worker_index, &waiter.task);
+    runtime.scheduleTo(waiter.worker_id, &waiter.task);
 
     return true;
 }

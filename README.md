@@ -7,7 +7,6 @@ A blockchain written in [Zig](https://ziglang.org).
 ### concurrency
 - thread-per-core architecture (thread pools for cpu-bound work, and i/o bound work)
 - async disk and network i/o using io_uring (multi-threaded event loop)
-- all shared state kept on main thread (shared-nothing architecture)
 - (s/m)psc lock-free queues for cross-thread communication
 - eventfd for cross-thread notifications
 

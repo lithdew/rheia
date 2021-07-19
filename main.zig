@@ -44,7 +44,7 @@ pub fn run(runtime: *Runtime) !void {
     var server = Server.init();
     defer {
         server.shutdown(runtime);
-        server.waitForShutdown();
+        server.waitForShutdown(runtime);
         server.deinit(runtime.gpa);
     }
 
@@ -65,7 +65,7 @@ pub fn run(runtime: *Runtime) !void {
 
     var client = try Client.init(runtime.gpa, runtime, ip.Address.initIPv4(IPv4.localhost, 9000));
     defer {
-        client.waitForShutdown();
+        client.waitForShutdown(runtime);
         client.deinit(runtime.gpa);
     }
 
@@ -94,20 +94,18 @@ fn runClient(runtime: *Runtime, _: *Loop.Timer, client: *Client) !void {
     var packets_per_second: usize = 0;
     var last_print_time: usize = 0;
 
-    var i: usize = 0;
+    var i: u32 = 0;
     while (i < 100_000_000) : (i += 1) {
-        defer await async runtime.yield(0);
-
         var buf = std.ArrayList(u8).init(runtime.gpa);
         errdefer buf.deinit();
 
-        const node_data = try binary.Buffer.from(&buf).allocate(@sizeOf(std.SinglyLinkedList([]const u8).Node));
+        const Node = std.SinglyLinkedList([]const u8).Node;
+        const node_data = try binary.Buffer.from(&buf).allocate(@sizeOf(Node));
 
         var size_data = try binary.allocate(node_data.sliceFromEnd(), u32);
-        var body_data = try Packet.append(size_data.sliceFromEnd(), .{ .nonce = 0, .@"type" = .request, .tag = .ping });
+        var body_data = try Packet.append(size_data.sliceFromEnd(), .{ .nonce = i, .@"type" = .request, .tag = .ping });
         size_data = binary.writeAssumeCapacity(node_data.sliceFromEnd(), @intCast(u32, size_data.len + body_data.len));
 
-        const Node = std.SinglyLinkedList([]const u8).Node;
         const node = @ptrCast(*Node, @alignCast(@alignOf(*Node), node_data.ptr()));
         node.* = .{ .data = size_data.ptr()[0 .. size_data.len + body_data.len] };
 

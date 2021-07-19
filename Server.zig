@@ -10,15 +10,24 @@ const binary = @import("binary.zig");
 
 const assert = std.debug.assert;
 
+const Lock = @import("Lock.zig");
 const Loop = @import("Loop.zig");
 const Packet = @import("Packet.zig");
 const Worker = @import("Worker.zig");
 const Runtime = @import("Runtime.zig");
 
+const SinglyLinkedList = @import("intrusive.zig").SinglyLinkedList;
+
 const Server = @This();
 
+pub const Waiter = struct {
+    next: ?*Waiter = null,
+    worker_id: usize,
+    task: Worker.Task,
+};
+
 pub const Connection = struct {
-    worker_index: usize,
+    worker_id: usize,
     client: tcp.Client,
     address: ip.Address,
     frame: @Frame(Server.serveConnection),
@@ -30,10 +39,11 @@ pub const Connection = struct {
     queue: std.fifo.LinearFifo(u8, .Dynamic),
 };
 
+lock: Lock = .{},
 connections: std.AutoArrayHashMapUnmanaged(*Server.Connection, void) = .{},
 
 pending: struct {
-    shutdown: std.SinglyLinkedList(anyframe) = .{},
+    shutdown: SinglyLinkedList(Server.Waiter, .next) = .{},
 } = .{},
 
 pub fn init() Server {
@@ -44,17 +54,30 @@ pub fn deinit(self: *Server, gpa: *mem.Allocator) void {
     self.connections.deinit(gpa);
 }
 
-pub fn shutdown(self: *Server, _: *Runtime) void {
+pub fn shutdown(self: *Server, runtime: *Runtime) void {
+    self.lock.acquire();
+    defer self.lock.release(runtime);
+
     var it = self.connections.iterator();
     while (it.next()) |entry| {
         entry.key_ptr.*.client.shutdown(.recv) catch {};
     }
 }
 
-pub fn waitForShutdown(self: *Server) callconv(.Async) void {
+pub fn waitForShutdown(self: *Server, runtime: *Runtime) callconv(.Async) void {
+    self.lock.acquire();
     if (self.connections.count() > 0) {
-        var waiter: std.SinglyLinkedList(anyframe).Node = .{ .data = @frame() };
-        suspend self.pending.shutdown.prepend(&waiter);
+        var waiter: Server.Waiter = .{
+            .worker_id = Worker.getCurrent().id,
+            .task = .{ .value = @frame() },
+        };
+
+        suspend {
+            self.pending.shutdown.prepend(&waiter);
+            self.lock.release(runtime);
+        }
+    } else {
+        self.lock.release(runtime);
     }
 }
 
@@ -64,9 +87,9 @@ pub fn serve(self: *Server, runtime: *Runtime, listener: tcp.Listener) !void {
     log.info("listening for peers on {}", .{address});
     defer log.info("stopped listening for peers on {}", .{address});
 
-    const loop = &runtime.workers.items[0].loop;
+    const loop = &Worker.getCurrent().loop;
 
-    var next_worker_index: usize = 0;
+    var next_worker_id: usize = 0;
 
     while (true) {
         const conn = loop.accept(listener.socket.fd, .{ .close_on_exec = true }) catch |err| switch (err) {
@@ -78,11 +101,11 @@ pub fn serve(self: *Server, runtime: *Runtime, listener: tcp.Listener) !void {
         const server_conn = try runtime.gpa.create(Server.Connection);
         errdefer runtime.gpa.destroy(server_conn);
 
-        try self.register(runtime.gpa, server_conn);
-        errdefer self.deregister(runtime.gpa, server_conn);
+        try self.register(runtime.gpa, runtime, server_conn);
+        errdefer _ = self.deregister(runtime, server_conn);
 
-        server_conn.worker_index = next_worker_index;
-        defer next_worker_index = (next_worker_index + 1) % runtime.workers.items.len;
+        server_conn.worker_id = next_worker_id;
+        defer next_worker_id = (next_worker_id + 1) % runtime.worker_count;
 
         server_conn.client = tcp.Client.from(conn.socket);
         server_conn.address = ip.Address.from(conn.address);
@@ -98,18 +121,18 @@ pub fn serve(self: *Server, runtime: *Runtime, listener: tcp.Listener) !void {
 }
 
 fn serveConnection(self: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
-    log.debug("new peer connected: {}", .{conn.address});
-    defer log.debug("peer disconnected: {}", .{conn.address});
+    runtime.yield(conn.worker_id);
 
     defer {
-        suspend {
-            conn.client.deinit();
-            self.deregister(runtime.gpa, conn);
-        }
+        conn.queue.deinit();
+        conn.client.deinit();
+
+        var waiters = self.deregister(runtime, conn);
+        suspend destroy(runtime, conn, waiters);
     }
 
-    runtime.yield(conn.worker_index);
-    defer runtime.yield(0);
+    log.debug("new peer connected: {}", .{conn.address});
+    defer log.debug("peer disconnected: {}", .{conn.address});
 
     try conn.client.setNoDelay(true);
 
@@ -118,20 +141,18 @@ fn serveConnection(self: *Server, runtime: *Runtime, conn: *Server.Connection) !
 
     await reader_frame catch {};
     await writer_frame catch {};
-
-    conn.queue.deinit();
 }
 
 fn runReadLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
     defer {
         conn.done = true;
-        if (conn.writer) |writer| {
+        if (conn.writer) |waiter| {
             conn.writer = null;
-            runtime.schedule(conn.worker_index, writer);
+            runtime.schedule(waiter);
         }
     }
 
-    const loop = &runtime.workers.items[conn.worker_index].loop;
+    const loop = &Worker.getCurrent().loop;
 
     var buffer = std.fifo.LinearFifo(u8, .Dynamic).init(runtime.gpa);
     defer buffer.deinit();
@@ -194,7 +215,7 @@ fn runReadLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
 
                     if (conn.writer) |waiter| {
                         conn.writer = null;
-                        runtime.schedule(conn.worker_index, waiter);
+                        runtime.schedule(waiter);
                     }
                 },
                 else => {},
@@ -209,11 +230,11 @@ fn runWriteLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
         conn.done = true;
         if (conn.queuer) |queuer| {
             conn.queuer = null;
-            runtime.schedule(conn.worker_index, queuer);
+            runtime.schedule(queuer);
         }
     }
 
-    const loop = &runtime.workers.items[conn.worker_index].loop;
+    const loop = &Worker.getCurrent().loop;
 
     var buffer: [65536]u8 = undefined;
 
@@ -231,7 +252,7 @@ fn runWriteLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
 
         if (conn.queuer) |waiter| {
             conn.queuer = null;
-            runtime.schedule(conn.worker_index, waiter);
+            runtime.schedule(waiter);
         }
     }
 }
@@ -243,17 +264,35 @@ fn writeAll(loop: *Loop, client: tcp.Client, buffer: []const u8) !void {
     }
 }
 
-fn register(self: *Server, gpa: *mem.Allocator, conn: *Server.Connection) !void {
+fn register(self: *Server, gpa: *mem.Allocator, runtime: *Runtime, conn: *Server.Connection) !void {
+    self.lock.acquire();
+    defer self.lock.release(runtime);
+
     try self.connections.put(gpa, conn, {});
 }
 
-fn deregister(self: *Server, gpa: *mem.Allocator, conn: *Server.Connection) void {
-    assert(self.connections.swapRemove(conn));
-    gpa.destroy(conn);
+fn deregister(self: *Server, runtime: *Runtime, conn: *Server.Connection) SinglyLinkedList(Server.Waiter, .next) {
+    self.lock.acquire();
+    defer self.lock.release(runtime);
 
-    if (self.connections.count() == 0) {
-        while (self.pending.shutdown.popFirst()) |node| {
-            resume node.data;
-        }
+    assert(self.connections.swapRemove(conn));
+
+    if (self.connections.count() > 0) {
+        return .{};
+    }
+
+    const waiters = self.pending.shutdown;
+    self.pending.shutdown = .{};
+
+    return waiters;
+}
+
+fn destroy(runtime: *Runtime, conn: *Server.Connection, waiters: SinglyLinkedList(Server.Waiter, .next)) void {
+    var it = waiters;
+
+    runtime.gpa.destroy(conn);
+
+    while (it.popFirst()) |waiter| {
+        runtime.scheduleTo(waiter.worker_id, &waiter.task);
     }
 }

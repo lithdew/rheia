@@ -93,7 +93,12 @@ pub fn yield(self: *Runtime, to: usize) void {
     }
 }
 
-pub inline fn schedule(self: *Runtime, to: usize, task: *Worker.Task) void {
+pub inline fn schedule(self: *Runtime, task: *Worker.Task) void {
+    const worker = Worker.getCurrent();
+    self.workers.items[worker.id].task_queues.items[worker.id].push(task);
+}
+
+pub inline fn scheduleTo(self: *Runtime, to: usize, task: *Worker.Task) void {
     const worker = Worker.getCurrent();
 
     const same_worker = worker.id == to;
@@ -130,6 +135,8 @@ fn initWorkers(self: *Runtime, count: usize) !void {
     while (index < count) : (index += 1) {
         try self.workers.addOneAssumeCapacity().init(self.gpa, self.workers.items.ptr[0..count], index);
     }
+
+    Worker.current = &self.workers.items[0];
 }
 
 fn startWorkers(self: *Runtime) !void {
