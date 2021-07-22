@@ -2,6 +2,7 @@ const std = @import("std");
 
 const meta = std.meta;
 
+/// A singly-linked list. Keeps track of one head pointer.
 pub fn SinglyLinkedList(comptime T: type, comptime next_field: meta.FieldEnum(T)) type {
     const next = meta.fieldInfo(T, next_field).name;
 
@@ -9,6 +10,10 @@ pub fn SinglyLinkedList(comptime T: type, comptime next_field: meta.FieldEnum(T)
         const Self = @This();
 
         head: ?*T = null,
+
+        pub fn isEmpty(self: *const Self) bool {
+            return self.head == null;
+        }
 
         pub fn prepend(self: *Self, value: *T) void {
             @field(value, next) = self.head;
@@ -24,6 +29,7 @@ pub fn SinglyLinkedList(comptime T: type, comptime next_field: meta.FieldEnum(T)
     };
 }
 
+/// A double-ended doubly-linked list (doubly-linked deque). Keeps track of two pointers: one head pointer, and one tail pointer.
 pub fn DoublyLinkedDeque(comptime T: type, comptime next_field: meta.FieldEnum(T), comptime prev_field: meta.FieldEnum(T)) type {
     const next = meta.fieldInfo(T, next_field).name;
     const prev = meta.fieldInfo(T, prev_field).name;
@@ -33,6 +39,21 @@ pub fn DoublyLinkedDeque(comptime T: type, comptime next_field: meta.FieldEnum(T
 
         head: ?*T = null,
         tail: ?*T = null,
+
+        pub fn isEmpty(self: *const Self) bool {
+            return self.head == null;
+        }
+
+        pub fn prepend(self: *Self, value: *T) void {
+            if (self.head) |head| {
+                @field(head, prev) = value;
+            } else {
+                self.tail = value;
+            }
+            @field(value, prev) = null;
+            @field(value, next) = self.head;
+            self.head = value;
+        }
 
         pub fn append(self: *Self, value: *T) void {
             if (self.tail) |tail| {
@@ -86,6 +107,7 @@ pub fn DoublyLinkedDeque(comptime T: type, comptime next_field: meta.FieldEnum(T
     };
 }
 
+/// A double-ended singly-linked list (singly-linked deque). Keeps track of two pointers: one head pointer, and one tail pointer.
 pub fn SinglyLinkedDeque(comptime T: type, comptime next_field: meta.FieldEnum(T)) type {
     const next = meta.fieldInfo(T, next_field).name;
 
@@ -94,6 +116,10 @@ pub fn SinglyLinkedDeque(comptime T: type, comptime next_field: meta.FieldEnum(T
 
         head: ?*T = null,
         tail: ?*T = null,
+
+        pub fn isEmpty(self: *const Self) bool {
+            return self.head == null;
+        }
 
         pub fn prepend(self: *Self, value: *T) void {
             if (self.head == null) self.tail = value;

@@ -5,25 +5,23 @@ const mem = std.mem;
 const ip = std.x.net.ip;
 const tcp = std.x.net.tcp;
 const log = std.log.scoped(.server);
+const sync = @import("sync.zig");
+const runtime = @import("runtime.zig");
 
 const binary = @import("binary.zig");
 
 const assert = std.debug.assert;
 
-const Lock = @import("Lock.zig");
-const Loop = @import("Loop.zig");
 const Packet = @import("Packet.zig");
-const Worker = @import("Worker.zig");
-const Runtime = @import("Runtime.zig");
 
 const SinglyLinkedList = @import("intrusive.zig").SinglyLinkedList;
 
 const Server = @This();
 
 pub const Waiter = struct {
-    next: ?*Waiter = null,
+    next: ?*Server.Waiter = null,
     worker_id: usize,
-    task: Worker.Task,
+    task: runtime.Task,
 };
 
 pub const Connection = struct {
@@ -33,14 +31,14 @@ pub const Connection = struct {
     frame: @Frame(Server.serveConnection),
 
     done: bool,
-    writer: ?*Worker.Task,
-    queuer: ?*Worker.Task,
+    writer: ?*runtime.Task,
+    queuer: ?*runtime.Task,
 
     queue: std.fifo.LinearFifo(u8, .Dynamic),
 };
 
-lock: Lock = .{},
-connections: std.AutoArrayHashMapUnmanaged(*Server.Connection, void) = .{},
+lock: sync.Lock = .{},
+connections: std.AutoHashMapUnmanaged(*Server.Connection, void) = .{},
 
 pending: struct {
     shutdown: SinglyLinkedList(Server.Waiter, .next) = .{},
@@ -54,9 +52,9 @@ pub fn deinit(self: *Server, gpa: *mem.Allocator) void {
     self.connections.deinit(gpa);
 }
 
-pub fn shutdown(self: *Server, runtime: *Runtime) void {
+pub fn shutdown(self: *Server) void {
     self.lock.acquire();
-    defer self.lock.release(runtime);
+    defer self.lock.release();
 
     var it = self.connections.iterator();
     while (it.next()) |entry| {
@@ -64,48 +62,47 @@ pub fn shutdown(self: *Server, runtime: *Runtime) void {
     }
 }
 
-pub fn waitForShutdown(self: *Server, runtime: *Runtime) callconv(.Async) void {
+pub fn join(self: *Server) callconv(.Async) void {
     self.lock.acquire();
     if (self.connections.count() > 0) {
         var waiter: Server.Waiter = .{
-            .worker_id = Worker.getCurrent().id,
-            .task = .{ .value = @frame() },
+            .worker_id = runtime.getCurrentWorkerId(),
+            .task = .{ .frame = @frame() },
         };
 
         suspend {
             self.pending.shutdown.prepend(&waiter);
-            self.lock.release(runtime);
+            self.lock.release();
         }
     } else {
-        self.lock.release(runtime);
+        self.lock.release();
     }
 }
 
-pub fn serve(self: *Server, runtime: *Runtime, listener: tcp.Listener) !void {
+pub fn serve(self: *Server, gpa: *mem.Allocator, listener: tcp.Listener) !void {
     const address = try listener.getLocalAddress();
 
     log.info("listening for peers on {}", .{address});
     defer log.info("stopped listening for peers on {}", .{address});
 
-    const loop = &Worker.getCurrent().loop;
-
     var next_worker_id: usize = 0;
+    var request: runtime.Request = .{};
 
     while (true) {
-        const conn = loop.accept(listener.socket.fd, .{ .close_on_exec = true }) catch |err| switch (err) {
+        const conn = runtime.accept(&request, listener.socket.fd, .{ .close_on_exec = true, .nonblocking = true }) catch |err| switch (err) {
             error.SocketNotListening => return,
             else => return err,
         };
         errdefer conn.socket.deinit();
 
-        const server_conn = try runtime.gpa.create(Server.Connection);
-        errdefer runtime.gpa.destroy(server_conn);
+        const server_conn = try gpa.create(Server.Connection);
+        errdefer gpa.destroy(server_conn);
 
-        try self.register(runtime.gpa, runtime, server_conn);
-        errdefer _ = self.deregister(runtime, server_conn);
+        try self.register(gpa, server_conn);
+        errdefer _ = self.deregister(server_conn);
 
         server_conn.worker_id = next_worker_id;
-        defer next_worker_id = (next_worker_id + 1) % runtime.worker_count;
+        defer next_worker_id = (next_worker_id + 1) % runtime.getNumWorkers();
 
         server_conn.client = tcp.Client.from(conn.socket);
         server_conn.address = ip.Address.from(conn.address);
@@ -114,21 +111,21 @@ pub fn serve(self: *Server, runtime: *Runtime, listener: tcp.Listener) !void {
         server_conn.writer = null;
         server_conn.queuer = null;
 
-        server_conn.queue = std.fifo.LinearFifo(u8, .Dynamic).init(runtime.gpa);
+        server_conn.queue = std.fifo.LinearFifo(u8, .Dynamic).init(gpa);
 
-        server_conn.frame = async self.serveConnection(runtime, server_conn);
+        server_conn.frame = async self.serveConnection(gpa, server_conn);
     }
 }
 
-fn serveConnection(self: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
+fn serveConnection(self: *Server, gpa: *mem.Allocator, conn: *Server.Connection) !void {
     runtime.yield(conn.worker_id);
 
     defer {
         conn.queue.deinit();
         conn.client.deinit();
 
-        var waiters = self.deregister(runtime, conn);
-        suspend destroy(runtime, conn, waiters);
+        var waiters = self.deregister(conn);
+        suspend destroy(gpa, conn, waiters);
     }
 
     log.debug("new peer connected: {}", .{conn.address});
@@ -136,14 +133,14 @@ fn serveConnection(self: *Server, runtime: *Runtime, conn: *Server.Connection) !
 
     try conn.client.setNoDelay(true);
 
-    var writer_frame = async self.runWriteLoop(runtime, conn);
-    var reader_frame = async self.runReadLoop(runtime, conn);
+    var writer_frame = async self.runWriteLoop(conn);
+    var reader_frame = async self.runReadLoop(gpa, conn);
 
     await reader_frame catch {};
     await writer_frame catch {};
 }
 
-fn runReadLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
+fn runReadLoop(_: *Server, gpa: *mem.Allocator, conn: *Server.Connection) !void {
     defer {
         conn.done = true;
         if (conn.writer) |waiter| {
@@ -152,27 +149,24 @@ fn runReadLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
         }
     }
 
-    const loop = &Worker.getCurrent().loop;
-
-    var buffer = std.fifo.LinearFifo(u8, .Dynamic).init(runtime.gpa);
+    var buffer = std.fifo.LinearFifo(u8, .Dynamic).init(gpa);
     defer buffer.deinit();
 
-    var buf = std.ArrayList(u8).init(runtime.gpa);
+    var buf = std.ArrayList(u8).init(gpa);
     defer buf.deinit();
+
+    var task: runtime.Task = .{ .frame = @frame() };
+    var request: runtime.Request = .{};
 
     while (true) {
         while (buffer.count < @sizeOf(u32)) {
-            const num_bytes_read = try loop.recv(conn.client.socket.fd, try buffer.writableWithSize(65536), 0);
+            const num_bytes_read = try runtime.recv(&request, conn.client.socket.fd, try buffer.writableWithSize(65536), 0);
             if (num_bytes_read == 0) return error.EndOfFile;
             buffer.update(num_bytes_read);
         }
 
         var size: u32 = undefined;
-
-        var size_pos: usize = 0;
-        while (size_pos < @sizeOf(u32)) {
-            size_pos += buffer.read(mem.asBytes(&size)[size_pos..]);
-        }
+        try buffer.reader().readNoEof(mem.asBytes(&size));
 
         size = try binary.decode(u32, mem.asBytes(&size));
         if (size < @sizeOf(u32)) return error.MessageSizeTooSmall;
@@ -181,18 +175,15 @@ fn runReadLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
         size -= @sizeOf(u32);
 
         while (buffer.count < size) {
-            const num_bytes_read = try loop.recv(conn.client.socket.fd, try buffer.writableWithSize(65536), 0);
+            const num_bytes_read = try runtime.recv(&request, conn.client.socket.fd, try buffer.writableWithSize(65536), 0);
             if (num_bytes_read == 0) return error.EndOfFile;
             buffer.update(num_bytes_read);
         }
 
-        const message = try runtime.gpa.alloc(u8, size);
-        defer runtime.gpa.free(message); // make it errdefer after implementing message handling
+        const message = try gpa.alloc(u8, size);
+        defer gpa.free(message);
 
-        var message_pos: usize = 0;
-        while (message_pos < size) {
-            message_pos += buffer.read(message[message_pos..]);
-        }
+        try buffer.reader().readNoEof(message);
 
         const packet = try Packet.unmarshal(message);
 
@@ -207,8 +198,7 @@ fn runReadLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
 
                     while (buf.items.len + conn.queue.count > 1 * 1024 * 1024) {
                         if (conn.done) return error.Closed;
-                        var waiter: Worker.Task = .{ .value = @frame() };
-                        suspend conn.queuer = &waiter;
+                        suspend conn.queuer = &task;
                     }
 
                     try conn.queue.writer().writeAll(buf.items);
@@ -225,7 +215,7 @@ fn runReadLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
     }
 }
 
-fn runWriteLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
+fn runWriteLoop(_: *Server, conn: *Server.Connection) !void {
     defer {
         conn.done = true;
         if (conn.queuer) |queuer| {
@@ -234,20 +224,20 @@ fn runWriteLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
         }
     }
 
-    const loop = &Worker.getCurrent().loop;
-
     var buffer: [65536]u8 = undefined;
+
+    var task: runtime.Task = .{ .frame = @frame() };
+    var request: runtime.Request = .{};
 
     while (true) {
         if (conn.queue.count == 0) {
             if (conn.done) return error.Closed;
-            var task: Worker.Task = .{ .value = @frame() };
             suspend conn.writer = &task;
             continue;
         }
 
         while (conn.queue.count > 0) {
-            try writeAll(loop, conn.client, buffer[0..try conn.queue.reader().readAll(&buffer)]);
+            try writeAll(&request, conn.client, buffer[0..try conn.queue.reader().readAll(&buffer)]);
         }
 
         if (conn.queuer) |waiter| {
@@ -257,25 +247,25 @@ fn runWriteLoop(_: *Server, runtime: *Runtime, conn: *Server.Connection) !void {
     }
 }
 
-fn writeAll(loop: *Loop, client: tcp.Client, buffer: []const u8) !void {
+fn writeAll(request: *runtime.Request, client: tcp.Client, buffer: []const u8) !void {
     var index: usize = 0;
     while (index < buffer.len) {
-        index += try loop.send(client.socket.fd, buffer[index..], os.MSG_NOSIGNAL);
+        index += try runtime.send(request, client.socket.fd, buffer[index..], os.MSG_NOSIGNAL);
     }
 }
 
-fn register(self: *Server, gpa: *mem.Allocator, runtime: *Runtime, conn: *Server.Connection) !void {
+fn register(self: *Server, gpa: *mem.Allocator, conn: *Server.Connection) !void {
     self.lock.acquire();
-    defer self.lock.release(runtime);
+    defer self.lock.release();
 
     try self.connections.put(gpa, conn, {});
 }
 
-fn deregister(self: *Server, runtime: *Runtime, conn: *Server.Connection) SinglyLinkedList(Server.Waiter, .next) {
+fn deregister(self: *Server, conn: *Server.Connection) SinglyLinkedList(Server.Waiter, .next) {
     self.lock.acquire();
-    defer self.lock.release(runtime);
+    defer self.lock.release();
 
-    assert(self.connections.swapRemove(conn));
+    assert(self.connections.remove(conn));
 
     if (self.connections.count() > 0) {
         return .{};
@@ -287,10 +277,10 @@ fn deregister(self: *Server, runtime: *Runtime, conn: *Server.Connection) Singly
     return waiters;
 }
 
-fn destroy(runtime: *Runtime, conn: *Server.Connection, waiters: SinglyLinkedList(Server.Waiter, .next)) void {
+fn destroy(gpa: *mem.Allocator, conn: *Server.Connection, waiters: SinglyLinkedList(Server.Waiter, .next)) void {
     var it = waiters;
 
-    runtime.gpa.destroy(conn);
+    gpa.destroy(conn);
 
     while (it.popFirst()) |waiter| {
         runtime.scheduleTo(waiter.worker_id, &waiter.task);

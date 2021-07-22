@@ -11,10 +11,9 @@ const assert = std.debug.assert;
 
 const IPv4 = std.x.os.IPv4;
 
-const Loop = @import("Loop.zig");
 const Server = @import("Server.zig");
 const Client = @import("Client.zig");
-const Runtime = @import("Runtime.zig");
+const runtime = @import("runtime.zig");
 
 const binary = @import("binary.zig");
 const Packet = @import("Packet.zig");
@@ -24,28 +23,26 @@ pub const log_level = .debug;
 pub fn main() !void {
     defer log.info("shutdown successful", .{});
 
-    var runtime: Runtime = undefined;
     try runtime.init();
     defer {
-        runtime.waitForShutdown();
+        runtime.join();
         runtime.deinit();
     }
-
     try runtime.start();
 
-    var frame = async run(&runtime);
-    try runtime.workers.items[0].run();
+    var frame = async run();
+    try runtime.run();
     try nosuspend await frame;
 }
 
-pub fn run(runtime: *Runtime) !void {
+pub fn run() !void {
     defer runtime.shutdown();
 
     var server = Server.init();
     defer {
-        server.shutdown(runtime);
-        server.waitForShutdown(runtime);
-        server.deinit(runtime.gpa);
+        server.shutdown();
+        server.join();
+        server.deinit(runtime.getAllocator());
     }
 
     var listener = try tcp.Listener.init(.ip, .{ .close_on_exec = true });
@@ -57,23 +54,23 @@ pub fn run(runtime: *Runtime) !void {
     try listener.bind(ip.Address.initIPv4(IPv4.localhost, 9000));
     try listener.listen(128);
 
-    var listener_frame = async server.serve(runtime, listener);
+    var listener_frame = async server.serve(runtime.getAllocator(), listener);
     defer {
         listener.shutdown() catch |err| log.warn("listener shutdown error: {}", .{err});
         await listener_frame catch |err| log.warn("listener error: {}", .{err});
     }
 
-    var client = try Client.init(runtime.gpa, runtime, ip.Address.initIPv4(IPv4.localhost, 9000));
+    var client = try Client.init(runtime.getAllocator(), ip.Address.initIPv4(IPv4.localhost, 9000));
     defer {
-        client.waitForShutdown(runtime);
-        client.deinit(runtime.gpa);
+        client.join();
+        client.deinit(runtime.getAllocator());
     }
 
-    var timer = Loop.Timer.init(&runtime.workers.items[0].loop);
-    var client_frame = async runClient(runtime, &timer, &client);
+    var client_timer: runtime.Request = .{};
+    var client_frame = async runClient(&client_timer, &client);
     defer {
-        timer.cancel();
-        client.shutdown(runtime);
+        runtime.cancel(&client_timer);
+        client.shutdown();
         await client_frame catch |err| log.warn("client error: {}", .{err});
     }
 
@@ -82,13 +79,13 @@ pub fn run(runtime: *Runtime) !void {
     log.info("gracefully shutting down...", .{});
 }
 
-fn runClient(runtime: *Runtime, _: *Loop.Timer, client: *Client) !void {
+fn runClient(_: *runtime.Request, client: *Client) !void {
     // log.info("starting benchmark in 3...", .{});
-    // try timer.waitFor(.{ .seconds = 1 });
+    // try runtime.timeout(client_timer, .{ .seconds = 1 });
     // log.info("starting benchmark in 2...", .{});
-    // try timer.waitFor(.{ .seconds = 1 });
+    // try runtime.timeout(client_timer, .{ .seconds = 1 });
     // log.info("starting benchmark in 1...", .{});
-    // try timer.waitFor(.{ .seconds = 1 });
+    // try runtime.timeout(client_timer, .{ .seconds = 1 });
 
     var timer = try std.time.Timer.start();
     var packets_per_second: usize = 0;
@@ -96,20 +93,29 @@ fn runClient(runtime: *Runtime, _: *Loop.Timer, client: *Client) !void {
 
     var i: u32 = 0;
     while (i < 100_000_000) : (i += 1) {
-        var buf = std.ArrayList(u8).init(runtime.gpa);
+        // var waiter: Client.RPC.Waiter = .{
+        //     .worker_id = runtime.getCurrentWorkerId(),
+        //     .task = .{ .frame = @frame() },
+        // };
+        // const nonce = try client.rpc.park(&waiter);
+        // errdefer _ = client.rpc.cancel(nonce);
+
+        const nonce = i;
+
+        var buf = std.ArrayList(u8).init(runtime.getAllocator());
         errdefer buf.deinit();
 
         const Node = std.SinglyLinkedList([]const u8).Node;
         const node_data = try binary.Buffer.from(&buf).allocate(@sizeOf(Node));
 
         var size_data = try binary.allocate(node_data.sliceFromEnd(), u32);
-        var body_data = try Packet.append(size_data.sliceFromEnd(), .{ .nonce = i, .@"type" = .request, .tag = .ping });
+        var body_data = try Packet.append(size_data.sliceFromEnd(), .{ .nonce = nonce, .@"type" = .request, .tag = .ping });
         size_data = binary.writeAssumeCapacity(node_data.sliceFromEnd(), @intCast(u32, size_data.len + body_data.len));
 
         const node = @ptrCast(*Node, @alignCast(@alignOf(*Node), node_data.ptr()));
         node.* = .{ .data = size_data.ptr()[0 .. size_data.len + body_data.len] };
 
-        try await async client.write(runtime, node);
+        try await async client.write(runtime.getAllocator(), node);
 
         packets_per_second += 1;
 

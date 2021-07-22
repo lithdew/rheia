@@ -2,6 +2,7 @@ const std = @import("std");
 
 const os = std.os;
 const mem = std.mem;
+const meta = std.meta;
 const atomic = std.atomic;
 const builtin = std.builtin;
 const testing = std.testing;
@@ -17,27 +18,24 @@ pub const cache_line_length = switch (builtin.cpu.arch) {
     else => 64,
 };
 
-pub fn UnboundedStack(comptime T: type) type {
+pub fn UnboundedStack(comptime T: type, comptime next_field: meta.FieldEnum(T)) type {
+    const next = meta.fieldInfo(T, next_field).name;
+
     return struct {
         const Self = @This();
 
-        pub const Node = struct {
-            next: ?*Self.Node = null,
-            value: T,
-        };
+        stack: ?*T align(cache_line_length) = null,
 
-        stack: ?*Self.Node align(cache_line_length) = null,
-
-        pub fn push(self: *Self, node: *Self.Node) void {
+        pub fn push(self: *Self, node: *T) void {
             return self.pushBatch(node, node);
         }
 
-        pub fn pushBatch(self: *Self, head: *Self.Node, tail: *Self.Node) void {
-            var stack = @atomicLoad(?*Self.Node, &self.stack, .Monotonic);
+        pub fn pushBatch(self: *Self, head: *T, tail: *T) void {
+            var stack = @atomicLoad(?*T, &self.stack, .Monotonic);
             while (true) {
-                tail.next = stack;
+                @field(tail, next) = stack;
                 stack = @cmpxchgWeak(
-                    ?*Self.Node,
+                    ?*T,
                     &self.stack,
                     stack,
                     head,
@@ -47,130 +45,130 @@ pub fn UnboundedStack(comptime T: type) type {
             }
         }
 
-        pub fn popBatch(self: *Self) ?*Self.Node {
+        pub fn popBatch(self: *Self) ?*T {
             if (self.isEmpty()) return null;
-            return @atomicRmw(?*Self.Node, &self.stack, .Xchg, null, .Acquire);
+            return @atomicRmw(?*T, &self.stack, .Xchg, null, .Acquire);
         }
 
         pub fn isEmpty(self: *Self) bool {
-            return @atomicLoad(?*Self.Node, &self.stack, .Monotonic) == null;
+            return @atomicLoad(?*T, &self.stack, .Monotonic) == null;
         }
     };
 }
 
-pub fn UnboundedQueue(comptime T: type) type {
+pub fn UnboundedQueue(comptime T: type, comptime next_field: meta.FieldEnum(T)) type {
+    const next = meta.fieldInfo(T, next_field).name;
+
     return struct {
         const Self = @This();
 
-        pub const Node = struct {
-            pub const Batch = struct {
-                pub const Iterator = struct {
-                    batch: Self.Node.Batch,
+        pub const Batch = struct {
+            pub const Iterator = struct {
+                batch: Self.Batch,
 
-                    pub fn next(self: *Self.Node.Batch.Iterator) ?T {
-                        if (self.batch.count == 0) return null;
-                        const front = self.batch.front orelse unreachable;
-                        self.batch.front = front.next;
-                        self.batch.count -= 1;
-                        return front.value;
-                    }
-                };
-
-                front: ?*Self.Node = null,
-                last: ?*Self.Node = null,
-                count: usize = 0,
-
-                pub fn iterator(self: Self.Node.Batch) Self.Node.Batch.Iterator {
-                    return .{ .batch = self };
+                pub fn next(self: *Self.Batch.Iterator) ?*T {
+                    if (self.batch.count == 0) return null;
+                    const front = self.batch.front orelse unreachable;
+                    self.batch.front = @field(front, next);
+                    self.batch.count -= 1;
+                    return front;
                 }
             };
 
-            next: ?*Self.Node = null,
-            value: T,
+            front: ?*T = null,
+            last: ?*T = null,
+            count: usize = 0,
+
+            pub fn iterator(self: Self.Batch) Self.Batch.Iterator {
+                return .{ .batch = self };
+            }
         };
 
         pub const queue_padding_length = cache_line_length / 2;
 
-        back: ?*Self.Node align(queue_padding_length) = null,
+        back: ?*T align(queue_padding_length) = null,
         count: usize = 0,
-        front: Self.Node align(queue_padding_length) = .{ .value = undefined },
+        front: T align(queue_padding_length) = init: {
+            var stub: T = undefined;
+            @field(stub, next) = null;
+            break :init stub;
+        },
 
-        pub fn push(self: *Self, src: *Self.Node) void {
+        pub fn push(self: *Self, src: *T) void {
             assert(@atomicRmw(usize, &self.count, .Add, 1, .Release) >= 0);
 
-            src.next = null;
-            const old_back = @atomicRmw(?*Self.Node, &self.back, .Xchg, src, .AcqRel) orelse &self.front;
-            old_back.next = src;
+            @field(src, next) = null;
+            const old_back = @atomicRmw(?*T, &self.back, .Xchg, src, .AcqRel) orelse &self.front;
+            @field(old_back, next) = src;
         }
 
-        pub fn pushBatch(self: *Self, first: *Self.Node, last: *Self.Node, count: usize) void {
+        pub fn pushBatch(self: *Self, first: *T, last: *T, count: usize) void {
             assert(@atomicRmw(usize, &self.count, .Add, count, .Release) >= 0);
 
-            last.next = null;
-            const old_back = @atomicRmw(?*Self.Node, &self.back, .Xchg, last, .AcqRel) orelse &self.front;
-            old_back.next = first;
+            @field(last, next) = null;
+            const old_back = @atomicRmw(?*T, &self.back, .Xchg, last, .AcqRel) orelse &self.front;
+            @field(old_back, next) = first;
         }
 
-        pub fn pop(self: *Self) ?*Self.Node {
-            const first = @atomicLoad(?*Self.Node, &self.front.next, .Acquire) orelse return null;
-            if (@atomicLoad(?*Self.Node, &first.next, .Acquire)) |next| {
-                @atomicStore(?*Self.Node, &self.front.next, next, .Monotonic);
+        pub fn pop(self: *Self) ?*T {
+            const first = @atomicLoad(?*T, &@field(self.front, next), .Acquire) orelse return null;
+            if (@atomicLoad(?*T, &@field(first, next), .Acquire)) |next_item| {
+                @atomicStore(?*T, &@field(self.front, next), next_item, .Monotonic);
                 assert(@atomicRmw(usize, &self.count, .Sub, 1, .Monotonic) >= 1);
                 return first;
             }
-            const last = @atomicLoad(?*Self.Node, &self.back, .Acquire) orelse &self.front;
+            const last = @atomicLoad(?*T, &self.back, .Acquire) orelse &self.front;
             if (first != last) return null;
-            @atomicStore(?*Self.Node, &self.front.next, null, .Monotonic);
-            if (@cmpxchgStrong(?*Self.Node, &self.back, last, &self.front, .AcqRel, .Acquire) == null) {
+            @atomicStore(?*T, &@field(self.front, next), null, .Monotonic);
+            if (@cmpxchgStrong(?*T, &self.back, last, &self.front, .AcqRel, .Acquire) == null) {
                 assert(@atomicRmw(usize, &self.count, .Sub, 1, .Monotonic) >= 1);
                 return first;
             }
-            var next = @atomicLoad(?*Self.Node, &first.next, .Acquire);
-            while (next == null) : (atomic.spinLoopHint()) {
-                next = @atomicLoad(?*Self.Node, &first.next, .Acquire);
+            var next_item = @atomicLoad(?*T, &@field(first, next), .Acquire);
+            while (next_item == null) : (atomic.spinLoopHint()) {
+                next_item = @atomicLoad(?*T, &@field(first, next), .Acquire);
             }
-            @atomicStore(?*Self.Node, &self.front.next, next, .Monotonic);
+            @atomicStore(?*T, &@field(self.front, next), next_item, .Monotonic);
             assert(@atomicRmw(usize, &self.count, .Sub, 1, .Monotonic) >= 1);
             return first;
         }
 
-        pub fn popBatch(self: *Self) Self.Node.Batch {
-            var batch: Self.Node.Batch = .{};
+        pub fn popBatch(self: *Self) Self.Batch {
+            var batch: Self.Batch = .{};
 
-            var front = @atomicLoad(?*Self.Node, &self.front.next, .Acquire) orelse return batch;
+            var front = @atomicLoad(?*T, &@field(self.front, next), .Acquire) orelse return batch;
             batch.front = front;
 
-            var next = @atomicLoad(?*Self.Node, &front.next, .Acquire);
-            while (next) |next_node| {
+            var next_item = @atomicLoad(?*T, &@field(front, next), .Acquire);
+            while (next_item) |next_node| : (next_item = @atomicLoad(?*T, &@field(next_node, next), .Acquire)) {
                 batch.count += 1;
                 batch.last = front;
 
                 front = next_node;
-                next = @atomicLoad(?*Self.Node, &next_node.next, .Acquire);
             }
 
-            const last = @atomicLoad(?*Self.Node, &self.back, .Acquire) orelse &self.front;
+            const last = @atomicLoad(?*T, &self.back, .Acquire) orelse &self.front;
             if (front != last) {
-                @atomicStore(?*Self.Node, &self.front.next, front, .Release);
+                @atomicStore(?*T, &@field(self.front, next), front, .Release);
                 assert(@atomicRmw(usize, &self.count, .Sub, batch.count, .Monotonic) >= batch.count);
                 return batch;
             }
 
-            @atomicStore(?*Self.Node, &self.front.next, null, .Monotonic);
-            if (@cmpxchgStrong(?*Self.Node, &self.back, last, &self.front, .AcqRel, .Acquire) == null) {
+            @atomicStore(?*T, &@field(self.front, next), null, .Monotonic);
+            if (@cmpxchgStrong(?*T, &self.back, last, &self.front, .AcqRel, .Acquire) == null) {
                 batch.count += 1;
                 batch.last = front;
                 assert(@atomicRmw(usize, &self.count, .Sub, batch.count, .Monotonic) >= batch.count);
                 return batch;
             }
 
-            next = @atomicLoad(?*Self.Node, &front.next, .Acquire);
-            while (next == null) : (atomic.spinLoopHint()) {
-                next = @atomicLoad(?*Self.Node, &front.next, .Acquire);
+            next_item = @atomicLoad(?*T, &@field(front, next), .Acquire);
+            while (next_item == null) : (atomic.spinLoopHint()) {
+                next_item = @atomicLoad(?*T, &@field(front, next), .Acquire);
             }
 
             batch.count += 1;
-            @atomicStore(?*Self.Node, &self.front.next, next, .Monotonic);
+            @atomicStore(?*T, &@field(self.front, next), next_item, .Monotonic);
             batch.last = front;
             assert(@atomicRmw(usize, &self.count, .Sub, batch.count, .Monotonic) >= batch.count);
             return batch;
@@ -196,14 +194,19 @@ test "mpsc/unbounded_stack: push and pop" {
 
     const num_items_per_producer = 100_000;
 
+    const Node = struct {
+        next: ?*@This() = null,
+        value: usize,
+    };
+
     const Context = struct {
         gpa: *mem.Allocator,
-        stack: *mpsc.UnboundedStack(usize),
+        stack: *mpsc.UnboundedStack(Node, .next),
 
         pub fn runProducer(self: @This()) !void {
             var i: usize = 0;
             while (i < num_items_per_producer) : (i += 1) {
-                const node = try self.gpa.create(mpsc.UnboundedStack(usize).Node);
+                const node = try self.gpa.create(Node);
                 node.* = .{ .value = i };
                 self.stack.push(node);
             }
@@ -222,7 +225,7 @@ test "mpsc/unbounded_stack: push and pop" {
         }
     };
 
-    var stack: mpsc.UnboundedStack(usize) = .{};
+    var stack: mpsc.UnboundedStack(Node, .next) = .{};
 
     const ctx: Context = .{ .gpa = testing.allocator, .stack = &stack };
 
@@ -241,7 +244,7 @@ test "mpsc/unbounded_stack: push and pop" {
         defer consumer_thread.join();
     }
 
-    try testing.expectEqual(@as(?*mpsc.UnboundedStack(usize).Node, null), stack.popBatch());
+    try testing.expectEqual(@as(?*Node, null), stack.popBatch());
     try testing.expect(stack.isEmpty());
 }
 
@@ -253,14 +256,19 @@ test "mpsc/unbounded_queue: push and pop" {
 
     const num_items_per_producer = 100_000;
 
+    const Node = struct {
+        next: ?*@This() = null,
+        value: usize,
+    };
+
     const Context = struct {
         gpa: *mem.Allocator,
-        queue: *mpsc.UnboundedQueue(usize),
+        queue: *mpsc.UnboundedQueue(Node, .next),
 
         pub fn runProducer(self: @This()) !void {
             var i: usize = 0;
             while (i < num_items_per_producer) : (i += 1) {
-                const node = try self.gpa.create(mpsc.UnboundedQueue(usize).Node);
+                const node = try self.gpa.create(Node);
                 node.* = .{ .value = i };
                 self.queue.push(node);
             }
@@ -280,7 +288,7 @@ test "mpsc/unbounded_queue: push and pop" {
         }
     };
 
-    var queue: mpsc.UnboundedQueue(usize) = .{};
+    var queue: mpsc.UnboundedQueue(Node, .next) = .{};
 
     const ctx: Context = .{ .gpa = testing.allocator, .queue = &queue };
 
@@ -299,7 +307,7 @@ test "mpsc/unbounded_queue: push and pop" {
         defer consumer_thread.join();
     }
 
-    try testing.expectEqual(@as(?*mpsc.UnboundedQueue(usize).Node, null), queue.pop());
+    try testing.expectEqual(@as(?*Node, null), queue.pop());
     try testing.expect(queue.popBatch().iterator().next() == null);
     try testing.expect(queue.popBatch().count == 0);
 

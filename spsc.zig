@@ -24,7 +24,7 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: comptime_int) type {
     return struct {
         const Self = @This();
 
-        buffer: [*]T align(cache_line_length),
+        buffer: *[capacity]T align(cache_line_length),
         head: usize align(cache_line_length),
         tail: usize align(cache_line_length),
 
@@ -34,7 +34,7 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: comptime_int) type {
         }
 
         pub fn deinit(self: *Self, gpa: *mem.Allocator) void {
-            gpa.destroy(@ptrCast(*[capacity]T, self.buffer));
+            gpa.destroy(self.buffer);
         }
 
         pub fn push(self: *Self, value: T) bool {
