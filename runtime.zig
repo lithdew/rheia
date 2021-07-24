@@ -71,7 +71,7 @@ pub const Request = struct {
 
     next: ?*Request = null,
     result: ?isize = null,
-    frame: ?anyframe = null,
+    frame: anyframe = undefined,
 };
 
 fn Flags(comptime T: type) type {
@@ -100,10 +100,8 @@ pub const Runtime = struct {
             self.gpa = &self.gpa_instance.allocator;
         }
 
-        var num_workers = if (builtin.single_threaded) 1 else try std.Thread.getCpuCount();
-        num_workers /= 2;
-
-        if (num_workers == 0) return error.NoWorkers;
+        var num_workers: usize = if (builtin.single_threaded) 1 else try std.Thread.getCpuCount();
+        num_workers = math.max(1, num_workers / 2);
 
         try self.initSignalHandler();
         try self.initWorkers(num_workers);
@@ -409,7 +407,7 @@ pub const Worker = struct {
 
         mem.swap(Request.Deque, &it, &self.submissions);
         while (it.popFirst()) |request| : (count += 1) {
-            resume request.frame.?;
+            resume request.frame;
         }
 
         if (count > 0) {
@@ -418,7 +416,7 @@ pub const Worker = struct {
 
         mem.swap(Request.Deque, &it, &self.completions);
         while (it.popFirst()) |request| : (count += 1) {
-            resume request.frame.?;
+            resume request.frame;
         }
 
         return count;

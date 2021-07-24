@@ -2,31 +2,53 @@ const std = @import("std");
 
 pub const log_level = .debug;
 
-const num_threads = 8;
+const num_threads = 4;
 
 var packets_per_second = std.atomic.Atomic(usize).init(0);
 
 pub fn main() !void {
+    var thread_rings: [num_threads]std.os.linux.IO_Uring = undefined;
+
+    var thread_ring_index: usize = 0;
+    errdefer for (thread_rings[0..thread_ring_index]) |*thread_ring| thread_ring.deinit();
+
+    while (thread_ring_index < thread_rings.len) : (thread_ring_index += 1) {
+        var params = switch (thread_ring_index) {
+            0 => std.mem.zeroInit(std.os.linux.io_uring_params, .{
+                .flags = 0,
+                .sq_thread_cpu = @intCast(u32, thread_ring_index),
+                .sq_thread_idle = 1000,
+            }),
+            else => std.mem.zeroInit(std.os.linux.io_uring_params, .{
+                .flags = std.os.IORING_SETUP_ATTACH_WQ,
+                .wq_fd = @intCast(u32, thread_rings[0].fd),
+                .sq_thread_cpu = @intCast(u32, thread_ring_index),
+                .sq_thread_idle = 1000,
+            }),
+        };
+
+        thread_rings[thread_ring_index] = try std.os.linux.IO_Uring.init_params(4096, &params);
+    }
+
     var threads: [num_threads - 1]std.Thread = undefined;
 
     var thread_index: usize = 0;
     defer for (threads[0..thread_index]) |*thread| thread.join();
 
     while (thread_index < threads.len) : (thread_index += 1) {
-        threads[thread_index] = try std.Thread.spawn(.{}, run, .{false});
+        threads[thread_index] = try std.Thread.spawn(.{}, run, .{ &thread_rings[thread_index + 1], false });
     }
 
-    try run(true);
+    try run(&thread_rings[0], true);
 }
 
-pub fn run(print: bool) !void {
-    var ring = try std.os.linux.IO_Uring.init(4096, 0);
+pub fn run(ring: *std.os.linux.IO_Uring, print: bool) !void {
     defer ring.deinit();
 
     const client = try std.x.net.tcp.Client.init(.ip, .{ .close_on_exec = true, .nonblocking = true });
     defer client.deinit();
 
-    // try client.setNoDelay(true);
+    try client.setNoDelay(true);
 
     client.connect(std.x.net.ip.Address.initIPv4(std.x.os.IPv4.localhost, 9000)) catch |err| switch (err) {
         error.WouldBlock => try client.getError(),
@@ -44,7 +66,7 @@ pub fn run(print: bool) !void {
         }
 
         while (true) {
-            _ = ring.send(0, client.socket.fd, &([_]u8{0} ** 10), std.os.MSG_NOSIGNAL) catch |err| switch (err) {
+            _ = ring.send(0, client.socket.fd, &([_]u8{0} ** (10)), std.os.MSG_NOSIGNAL) catch |err| switch (err) {
                 error.SubmissionQueueFull => break,
                 else => return err,
             };

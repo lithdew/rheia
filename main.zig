@@ -38,27 +38,27 @@ pub fn main() !void {
 pub fn run() !void {
     defer runtime.shutdown();
 
-    var server = Server.init();
-    defer {
-        server.shutdown();
-        server.join();
-        server.deinit(runtime.getAllocator());
-    }
+    // var server = Server.init();
+    // defer {
+    //     server.shutdown();
+    //     server.join();
+    //     server.deinit(runtime.getAllocator());
+    // }
 
-    var listener = try tcp.Listener.init(.ip, .{ .close_on_exec = true });
-    defer listener.deinit();
+    // var listener = try tcp.Listener.init(.ip, .{ .close_on_exec = true });
+    // defer listener.deinit();
 
-    try listener.setReuseAddress(true);
-    try listener.setFastOpen(true);
+    // try listener.setReuseAddress(true);
+    // try listener.setFastOpen(true);
 
-    try listener.bind(ip.Address.initIPv4(IPv4.localhost, 9000));
-    try listener.listen(128);
+    // try listener.bind(ip.Address.initIPv4(IPv4.localhost, 9000));
+    // try listener.listen(128);
 
-    var listener_frame = async server.serve(runtime.getAllocator(), listener);
-    defer {
-        listener.shutdown() catch |err| log.warn("listener shutdown error: {}", .{err});
-        await listener_frame catch |err| log.warn("listener error: {}", .{err});
-    }
+    // var listener_frame = async server.serve(runtime.getAllocator(), listener);
+    // defer {
+    //     listener.shutdown() catch |err| log.warn("listener shutdown error: {}", .{err});
+    //     await listener_frame catch |err| log.warn("listener error: {}", .{err});
+    // }
 
     var client = try Client.init(runtime.getAllocator(), ip.Address.initIPv4(IPv4.localhost, 9000));
     defer {
@@ -103,19 +103,13 @@ fn runClient(_: *runtime.Request, client: *Client) !void {
         const nonce = i;
 
         var buf = std.ArrayList(u8).init(runtime.getAllocator());
-        errdefer buf.deinit();
+        defer buf.deinit();
 
-        const Node = std.SinglyLinkedList([]const u8).Node;
-        const node_data = try binary.Buffer.from(&buf).allocate(@sizeOf(Node));
-
-        var size_data = try binary.allocate(node_data.sliceFromEnd(), u32);
+        var size_data = try binary.allocate(binary.Buffer.from(&buf), u32);
         var body_data = try Packet.append(size_data.sliceFromEnd(), .{ .nonce = nonce, .@"type" = .request, .tag = .ping });
-        size_data = binary.writeAssumeCapacity(node_data.sliceFromEnd(), @intCast(u32, size_data.len + body_data.len));
+        size_data = binary.writeAssumeCapacity(size_data.sliceFromStart(), @intCast(u32, size_data.len + body_data.len));
 
-        const node = @ptrCast(*Node, @alignCast(@alignOf(*Node), node_data.ptr()));
-        node.* = .{ .data = size_data.ptr()[0 .. size_data.len + body_data.len] };
-
-        try await async client.write(runtime.getAllocator(), node);
+        try await async client.write(runtime.getAllocator(), buf.items);
 
         packets_per_second += 1;
 

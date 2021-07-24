@@ -6,7 +6,49 @@ const builtin = std.builtin;
 const testing = std.testing;
 const runtime = @import("runtime.zig");
 
+const DoublyLinkedDeque = @import("intrusive.zig").DoublyLinkedDeque;
+
 const Atomic = std.atomic.Atomic;
+
+pub const Parker = struct {
+    pub const Waiter = struct {
+        next: ?*Waiter = null,
+        prev: ?*Waiter = null,
+        task: runtime.Task,
+        worker_id: usize,
+    };
+
+    entries: DoublyLinkedDeque(Waiter, .next, .prev) = .{},
+
+    pub fn park(self: *Parker) void {
+        var waiter: Waiter = .{
+            .task = .{ .frame = @frame() },
+            .worker_id = runtime.getCurrentWorkerId(),
+        };
+        suspend self.entries.append(&waiter);
+    }
+
+    pub fn parkIntrusive(self: *Parker, waiter: *Waiter) void {
+        self.entries.append(&waiter);
+    }
+
+    pub fn unpark(self: *Parker) void {
+        const waiter = self.entries.popFirst() orelse return;
+        runtime.scheduleTo(waiter.worker_id, &waiter.task);
+    }
+
+    pub fn unparkAll(self: *Parker) void {
+        while (self.entries.popFirst()) |waiter| {
+            runtime.scheduleTo(waiter.worker_id, &waiter.task);
+        }
+    }
+
+    pub fn cancel(self: *Parker, waiter: *Waiter) void {
+        if (self.entries.remove(waiter)) {
+            runtime.scheduleTo(waiter.worker_id, &waiter.task);
+        }
+    }
+};
 
 pub const Lock = struct {
     pub const locked_bit = 0b01;

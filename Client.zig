@@ -37,9 +37,17 @@ pub const Connection = struct {
         task: runtime.Task,
     };
 
+    pub const Writer = struct {
+        next: ?*Client.Connection.Writer = null,
+        prev: ?*Client.Connection.Writer = null,
+        worker_id: usize,
+        task: runtime.Task,
+        buffer: []const u8 = undefined,
+    };
+
     client: ?tcp.Client = null,
     frame: @Frame(Client.serve),
-    writer: Client.Connection.Waiter,
+    writer: Client.Connection.Writer,
 };
 
 pub const CircuitBreaker = struct {
@@ -49,22 +57,15 @@ pub const CircuitBreaker = struct {
         closed,
     };
 
-    lock: sync.Lock = .{},
     num_failed_attempts: u64 = math.maxInt(u64),
     last_time_attempt_failed: i64 = 0,
 
     pub fn reportSuccess(self: *CircuitBreaker) void {
-        self.lock.acquire();
-        defer self.lock.release();
-
         self.num_failed_attempts = 0;
         self.last_time_attempt_failed = 0;
     }
 
     pub fn reportFailure(self: *CircuitBreaker) void {
-        self.lock.acquire();
-        defer self.lock.release();
-
         self.num_failed_attempts = math.add(u64, self.num_failed_attempts, 1) catch self.num_failed_attempts;
         self.last_time_attempt_failed = time.milliTimestamp();
     }
@@ -74,25 +75,16 @@ pub const CircuitBreaker = struct {
     }
 
     pub fn state(self: *CircuitBreaker) CircuitBreaker.State {
-        self.lock.acquire();
-        defer self.lock.release();
-
         if (self.num_failed_attempts <= 10) return .closed;
         if (time.milliTimestamp() - self.last_time_attempt_failed > 30_000) return .half_open;
         return .open;
     }
 
     pub fn hasFailuresReported(self: *CircuitBreaker) bool {
-        self.lock.acquire();
-        defer self.lock.release();
-
         return self.num_failed_attempts > 0 and self.last_time_attempt_failed > 0;
     }
 
     pub fn getNumReportedFailures(self: *CircuitBreaker) u64 {
-        self.lock.acquire();
-        defer self.lock.release();
-
         return self.num_failed_attempts;
     }
 };
@@ -113,7 +105,6 @@ pub const RPC = struct {
         result: ?Response = null,
     };
 
-    lock: sync.Lock = .{},
     head: u32 = 0,
     tail: u32 = 0,
     entries: []?*RPC.Waiter,
@@ -134,9 +125,6 @@ pub const RPC = struct {
     }
 
     pub fn shutdown(self: *RPC) void {
-        self.lock.acquire();
-        defer self.lock.release();
-
         for (self.entries) |*maybe_waiter| {
             if (maybe_waiter.*) |waiter| {
                 maybe_waiter.* = null;
@@ -146,9 +134,6 @@ pub const RPC = struct {
     }
 
     pub fn park(self: *RPC, waiter: *RPC.Waiter) !u32 {
-        self.lock.acquire();
-        defer self.lock.release();
-
         const nonce = self.head;
         if (nonce -% self.tail == self.entries.len) {
             return error.TooManyPendingRequests;
@@ -159,9 +144,6 @@ pub const RPC = struct {
     }
 
     pub fn cancel(self: *RPC, nonce: u32) ?*RPC.Waiter {
-        self.lock.acquire();
-        defer self.lock.release();
-
         const distance = nonce -% self.tail;
         if (distance >= self.entries.len) return null;
 
@@ -173,9 +155,6 @@ pub const RPC = struct {
     }
 
     pub fn unpark(self: *RPC, response: Response) bool {
-        self.lock.acquire();
-        defer self.lock.release();
-
         const nonce = response.header.get(.nonce);
 
         const distance = nonce -% self.tail;
@@ -200,21 +179,19 @@ closed: bool = false,
 
 capacity: usize,
 
-queue: std.SinglyLinkedList([]const u8) = .{},
-num_bytes_queued: usize = 0,
+queue: std.ArrayListUnmanaged(u8) = .{},
 
 rpc: RPC,
 pool: []*Client.Connection,
 next_worker_id: usize = 0,
 
-lock: sync.Lock = .{},
-connect_attempt: sync.Lock = .{},
+lock: std.Thread.Mutex = .{},
 connect_backoff: runtime.Request = .{},
 
 pending: struct {
     writes: DoublyLinkedDeque(Client.Connection.Waiter, .next, .prev) = .{},
     shutdown: DoublyLinkedDeque(Client.Connection.Waiter, .next, .prev) = .{},
-    writers: DoublyLinkedDeque(Client.Connection.Waiter, .next, .prev) = .{},
+    writers: DoublyLinkedDeque(Client.Connection.Writer, .next, .prev) = .{},
     connection_available: DoublyLinkedDeque(Client.Connection.Result, .next, .prev) = .{},
 
     fn reportConnectionResult(self: *@This(), result: ?anyerror) void {
@@ -230,8 +207,9 @@ pending: struct {
         }
     }
 
-    fn wakeUpWriter(self: *@This()) void {
+    fn wakeUpWriter(self: *@This(), buffer: []const u8) void {
         const waiter = self.writers.popFirst() orelse return;
+        waiter.buffer = buffer;
         runtime.scheduleTo(waiter.worker_id, &waiter.task);
     }
 
@@ -275,10 +253,7 @@ pub fn init(gpa: *mem.Allocator, address: ip.Address) !Client {
 pub fn deinit(self: *Client, gpa: *mem.Allocator) void {
     self.rpc.deinit(gpa);
 
-    while (self.queue.popFirst()) |node| {
-        gpa.destroy(node);
-    }
-    self.num_bytes_queued = 0;
+    self.queue.deinit(gpa);
 
     self.pool.len = self.capacity;
     for (self.pool) |conn| {
@@ -288,14 +263,12 @@ pub fn deinit(self: *Client, gpa: *mem.Allocator) void {
 }
 
 pub fn shutdown(self: *Client) void {
-    self.lock.acquire();
     self.closed = true;
 
     for (self.pool) |conn| {
         const client = conn.client orelse continue;
         client.shutdown(.recv) catch {};
     }
-    self.lock.release();
 
     self.rpc.shutdown();
 
@@ -303,7 +276,6 @@ pub fn shutdown(self: *Client) void {
 }
 
 pub fn join(self: *Client) void {
-    self.lock.acquire();
     if (self.pool.len > 0) {
         var waiter: Client.Connection.Waiter = .{
             .worker_id = runtime.getCurrentWorkerId(),
@@ -311,22 +283,16 @@ pub fn join(self: *Client) void {
         };
         suspend {
             self.pending.shutdown.append(&waiter);
-            self.lock.release();
         }
-    } else {
-        self.lock.release();
     }
 }
 
 pub fn ensureConnectionAvailable(self: *Client, gpa: *mem.Allocator) !void {
-    self.lock.acquire();
-
     if (self.closed) {
-        self.lock.release();
         return error.Closed;
     }
 
-    if (self.pool.len == 0 or (self.num_bytes_queued > 0 and self.pool.len < self.capacity)) {
+    if (self.pool.len == 0 or (self.queue.items.len > 0 and self.pool.len < self.capacity)) {
         self.pool.len += 1;
 
         const worker_id = self.next_worker_id;
@@ -343,7 +309,6 @@ pub fn ensureConnectionAvailable(self: *Client, gpa: *mem.Allocator) !void {
     } else false;
 
     if (connection_available) {
-        self.lock.release();
         return;
     }
 
@@ -354,38 +319,35 @@ pub fn ensureConnectionAvailable(self: *Client, gpa: *mem.Allocator) !void {
 
     suspend {
         self.pending.connection_available.append(&waiter);
-        self.lock.release();
     }
 
     return waiter.result orelse {};
 }
 
-pub fn write(self: *Client, gpa: *mem.Allocator, node: *std.SinglyLinkedList([]const u8).Node) !void {
+pub fn write(self: *Client, gpa: *mem.Allocator, buffer: []const u8) !void {
     try self.ensureConnectionAvailable(gpa);
 
-    self.lock.acquire();
-    defer self.lock.release();
-
-    while (node.data.len + self.num_bytes_queued > 4 * 1024 * 1024) {
-        if (self.closed) {
-            return error.Closed;
+    if (buffer.len + self.queue.items.len > 65536 * self.capacity) {
+        while (self.pending.writers.isEmpty()) {
+            var waiter: Client.Connection.Waiter = .{
+                .worker_id = runtime.getCurrentWorkerId(),
+                .task = .{ .frame = @frame() },
+            };
+            suspend {
+                self.pending.writes.append(&waiter);
+            }
+            if (self.closed) {
+                return error.Closed;
+            }
         }
 
-        var waiter: Client.Connection.Waiter = .{
-            .worker_id = runtime.getCurrentWorkerId(),
-            .task = .{ .frame = @frame() },
-        };
-        suspend {
-            self.pending.writes.append(&waiter);
-            self.lock.release();
+        if (self.queue.items.len == 0) {
+            return self.pending.wakeUpWriter(buffer);
         }
-        self.lock.acquire();
+        self.pending.wakeUpWriter(self.queue.toOwnedSlice(gpa));
     }
 
-    self.queue.prepend(node);
-    self.num_bytes_queued += node.data.len;
-
-    self.pending.wakeUpWriter();
+    try self.queue.appendSlice(gpa, buffer);
 }
 
 fn serve(self: *Client, gpa: *mem.Allocator, worker_id: usize, conn: *Client.Connection) void {
@@ -408,7 +370,7 @@ fn serve(self: *Client, gpa: *mem.Allocator, worker_id: usize, conn: *Client.Con
             return;
         }
 
-        self.runIoLoops(gpa, conn);
+        self.runIoLoops(gpa, worker_id, conn);
 
         if (self.markDisconnected(conn)) {
             return;
@@ -416,27 +378,28 @@ fn serve(self: *Client, gpa: *mem.Allocator, worker_id: usize, conn: *Client.Con
     }
 }
 
-fn runIoLoops(self: *Client, gpa: *mem.Allocator, conn: *Client.Connection) void {
+fn runIoLoops(self: *Client, gpa: *mem.Allocator, worker_id: usize, conn: *Client.Connection) void {
     var writer_done = false;
-    var writer_frame = async self.runWriteLoop(gpa, conn, &writer_done);
-    var reader_frame = async self.runReadLoop(gpa, conn);
+    var writer_frame = async self.runWriteLoop(gpa, worker_id, conn, &writer_done);
+    var reader_frame = async self.runReadLoop(gpa, worker_id, conn);
 
     await reader_frame catch {};
+    writer_done = true;
 
     {
-        self.lock.acquire();
-        defer self.lock.release();
-
-        writer_done = true;
+        runtime.yield(0);
         if (self.pending.writers.remove(&conn.writer)) {
             runtime.schedule(&conn.writer.task);
         }
     }
 
     await writer_frame catch {};
+    runtime.yield(0);
 }
 
-fn runReadLoop(self: *Client, gpa: *mem.Allocator, conn: *Client.Connection) !void {
+fn runReadLoop(self: *Client, gpa: *mem.Allocator, worker_id: usize, conn: *Client.Connection) !void {
+    runtime.yield(worker_id);
+
     const client = conn.client orelse unreachable;
 
     var buffer = std.fifo.LinearFifo(u8, .Dynamic).init(gpa);
@@ -473,6 +436,9 @@ fn runReadLoop(self: *Client, gpa: *mem.Allocator, conn: *Client.Connection) !vo
 
         const packet = try Packet.unmarshal(message);
 
+        const held = self.lock.acquire();
+        defer held.release();
+
         switch (packet.get(.type)) {
             .response => {
                 if (self.rpc.unpark(RPC.Response{ .header = packet, .data = message[packet.buffer.len..] })) {
@@ -484,78 +450,43 @@ fn runReadLoop(self: *Client, gpa: *mem.Allocator, conn: *Client.Connection) !vo
     }
 }
 
-fn runWriteLoop(self: *Client, gpa: *mem.Allocator, conn: *Client.Connection, writer_done: *const bool) !void {
+fn runWriteLoop(self: *Client, gpa: *mem.Allocator, worker_id: usize, conn: *Client.Connection, writer_done: *const bool) !void {
     const client = conn.client orelse unreachable;
 
-    var buffer: [65536]u8 = undefined;
-    var pos: usize = 0;
-
-    var pending: std.SinglyLinkedList([]const u8) = .{};
-    defer if (pending.first != null) {
-        self.lock.acquire();
-        defer self.lock.release();
-
-        while (pending.popFirst()) |node| : (self.num_bytes_queued += node.data.len) {
-            self.queue.prepend(node);
-        }
-    };
-
-    var request: runtime.Request = .{};
-
     while (true) {
-        self.lock.acquire();
-        if (self.queue.first) |first| {
-            self.queue.first = null;
-            pending.first = first;
+        runtime.yield(0);
 
-            self.num_bytes_queued = 0;
+        if (self.closed) {
+            return error.Closed;
+        }
+
+        conn.writer = .{
+            .worker_id = worker_id,
+            .task = .{ .frame = @frame() },
+        };
+
+        suspend {
+            self.pending.writers.append(&conn.writer);
             self.pending.unparkWriteRequests();
-        } else {
-            if (self.closed or writer_done.*) {
-                self.lock.release();
-                return error.Closed;
-            }
-
-            conn.writer = .{
-                .worker_id = runtime.getCurrentWorkerId(),
-                .task = .{ .frame = @frame() },
-            };
-
-            suspend {
-                self.pending.writers.append(&conn.writer);
-                self.lock.release();
-            }
-
-            continue;
-        }
-        self.lock.release();
-
-        var count: usize = 0;
-
-        while (pending.popFirst()) |node| : (count += 1) {
-            defer gpa.destroy(node);
-
-            if (node.data.len >= buffer[pos..].len) {
-                // If a queued message cannot fit into the buffer, do a dedicated send() on
-                // the message rather than attempt to have it fit inside the buffer.
-
-                if (node.data.len > buffer.len) {
-                    @setCold(true);
-                    try writeAll(&request, client, node.data);
-                    continue;
-                }
-
-                try writeAll(&request, client, buffer[0..pos]);
-                pos = 0;
-            }
-
-            mem.copy(u8, buffer[pos..], node.data);
-            pos += node.data.len;
         }
 
-        if (pos > 0) {
-            try writeAll(&request, client, buffer[0..pos]);
-            pos = 0;
+        if (writer_done.*) {
+            return error.Closed;
+        }
+
+        const buffer = conn.writer.buffer;
+        defer gpa.free(buffer);
+
+        errdefer {
+            runtime.yield(0);
+            self.queue.appendSlice(gpa, buffer) catch {};
+        }
+
+        var request: runtime.Request = .{};
+
+        var index: usize = 0;
+        while (index < buffer.len) {
+            index += try runtime.send(&request, client.socket.fd, buffer[index..], os.MSG_NOSIGNAL);
         }
     }
 }
@@ -563,8 +494,8 @@ fn runWriteLoop(self: *Client, gpa: *mem.Allocator, conn: *Client.Connection, wr
 fn connect(self: *Client) !tcp.Client {
     const worker_id = runtime.getCurrentWorkerId();
 
-    self.connect_attempt.acquire();
-    defer self.connect_attempt.release();
+    // self.connect_attempt.acquire();
+    // defer self.connect_attempt.release();
 
     if (self.circuit_breaker.tripped()) {
         return error.CircuitBreakerTripped;
@@ -600,17 +531,7 @@ fn connect(self: *Client) !tcp.Client {
     return client;
 }
 
-fn writeAll(request: *runtime.Request, client: tcp.Client, buffer: []const u8) !void {
-    var index: usize = 0;
-    while (index < buffer.len) {
-        index += try runtime.send(request, client.socket.fd, buffer[index..], os.MSG_NOSIGNAL);
-    }
-}
-
 fn markReady(self: *Client, conn: *Client.Connection, client: tcp.Client) bool {
-    self.lock.acquire();
-    defer self.lock.release();
-
     if (self.closed) return false;
 
     log.debug("{} [{}] is connected and ready", .{ self.address, runtime.getCurrentWorkerId() });
@@ -625,9 +546,6 @@ fn markReady(self: *Client, conn: *Client.Connection, client: tcp.Client) bool {
 }
 
 fn markError(self: *Client, err: anyerror) bool {
-    self.lock.acquire();
-    defer self.lock.release();
-
     log.debug("{} [{}] tried to connect and failed: {}", .{ self.address, runtime.getCurrentWorkerId(), err });
 
     self.circuit_breaker.reportFailure();
@@ -646,9 +564,6 @@ fn markError(self: *Client, err: anyerror) bool {
 }
 
 fn markDisconnected(self: *Client, conn: *Client.Connection) bool {
-    self.lock.acquire();
-    defer self.lock.release();
-
     assert(conn.client != null);
     conn.client = null;
 
@@ -656,9 +571,6 @@ fn markDisconnected(self: *Client, conn: *Client.Connection) bool {
 }
 
 fn markClosed(self: *Client, conn: *Client.Connection) void {
-    self.lock.acquire();
-    defer self.lock.release();
-
     log.debug("{} [{}] was closed", .{ self.address, runtime.getCurrentWorkerId() });
 
     const i = mem.indexOfScalar(*Client.Connection, self.pool, conn).?;

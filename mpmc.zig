@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const os = std.os;
 const mem = std.mem;
 const math = std.math;
 const atomic = std.atomic;
@@ -43,9 +44,7 @@ pub fn Ring(comptime T: type, comptime capacity: comptime_int) type {
             gpa.destroy(self.entries);
         }
 
-        pub inline fn push(self: *Self, item: T) bool {
-            atomic.compilerFence(.SeqCst);
-
+        pub inline fn pushMP(self: *Self, item: T) bool {
             var prod_head: u32 = self.prod_head.loadUnchecked();
             var prod_next: u32 = undefined;
 
@@ -71,9 +70,24 @@ pub fn Ring(comptime T: type, comptime capacity: comptime_int) type {
 
             self.entries[prod_head & mask] = item;
             while (self.prod_tail.loadUnchecked() != prod_head) {
-                atomic.spinLoopHint();
+                os.sched_yield() catch {};
             }
 
+            self.prod_tail.store(prod_next, .Release);
+            return true;
+        }
+
+        pub inline fn pushSP(self: *Self, item: T) bool {
+            const prod_head = self.prod_head.load(.Acquire);
+            const cons_tail = self.cons_tail.loadUnchecked();
+
+            if (prod_head -% cons_tail >= capacity) {
+                return false;
+            }
+
+            const prod_next = prod_head +% 1;
+            self.prod_head.storeUnchecked(prod_next);
+            self.entries[prod_head & mask] = item;
             self.prod_tail.store(prod_next, .Release);
             return true;
         }
@@ -98,7 +112,7 @@ pub fn Ring(comptime T: type, comptime capacity: comptime_int) type {
 
             const item = self.entries[cons_head & mask];
             while (self.cons_tail.loadUnchecked() != cons_head) {
-                atomic.spinLoopHint();
+                os.sched_yield() catch {};
             }
 
             self.cons_tail.store(cons_next, .Release);
@@ -106,15 +120,14 @@ pub fn Ring(comptime T: type, comptime capacity: comptime_int) type {
         }
 
         pub inline fn popSC(self: *Self) ?T {
-            const cons_head = self.cons_head.loadUnchecked();
-            const prod_tail = self.prod_tail.load(.Acquire);
+            const cons_head = self.cons_head.load(.Acquire);
+            const prod_tail = self.prod_tail.loadUnchecked();
             if (cons_head == prod_tail) return null;
 
             const cons_next = cons_head +% 1;
             self.cons_head.storeUnchecked(cons_next);
             const item = self.entries[cons_head & mask];
-
-            self.cons_tail.storeUnchecked(cons_next);
+            self.cons_tail.store(cons_next, .Release);
             return item;
         }
 
@@ -129,14 +142,14 @@ pub fn Ring(comptime T: type, comptime capacity: comptime_int) type {
 
         pub inline fn putBackSC(self: *Self, item: T) void {
             assert(self.cons_head.loadUnchecked() != self.prod_tail.loadUnchecked());
-            self.entries[self.cons_head.loadUnchecked()] = item;
+            self.entries[self.cons_head.loadUnchecked() & mask] = item;
         }
 
         pub inline fn peekSC(self: *Self) ?T {
             if (self.cons_head.loadUnchecked() == self.prod_tail.loadUnchecked()) {
                 return null;
             }
-            return self.entries[self.cons_head.loadUnchecked()];
+            return self.entries[self.cons_head.loadUnchecked() & mask];
         }
 
         pub inline fn isFull(self: *Self) bool {
@@ -153,35 +166,35 @@ pub fn Ring(comptime T: type, comptime capacity: comptime_int) type {
     };
 }
 
-test "ring: {s,m}psc: push and pop with a capacity of 2" {
+test "ring: spsc: push and pop with a capacity of 2" {
     var queue = try mpmc.Ring(usize, 2).init(testing.allocator);
     defer queue.deinit(testing.allocator);
 
-    try testing.expect(queue.push(1));
-    try testing.expect(queue.push(2));
-    try testing.expect(!queue.push(3));
+    try testing.expect(queue.pushSP(1));
+    try testing.expect(queue.pushSP(2));
+    try testing.expect(!queue.pushSP(3));
 
     try testing.expectEqual(@as(?usize, 1), queue.popSC());
     try testing.expectEqual(@as(?usize, 2), queue.popSC());
 
-    try testing.expect(queue.push(3));
-    try testing.expect(queue.push(4));
-    try testing.expect(!queue.push(5));
+    try testing.expect(queue.pushSP(3));
+    try testing.expect(queue.pushSP(4));
+    try testing.expect(!queue.pushSP(5));
 
     try testing.expectEqual(@as(?usize, 3), queue.popSC());
     try testing.expectEqual(@as(?usize, 4), queue.popSC());
     try testing.expectEqual(@as(?usize, null), queue.popSC());
 }
 
-test "ring: {s,m}psc: push and pop with a capacity of 4" {
+test "ring: spsc: push and pop with a capacity of 4" {
     var queue = try mpmc.Ring(usize, 4).init(testing.allocator);
     defer queue.deinit(testing.allocator);
 
-    try testing.expect(queue.push(1));
-    try testing.expect(queue.push(2));
-    try testing.expect(queue.push(3));
-    try testing.expect(queue.push(4));
-    try testing.expect(!queue.push(5));
+    try testing.expect(queue.pushSP(1));
+    try testing.expect(queue.pushSP(2));
+    try testing.expect(queue.pushSP(3));
+    try testing.expect(queue.pushSP(4));
+    try testing.expect(!queue.pushSP(5));
 
     try testing.expectEqual(@as(?usize, 1), queue.popSC());
     try testing.expectEqual(@as(?usize, 2), queue.popSC());
@@ -189,11 +202,11 @@ test "ring: {s,m}psc: push and pop with a capacity of 4" {
     try testing.expectEqual(@as(?usize, 4), queue.popSC());
     try testing.expectEqual(@as(?usize, null), queue.popSC());
 
-    try testing.expect(queue.push(5));
-    try testing.expect(queue.push(6));
-    try testing.expect(queue.push(7));
-    try testing.expect(queue.push(8));
-    try testing.expect(!queue.push(9));
+    try testing.expect(queue.pushSP(5));
+    try testing.expect(queue.pushSP(6));
+    try testing.expect(queue.pushSP(7));
+    try testing.expect(queue.pushSP(8));
+    try testing.expect(!queue.pushSP(9));
 
     try testing.expectEqual(@as(?usize, 5), queue.popSC());
     try testing.expectEqual(@as(?usize, 6), queue.popSC());
@@ -206,16 +219,16 @@ test "ring: {s,m}pmc: push and pop with a capacity of 2" {
     var queue = try mpmc.Ring(usize, 2).init(testing.allocator);
     defer queue.deinit(testing.allocator);
 
-    try testing.expect(queue.push(1));
-    try testing.expect(queue.push(2));
-    try testing.expect(!queue.push(3));
+    try testing.expect(queue.pushMP(1));
+    try testing.expect(queue.pushMP(2));
+    try testing.expect(!queue.pushMP(3));
 
     try testing.expectEqual(@as(?usize, 1), queue.popMC());
     try testing.expectEqual(@as(?usize, 2), queue.popMC());
 
-    try testing.expect(queue.push(3));
-    try testing.expect(queue.push(4));
-    try testing.expect(!queue.push(5));
+    try testing.expect(queue.pushMP(3));
+    try testing.expect(queue.pushMP(4));
+    try testing.expect(!queue.pushMP(5));
 
     try testing.expectEqual(@as(?usize, 3), queue.popMC());
     try testing.expectEqual(@as(?usize, 4), queue.popMC());
@@ -226,11 +239,11 @@ test "ring: {s,m}pmc: push and pop with a capacity of 4" {
     var queue = try mpmc.Ring(usize, 4).init(testing.allocator);
     defer queue.deinit(testing.allocator);
 
-    try testing.expect(queue.push(1));
-    try testing.expect(queue.push(2));
-    try testing.expect(queue.push(3));
-    try testing.expect(queue.push(4));
-    try testing.expect(!queue.push(5));
+    try testing.expect(queue.pushMP(1));
+    try testing.expect(queue.pushMP(2));
+    try testing.expect(queue.pushMP(3));
+    try testing.expect(queue.pushMP(4));
+    try testing.expect(!queue.pushMP(5));
 
     try testing.expectEqual(@as(?usize, 1), queue.popMC());
     try testing.expectEqual(@as(?usize, 2), queue.popMC());
@@ -238,11 +251,11 @@ test "ring: {s,m}pmc: push and pop with a capacity of 4" {
     try testing.expectEqual(@as(?usize, 4), queue.popMC());
     try testing.expectEqual(@as(?usize, null), queue.popMC());
 
-    try testing.expect(queue.push(5));
-    try testing.expect(queue.push(6));
-    try testing.expect(queue.push(7));
-    try testing.expect(queue.push(8));
-    try testing.expect(!queue.push(9));
+    try testing.expect(queue.pushMP(5));
+    try testing.expect(queue.pushMP(6));
+    try testing.expect(queue.pushMP(7));
+    try testing.expect(queue.pushMP(8));
+    try testing.expect(!queue.pushMP(9));
 
     try testing.expectEqual(@as(?usize, 5), queue.popMC());
     try testing.expectEqual(@as(?usize, 6), queue.popMC());
@@ -255,11 +268,11 @@ test "ring: {s,m}pmc: push and pop with a capacity of 4" {
     var queue = try mpmc.Ring(usize, 4).init(testing.allocator);
     defer queue.deinit(testing.allocator);
 
-    try testing.expect(queue.push(1));
-    try testing.expect(queue.push(2));
-    try testing.expect(queue.push(3));
-    try testing.expect(queue.push(4));
-    try testing.expect(!queue.push(5));
+    try testing.expect(queue.pushMP(1));
+    try testing.expect(queue.pushMP(2));
+    try testing.expect(queue.pushMP(3));
+    try testing.expect(queue.pushMP(4));
+    try testing.expect(!queue.pushMP(5));
 
     try testing.expectEqual(@as(?usize, 1), queue.popMC());
     try testing.expectEqual(@as(?usize, 2), queue.popMC());
@@ -267,11 +280,11 @@ test "ring: {s,m}pmc: push and pop with a capacity of 4" {
     try testing.expectEqual(@as(?usize, 4), queue.popMC());
     try testing.expectEqual(@as(?usize, null), queue.popMC());
 
-    try testing.expect(queue.push(5));
-    try testing.expect(queue.push(6));
-    try testing.expect(queue.push(7));
-    try testing.expect(queue.push(8));
-    try testing.expect(!queue.push(9));
+    try testing.expect(queue.pushMP(5));
+    try testing.expect(queue.pushMP(6));
+    try testing.expect(queue.pushMP(7));
+    try testing.expect(queue.pushMP(8));
+    try testing.expect(!queue.pushMP(9));
 
     try testing.expectEqual(@as(?usize, 5), queue.popMC());
     try testing.expectEqual(@as(?usize, 6), queue.popMC());
@@ -289,7 +302,7 @@ test "ring: spsc: fifo behavior" {
         pub fn runProducer(self: @This()) !void {
             var i: usize = 0;
             while (i < 1_000_000) : (i += 1) {
-                while (!self.ring.push(i)) {
+                while (!self.ring.pushSP(i)) {
                     continue;
                 }
             }
@@ -337,7 +350,7 @@ test "ring: mpsc behavior" {
         pub fn runProducer(self: @This()) !void {
             var i: usize = 0;
             while (i < num_items_per_producer) : (i += 1) {
-                while (!self.ring.push(i)) {
+                while (!self.ring.pushMP(i)) {
                     continue;
                 }
             }
