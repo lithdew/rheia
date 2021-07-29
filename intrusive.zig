@@ -30,9 +30,15 @@ pub fn SinglyLinkedList(comptime T: type, comptime next_field: meta.FieldEnum(T)
 }
 
 /// A double-ended doubly-linked list (doubly-linked deque). Keeps track of two pointers: one head pointer, and one tail pointer.
-pub fn DoublyLinkedDeque(comptime T: type, comptime next_field: meta.FieldEnum(T), comptime prev_field: meta.FieldEnum(T)) type {
-    const next = meta.fieldInfo(T, next_field).name;
-    const prev = meta.fieldInfo(T, prev_field).name;
+pub fn DoublyLinkedDeque(comptime T: type, comptime next_field: anytype, comptime prev_field: anytype) type {
+    // const next = meta.fieldInfo(T, next_field).name;
+    // const prev = meta.fieldInfo(T, prev_field).name;
+
+    _ = next_field;
+    _ = prev_field;
+
+    const next = "next";
+    const prev = "prev";
 
     return struct {
         const Self = @This();

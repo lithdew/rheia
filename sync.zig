@@ -1,246 +1,149 @@
 const std = @import("std");
 
-const os = std.os;
-const atomic = std.atomic;
-const builtin = std.builtin;
-const testing = std.testing;
 const runtime = @import("runtime.zig");
 
+const assert = std.debug.assert;
+
+const Task = runtime.Task;
+const Context = runtime.Context;
 const DoublyLinkedDeque = @import("intrusive.zig").DoublyLinkedDeque;
 
-const Atomic = std.atomic.Atomic;
+pub fn Parker(comptime T: type) type {
+    return struct {
+        const Self = @This();
 
-pub const Parker = struct {
-    pub const Waiter = struct {
-        next: ?*Waiter = null,
-        prev: ?*Waiter = null,
-        task: runtime.Task,
-        worker_id: usize,
-    };
-
-    entries: DoublyLinkedDeque(Waiter, .next, .prev) = .{},
-
-    pub fn park(self: *Parker) void {
-        var waiter: Waiter = .{
-            .task = .{ .frame = @frame() },
-            .worker_id = runtime.getCurrentWorkerId(),
+        pub const Waiter = struct {
+            task: Task,
+            result: ?T = null,
         };
-        suspend self.entries.append(&waiter);
-    }
 
-    pub fn parkIntrusive(self: *Parker, waiter: *Waiter) void {
-        self.entries.append(&waiter);
-    }
+        waiters: Task.Deque = .{},
 
-    pub fn unpark(self: *Parker) void {
-        const waiter = self.entries.popFirst() orelse return;
-        runtime.scheduleTo(waiter.worker_id, &waiter.task);
-    }
-
-    pub fn unparkAll(self: *Parker) void {
-        while (self.entries.popFirst()) |waiter| {
-            runtime.scheduleTo(waiter.worker_id, &waiter.task);
-        }
-    }
-
-    pub fn cancel(self: *Parker, waiter: *Waiter) void {
-        if (self.entries.remove(waiter)) {
-            runtime.scheduleTo(waiter.worker_id, &waiter.task);
-        }
-    }
-};
-
-pub const Lock = struct {
-    pub const locked_bit = 0b01;
-    pub const queue_locked_bit: usize = 0b10;
-    pub const queue_mask: usize = ~@as(usize, 0b11);
-
-    pub const Waiter = struct {
-        task: runtime.Task,
-        worker_id: usize,
-
-        queue_tail: ?*Lock.Waiter = null,
-        prev: ?*Lock.Waiter = null,
-        next: ?*Lock.Waiter = null,
-    };
-
-    state: Atomic(usize) = .{ .value = 0 },
-
-    pub fn acquire(self: *Lock) void {
-        if (builtin.single_threaded) return;
-
-        if (self.tryAcquire()) {
-            return;
-        }
-        return self.acquireSlow();
-    }
-
-    pub inline fn tryAcquire(self: *Lock) bool {
-        if (builtin.single_threaded) return true;
-
-        return self.state.tryCompareAndSwap(
-            0,
-            locked_bit,
-            .Acquire,
-            .Monotonic,
-        ) == null;
-    }
-
-    fn acquireSlow(self: *Lock) void {
-        @setCold(true);
-
-        // var spin_wait: SpinWait = .{};
-        var state = self.state.load(.Monotonic);
-        while (true) {
-            if (state & locked_bit == 0) {
-                state = self.state.tryCompareAndSwap(
-                    state,
-                    state | locked_bit,
-                    .Acquire,
-                    .Monotonic,
-                ) orelse {
-                    return;
-                };
-
-                continue;
-            }
-
-            // if (@intToPtr(?*Lock.Waiter, state & queue_mask) == null and spin_wait.spin()) {
-            //     state = self.state.load(.Monotonic);
-            //     continue;
-            // }
-
-            var waiter: Lock.Waiter = .{
-                .task = .{ .frame = @frame() },
-                .worker_id = runtime.getCurrentWorkerId(),
-            };
-
-            suspend {
-                if (@intToPtr(?*Lock.Waiter, state & queue_mask)) |head| {
-                    waiter.queue_tail = null;
-                    waiter.prev = null;
-                    waiter.next = head;
-                } else {
-                    waiter.queue_tail = &waiter;
-                    waiter.prev = null;
-                }
-
-                if (self.state.tryCompareAndSwap(
-                    state,
-                    (state & ~queue_mask) | @ptrToInt(&waiter),
-                    .Release,
-                    .Monotonic,
-                )) |new_state| {
-                    state = new_state;
-                    resume @frame();
-                }
-            }
-
-            // spin_wait.reset();
-            state = self.state.load(.Monotonic);
-        }
-    }
-
-    pub inline fn release(self: *Lock) void {
-        if (builtin.single_threaded) return;
-
-        const state = self.state.fetchSub(locked_bit, .Release);
-        if (state & queue_locked_bit != 0 or @intToPtr(?*Lock.Waiter, state & queue_mask) == null) {
-            return;
-        }
-        return self.releaseSlow();
-    }
-
-    fn releaseSlow(self: *Lock) void {
-        @setCold(true);
-
-        var state = self.state.load(.Monotonic);
-        while (true) {
-            if (state & queue_locked_bit != 0 or @intToPtr(?*Lock.Waiter, state & queue_mask) == null) {
-                return;
-            }
-
-            state = self.state.tryCompareAndSwap(
-                state,
-                state | queue_locked_bit,
-                .Acquire,
-                .Monotonic,
-            ) orelse {
-                break;
-            };
+        pub fn isEmpty(self: *const Self) bool {
+            return self.waiters.isEmpty();
         }
 
-        while (true) {
-            const queue_head = @intToPtr(*Lock.Waiter, state & queue_mask);
+        pub fn park(self: *Self, ctx: *Context) !T {
+            var waiter: Self.Waiter = .{ .task = .{ .frame = @frame() } };
 
-            const queue_tail = queue_head.queue_tail orelse queue_tail: {
-                var current = queue_head;
-                while (true) {
-                    const next = current.next orelse unreachable;
-                    next.prev = current;
-                    current = next;
-                    if (current.queue_tail) |queue_tail| {
-                        queue_head.queue_tail = queue_tail;
-                        break :queue_tail queue_tail;
+            var callback: struct {
+                state: Context.Callback = .{ .run = @This().run },
+                self: *Self,
+                waiter: *Task,
+
+                pub fn run(state: *Context.Callback) void {
+                    const callback = @fieldParentPtr(@This(), "state", state);
+                    if (callback.self.waiters.remove(callback.waiter)) {
+                        runtime.schedule(callback.waiter);
                     }
                 }
-            };
+            } = .{ .self = self, .waiter = &waiter.task };
 
-            if (state & locked_bit != 0) {
-                state = self.state.tryCompareAndSwap(state, state & ~queue_locked_bit, .AcqRel, .Acquire) orelse {
-                    return;
-                };
+            try ctx.register(&callback.state);
+            defer ctx.deregister(&callback.state);
 
-                continue;
+            suspend self.waiters.append(&waiter.task);
+            return waiter.result orelse return error.Cancelled;
+        }
+
+        pub fn notify(self: *Self, result: ?T) void {
+            const task = self.waiters.popFirst() orelse return;
+            const waiter = @fieldParentPtr(Self.Waiter, "task", task);
+            waiter.result = result;
+            runtime.schedule(task);
+        }
+
+        pub fn broadcast(self: *Self, result: ?T) void {
+            while (self.waiters.popFirst()) |task| {
+                const waiter = @fieldParentPtr(Self.Waiter, "task", task);
+                waiter.result = result;
+                runtime.schedule(task);
             }
-
-            if (queue_tail.prev) |new_tail| {
-                queue_head.queue_tail = new_tail;
-                _ = self.state.fetchAnd(~queue_locked_bit, .Release);
-            } else if (self.state.tryCompareAndSwap(state, state & locked_bit, .AcqRel, .Acquire)) |new_state| {
-                state = new_state;
-                continue;
-            }
-
-            break runtime.scheduleTo(queue_tail.worker_id, &queue_tail.task);
         }
-    }
-};
-
-pub const SpinWait = struct {
-    counter: u5 = 0,
-
-    pub inline fn reset(self: *SpinWait) void {
-        self.counter = 0;
-    }
-
-    pub inline fn spin(self: *SpinWait) bool {
-        if (self.counter >= 10) return false;
-        self.counter += 1;
-        if (self.counter <= 3) {
-            cpuRelax(@as(u32, 1) << self.counter);
-        } else {
-            os.sched_yield() catch {};
-        }
-        return true;
-    }
-
-    pub inline fn spinNoYield(self: *SpinWait) void {
-        self.counter += 1;
-        if (self.counter > 10) {
-            self.counter = 10;
-        }
-        cpuRelax(@as(u32, 1) << self.counter);
-    }
-
-    inline fn cpuRelax(iterations: u32) void {
-        var i: u32 = 0;
-        while (i < iterations) : (i += 1) {
-            atomic.spinLoopHint();
-        }
-    }
-};
-
-test {
-    testing.refAllDecls(@This());
+    };
 }
+
+pub const Mutex = struct {
+    locked: bool = false,
+    waiters: Task.Deque = .{},
+
+    pub fn acquire(self: *Mutex, ctx: *Context) !void {
+        var waiter: Task = .{ .frame = @frame() };
+
+        var callback: struct {
+            state: Context.Callback = .{ .run = @This().run },
+            self: *Mutex,
+            waiter: *Task,
+
+            pub fn run(state: *Context.Callback) void {
+                const callback = @fieldParentPtr(@This(), "state", state);
+                if (callback.self.waiters.remove(callback.waiter)) {
+                    if (callback.self.waiters.isEmpty()) {
+                        callback.self.locked = false;
+                    }
+                    runtime.schedule(callback.waiter);
+                }
+            }
+        } = .{ .self = self, .waiter = &waiter };
+
+        try ctx.register(&callback.state);
+        defer ctx.deregister(&callback.state);
+
+        if (!self.locked) {
+            self.locked = true;
+            return;
+        }
+
+        suspend self.waiters.append(&waiter);
+    }
+
+    pub fn release(self: *Mutex) void {
+        assert(self.locked);
+
+        runtime.schedule(self.waiters.popFirst() orelse {
+            self.locked = false;
+            return;
+        });
+    }
+};
+
+pub const WaitGroup = struct {
+    len: usize = 0,
+    waiters: Task.Deque = .{},
+
+    pub fn wait(self: *WaitGroup, ctx: *Context) !void {
+        var waiter: Task = .{ .frame = @frame() };
+
+        var callback: struct {
+            state: Context.Callback = .{ .run = @This().run },
+            self: *WaitGroup,
+            waiter: *Task,
+
+            pub fn run(state: *Context.Callback) void {
+                const callback = @fieldParentPtr(@This(), "state", state);
+                if (callback.self.waiters.remove(callback.waiter)) {
+                    runtime.schedule(callback.waiter);
+                }
+            }
+        } = .{ .self = self, .waiter = &waiter };
+
+        try ctx.register(&callback.state);
+        defer ctx.deregister(&callback.state);
+
+        if (self.len == 0) return;
+
+        suspend self.waiters.append(&waiter);
+    }
+
+    pub fn add(self: *WaitGroup, delta: usize) void {
+        self.len += delta;
+    }
+
+    pub fn sub(self: *WaitGroup, delta: usize) void {
+        self.len -= delta;
+        if (self.len > 0) return;
+        while (self.waiters.popFirst()) |waiter| {
+            runtime.schedule(waiter);
+        }
+    }
+};

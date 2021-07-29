@@ -38,8 +38,8 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: comptime_int) type {
         }
 
         pub fn push(self: *Self, value: T) bool {
-            const head = @atomicLoad(usize, &self.head, .Monotonic);
-            const tail = @atomicLoad(usize, &self.tail, .Acquire);
+            const head = @atomicLoad(usize, &self.head, .Acquire);
+            const tail = self.tail;
             if (head +% 1 -% tail > capacity) return false;
             self.buffer[head & mask] = value;
             @atomicStore(usize, &self.head, head +% 1, .Release);
@@ -47,8 +47,8 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: comptime_int) type {
         }
 
         pub fn pop(self: *Self) ?T {
-            const tail = @atomicLoad(usize, &self.tail, .Monotonic);
-            const head = @atomicLoad(usize, &self.head, .Acquire);
+            const tail = @atomicLoad(usize, &self.tail, .Acquire);
+            const head = self.head;
             if (tail -% head == 0) return null;
             const value = self.buffer[tail & mask];
             @atomicStore(usize, &self.tail, tail +% 1, .Release);
@@ -98,6 +98,13 @@ pub fn UnboundedQueue(comptime T: type) type {
 
             @atomicStore(?*Self.Node, &self.head.next, node, .Release);
             self.head = node;
+        }
+
+        pub fn peek(self: *Self) ?T {
+            if (@atomicLoad(?*Node, &self.tail.next, .Acquire)) |next_tail| {
+                return next_tail.value;
+            }
+            return null;
         }
 
         pub fn pop(self: *Self) ?T {

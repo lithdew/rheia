@@ -25,6 +25,7 @@ pub fn UnboundedStack(comptime T: type, comptime next_field: meta.FieldEnum(T)) 
         const Self = @This();
 
         stack: ?*T align(cache_line_length) = null,
+        cache: ?*T = null,
 
         pub fn push(self: *Self, node: *T) void {
             return self.pushBatch(node, node);
@@ -43,6 +44,12 @@ pub fn UnboundedStack(comptime T: type, comptime next_field: meta.FieldEnum(T)) 
                     .Monotonic,
                 ) orelse return;
             }
+        }
+
+        pub fn pop(self: *Self) ?*T {
+            const item = self.cache orelse (self.popBatch() orelse return null);
+            self.cache = item.next;
+            return item;
         }
 
         pub fn popBatch(self: *Self) ?*T {
@@ -186,7 +193,7 @@ pub fn UnboundedQueue(comptime T: type, comptime next_field: meta.FieldEnum(T)) 
     };
 }
 
-test "mpsc/unbounded_stack: push and pop" {
+test "mpsc/unbounded_stack: push and pop batch" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
     const cpu_count = try std.Thread.getCpuCount();
@@ -220,6 +227,66 @@ test "mpsc/unbounded_stack: push and pop" {
                     it = node.next;
                     self.gpa.destroy(node);
                     remaining -= 1;
+                }
+            }
+        }
+    };
+
+    var stack: mpsc.UnboundedStack(Node, .next) = .{};
+
+    const ctx: Context = .{ .gpa = testing.allocator, .stack = &stack };
+
+    {
+        var producer_threads = try std.ArrayListUnmanaged(std.Thread).initCapacity(testing.allocator, cpu_count - 1);
+        defer producer_threads.deinit(testing.allocator);
+
+        var producer_thread_index: usize = 0;
+        defer for (producer_threads.items[0..producer_thread_index]) |producer_thread| producer_thread.join();
+
+        while (producer_thread_index < cpu_count - 1) : (producer_thread_index += 1) {
+            producer_threads.addOneAssumeCapacity().* = try std.Thread.spawn(.{}, Context.runProducer, .{ctx});
+        }
+
+        const consumer_thread = try std.Thread.spawn(.{}, Context.runConsumer, .{ ctx, producer_threads.items.len });
+        defer consumer_thread.join();
+    }
+
+    try testing.expectEqual(@as(?*Node, null), stack.popBatch());
+    try testing.expect(stack.isEmpty());
+}
+
+test "mpsc/unbounded_stack: push and pop" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const cpu_count = try std.Thread.getCpuCount();
+    if (cpu_count < 2) return error.SkipZigTest;
+
+    const num_items_per_producer = 100_000;
+
+    const Node = struct {
+        next: ?*@This() = null,
+        value: usize,
+    };
+
+    const Context = struct {
+        gpa: *mem.Allocator,
+        stack: *mpsc.UnboundedStack(Node, .next),
+
+        pub fn runProducer(self: @This()) !void {
+            var i: usize = 0;
+            while (i < num_items_per_producer) : (i += 1) {
+                const node = try self.gpa.create(Node);
+                node.* = .{ .value = i };
+                self.stack.push(node);
+            }
+        }
+
+        pub fn runConsumer(self: @This(), num_producers: usize) void {
+            var remaining = num_producers * num_items_per_producer;
+            while (remaining > 0) : (remaining -= 1) {
+                while (true) {
+                    const node = self.stack.pop() orelse continue;
+                    break self.gpa.destroy(node);
                 }
             }
         }
