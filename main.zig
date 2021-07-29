@@ -7,6 +7,7 @@ const runtime = @import("runtime.zig");
 const io = std.io;
 const os = std.os;
 const ip = std.x.net.ip;
+const fmt = std.fmt;
 const mem = std.mem;
 const tcp = std.x.net.tcp;
 const math = std.math;
@@ -417,6 +418,9 @@ pub const TransactionVerifier = struct {
     pub const max_signature_batch_size = 64;
     pub const max_num_allowed_parallel_tasks = 256;
 
+    pub const flush_delay_min: i64 = 100 * time.ns_per_ms;
+    pub const flush_delay_max: i64 = 500 * time.ns_per_ms;
+
     pub const Task = extern struct {
         next: ?*TransactionVerifier.Task = null,
     };
@@ -426,6 +430,7 @@ pub const TransactionVerifier = struct {
     pool: SinglyLinkedList(TransactionVerifier.Task, .next) = .{},
 
     entries: std.ArrayListUnmanaged(*Transaction) = .{},
+    last_flush_time: i64 = 0,
 
     pub fn init() TransactionVerifier {
         return TransactionVerifier{};
@@ -457,7 +462,7 @@ pub const TransactionVerifier = struct {
     }
 
     pub fn run(self: *TransactionVerifier, ctx: *Context, gpa: *mem.Allocator) !void {
-        var flush_delay: i64 = 10 * time.ns_per_ms;
+        var flush_delay: i64 = flush_delay_min;
 
         while (true) {
             while (self.pool_wg.len == max_num_allowed_parallel_tasks) {
@@ -466,14 +471,14 @@ pub const TransactionVerifier = struct {
 
             try runtime.timeout(ctx, .{ .nanoseconds = flush_delay });
 
-            if (self.entries.items.len == 0) {
-                flush_delay = math.min(500 * time.ns_per_ms, @divExact(flush_delay * 4, 3));
+            if (self.entries.items.len == 0 or time.milliTimestamp() - self.last_flush_time < flush_delay_min / time.ns_per_ms) {
+                flush_delay = math.min(flush_delay_max, flush_delay * 2);
                 continue;
             }
 
-            flush_delay = 10 * time.ns_per_ms;
-
             try self.flush(gpa);
+
+            flush_delay = flush_delay_min;
         }
     }
 
@@ -492,6 +497,8 @@ pub const TransactionVerifier = struct {
 
         task.* = .{};
         task_frame.* = async self.runTask(task, gpa, self.entries.toOwnedSlice(gpa));
+
+        self.last_flush_time = time.milliTimestamp();
     }
 
     fn runTask(self: *TransactionVerifier, task: *TransactionVerifier.Task, gpa: *mem.Allocator, entries: []*Transaction) void {
@@ -513,7 +520,7 @@ pub const TransactionVerifier = struct {
 
                 for (entries[num..][0..max_signature_batch_size]) |tx| {
                     crypto.verify(tx.signature, tx, tx.sender) catch |err| {
-                        log.warn("bad transaction {}: {}", .{ std.fmt.fmtSliceHexLower(&tx.id), err });
+                        log.warn("bad transaction {}: {}", .{ fmt.fmtSliceHexLower(&tx.id), err });
                         continue;
                     };
                 }
@@ -522,7 +529,7 @@ pub const TransactionVerifier = struct {
 
         for (entries[num..]) |tx| {
             crypto.verify(tx.signature, tx, tx.sender) catch |err| {
-                log.warn("bad transaction {}: {}", .{ std.fmt.fmtSliceHexLower(&tx.id), err });
+                log.warn("bad transaction {}: {}", .{ fmt.fmtSliceHexLower(&tx.id), err });
                 continue;
             };
         }
