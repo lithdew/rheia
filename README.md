@@ -39,3 +39,68 @@ A blockchain written in [Zig](https://ziglang.org).
 ```
 $ zig run main.zig --name rheia -lc
 ```
+
+## research
+
+### mempool
+
+One of the most critical data structures required by Rheia is a main-memory index that is meant to keep track of all transactions that have yet to be finalized under Rheia's consensus protocol (or in other words, a mempool).
+    
+A mempool in general maps transactions by their ID's to their contents. The ID of a transaction is the checksum of its contents. In Rheia's case, the checksum or ID of a transaction is computed using the BLAKE3 hash function with an output size of 256 bits.
+
+There are two important things to look out for when it comes to figuring out the right data structure for Rheia's mempool given Rheia's choice of consensus protocol.
+
+1. Iterating over all transactions by their ID lexicographically should
+   be cheap.
+2. Insertions/deletions should be fast assuming that there may be
+   roughly 300k to 1 million transactions indexed at any moment in time.
+
+A lot of different data structures were benchmarked, and the final data structure that I have decided to utilize as Rheia's mempool is the adaptive radix tree.
+
+To make the decision, the following data structures were benchmarked:
+
+1. B-Tree ([tidwall/btree.c](https://github.com/tidwall/btree.c))
+2. Adaptive Radix Tree ([armon/libart](https://github.com/armon/libart))
+3. Skiplist ([MauriceGit/skiplist](https://github.com/MauriceGit/skiplist) - ported to [zig](benchmarks/mempool/skiplist.zig))
+4. Red-black tree ([ziglang/std-lib-orphanage](https://github.com/ziglang/std-lib-orphanage/blob/master/std/rb.zig))
+5. Radix Tree ([antirez/rax](https://github.com/antirez/rax) - ported to [zig](benchmarks/mempool/rax.zig))
+6. Binary Heap ([ziglang/zig](https://github.com/ziglang/zig/blob/master/lib/std/priority_queue.zig))
+7. Adaptive Radix Tree ([armon/libart](https://github.com/armon/libart) - ported to [zig](benchmarks/mempool/art.zig))
+8. Adaptive Radix Tree ([travisstaloch/art.zig](https://github.com/travisstaloch/art.zig))
+
+The adaptive radix tree showed the highest average overall throughput over the following tests:
+
+1. Insert 1 million different hashes into the data structure.
+2. Check if 1 million different hashes exist in the data structure.
+3. Delete 1 million different hashes from the data structure.
+
+Roughly 2 to 3 million hashes can be inserted per second from the benchmarks I wrote, which roughly translates into Rheia being able to index roughly 2 to 3 million transactions per second on my laptop.
+
+The benchmark code is available [here](benchmarks/mempool/main.zig). An example run is provided below.
+
+```
+$ zig run benchmarks/mempool/main.zig benchmarks/mempool/*.c -I benchmarks/mempool -lc -fno-sanitize-c --name mempool -O ReleaseFast
+
+info(btree): insert: 449.815ms
+info(btree): search: 460.462ms
+info(btree): delete: 449.945ms
+info(red_black_tree): insert: 653.616ms
+info(red_black_tree): search: 612.878ms
+info(red_black_tree): skipping delete...
+info(binary_heap): insert: 62.677ms
+info(binary_heap): skipping search/delete...
+info(skiplist): insert: 1.4s
+info(skiplist): skipping search/delete...
+info(libart): insert: 143.33ms
+info(libart): search: 78.175ms
+info(libart): delete: 208.693ms
+info(art_travis): insert: 186.45ms
+info(art_travis): search: 86.304ms
+info(art_travis): delete: 192.678ms
+info(art): insert: 169.749ms
+info(art): search: 162.432ms
+info(art): delete: 186.252ms
+info(rax): insert: 430.705ms
+info(rax): search: 316.481ms
+info(rax): delete: 559.38ms
+```

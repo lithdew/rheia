@@ -215,11 +215,10 @@ pub const Runtime = struct {
     closing: bool,
     pending_tasks: Task.Deque,
     incoming_tasks: Task.Stack,
+    outgoing_tasks: Pool.Batch,
 
     pub fn init(self: *Runtime) !void {
         defer log.debug("runtime started", .{});
-
-        self.closing = false;
 
         self.gpa_instance = .{};
         if (builtin.link_libc) {
@@ -241,8 +240,10 @@ pub const Runtime = struct {
         self.ring = try os.linux.IO_Uring.init(512, 0);
         errdefer self.ring.deinit();
 
+        self.closing = false;
         self.pending_tasks = .{};
         self.incoming_tasks = .{};
+        self.outgoing_tasks = .{};
     }
 
     pub fn deinit(self: *Runtime) void {
@@ -289,7 +290,7 @@ pub const Runtime = struct {
             }
         } = .{ .frame = @frame() };
 
-        suspend self.pool.schedule(Pool.Batch.from(&callback.state));
+        suspend self.outgoing_tasks.push(Pool.Batch.from(&callback.state));
     }
 
     pub fn endCpuBoundOperation(self: *Runtime) void {
@@ -319,6 +320,9 @@ pub const Runtime = struct {
         var completions: [512]os.linux.io_uring_cqe = undefined;
 
         while (true) {
+            self.pool.schedule(self.outgoing_tasks);
+            self.outgoing_tasks = .{};
+
             while (self.incoming_tasks.pop()) |task| {
                 self.pending_tasks.append(task);
             }
