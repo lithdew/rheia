@@ -158,9 +158,9 @@ pub fn Tree(comptime V: type) type {
                 struct {
                     pub fn addChild(self: *N, gpa: *mem.Allocator, ref: *usize, character: u8, child: usize) !void {
                         if (self.metadata.num_children < self.children.len) {
-                            const pos = mem.indexOfScalar(usize, &self.children, 0).?;
+                            const pos = @intCast(u8, mem.indexOfScalar(usize, &self.children, 0).?);
                             self.children[pos] = child;
-                            self.keys[character] = @intCast(u8, pos + 1);
+                            self.keys[character] = pos + 1;
                             self.metadata.num_children += 1;
                             return;
                         }
@@ -188,26 +188,18 @@ pub fn Tree(comptime V: type) type {
                 struct {
                     pub fn addChild(self: *N, gpa: *mem.Allocator, ref: *usize, character: u8, child: usize) !void {
                         if (self.metadata.num_children < self.children.len) {
-                            const cmp = @as(Vector(16, u8), self.keys) < @splat(16, character);
-
+                            const cmp = @splat(16, character) < @as(Vector(16, u8), self.keys);
                             const bitfield = @ptrCast(*const u17, &cmp).* & ((@as(u17, 1) << @intCast(u5, self.metadata.num_children)) - 1);
                             const idx = idx: {
                                 if (bitfield != 0) {
-                                    const idx = @ctz(u17, bitfield);
-                                    mem.copyBackwards(u8, self.keys[idx + 1 ..], self.keys[idx..][0 .. self.metadata.num_children - idx]);
-                                    mem.copyBackwards(usize, self.children[idx + 1 ..], self.children[idx..][0 .. self.metadata.num_children - idx]);
+                                    const idx = @ctz(usize, bitfield);
+                                    const shift_len = self.metadata.num_children - idx;
+                                    mem.copyBackwards(u8, self.keys[idx + 1 ..], self.keys[idx..][0..shift_len]);
+                                    mem.copyBackwards(usize, self.children[idx + 1 ..], self.children[idx..][0..shift_len]);
                                     break :idx idx;
                                 }
                                 break :idx self.metadata.num_children;
                             };
-
-                            // var idx: u16 = 16 - @clz(u16, @ptrCast(*const u16, &cmp).*);
-                            // if (idx < self.metadata.num_children) {
-                            //     mem.copyBackwards(u8, self.keys[idx + 1 ..], self.keys[idx..][0 .. self.metadata.num_children - idx]);
-                            //     mem.copyBackwards(usize, self.children[idx + 1 ..], self.children[idx..][0 .. self.metadata.num_children - idx]);
-                            // } else {
-                            //     idx = self.metadata.num_children;
-                            // }
 
                             self.keys[idx] = character;
                             self.children[idx] = child;
@@ -226,9 +218,9 @@ pub fn Tree(comptime V: type) type {
 
                         mem.copy(usize, &new_node.children, &old_children);
 
-                        comptime var i = 0;
+                        comptime var i: u8 = 0;
                         inline while (i < old_children.len) : (i += 1) {
-                            new_node.keys[old_keys[i]] = @intCast(u8, i + 1);
+                            new_node.keys[old_keys[i]] = i + 1;
                         }
 
                         ref.* = @ptrToInt(&new_node.metadata);
@@ -243,8 +235,9 @@ pub fn Tree(comptime V: type) type {
                                 if (character < key) break i;
                             } else self.metadata.num_children;
 
-                            mem.copyBackwards(u8, self.keys[idx + 1 ..], self.keys[idx..][0 .. self.metadata.num_children - idx]);
-                            mem.copyBackwards(usize, self.children[idx + 1 ..], self.children[idx..][0 .. self.metadata.num_children - idx]);
+                            const shift_len = self.metadata.num_children - idx;
+                            mem.copyBackwards(u8, self.keys[idx + 1 ..], self.keys[idx..][0..shift_len]);
+                            mem.copyBackwards(usize, self.children[idx + 1 ..], self.children[idx..][0..shift_len]);
 
                             self.keys[idx] = character;
                             self.children[idx] = child;
@@ -287,7 +280,7 @@ pub fn Tree(comptime V: type) type {
         }
 
         pub const Metadata = struct {
-            partial_len: u16 = 0,
+            partial_len: u8 = 0,
             node_type: NodeType,
             num_children: u9 = 0,
             partial: [max_prefix_len]u8 = undefined,
@@ -400,19 +393,15 @@ pub fn Tree(comptime V: type) type {
                 switch (self.node_type) {
                     .node_4 => {
                         const node = @fieldParentPtr(Node4, "metadata", self);
-                        if (mem.indexOfScalar(u8, node.keys[0..self.num_children], character)) |child_index| {
-                            return &node.children[child_index];
+                        if (mem.indexOfScalar(u8, node.keys[0..self.num_children], character)) |index| {
+                            return &node.children[index];
                         }
                     },
                     .node_16 => {
                         const node = @fieldParentPtr(Node16, "metadata", self);
                         const cmp = @as(Vector(16, u8), node.keys) == @splat(16, character);
-
-                        const bitmask = @ptrCast(*const u17, &cmp).* & ((@as(u17, 1) << @intCast(u5, self.num_children)) - 1);
-                        if (bitmask != 0) return &node.children[@ctz(u17, bitmask)];
-
-                        // const child_index = @ctz(u16, @ptrCast(*const u16, &cmp).*);
-                        // if (child_index < self.num_children) return &node.children[child_index];
+                        const child_index = @ctz(usize, @ptrCast(*const u16, &cmp).*);
+                        if (child_index < self.num_children) return &node.children[child_index];
                     },
                     .node_48 => {
                         const node = @fieldParentPtr(Node48, "metadata", self);
@@ -548,7 +537,6 @@ pub fn Tree(comptime V: type) type {
                 }
 
                 const child = node.findChild(keyAt(key, depth)) orelse return null;
-
                 if (Leaf.from(child.*)) |leaf_node| {
                     if (mem.eql(u8, leaf_node.keySlice(), key)) {
                         node.removeChild(gpa, ref, keyAt(key, depth), child);
@@ -584,7 +572,7 @@ pub fn Tree(comptime V: type) type {
                     errdefer new_leaf_node.deinit(gpa);
 
                     const longest_prefix = leaf_node.longestCommonPrefix(new_leaf_node, depth);
-                    new_node_metadata.partial_len = @intCast(u16, longest_prefix);
+                    new_node_metadata.partial_len = @intCast(u8, longest_prefix);
                     mem.copy(u8, &new_node_metadata.partial, key[depth..][0..@minimum(max_prefix_len, longest_prefix)]);
 
                     ref.* = @ptrToInt(new_node_metadata);
@@ -599,16 +587,7 @@ pub fn Tree(comptime V: type) type {
                 if (node.partial_len != 0) {
                     const prefix_diff = node.prefixMismatch(key, depth);
                     if (prefix_diff >= node.partial_len) {
-                        if (node.findChild(keyAt(key, depth + node.partial_len))) |child| {
-                            return Metadata.insert(child.*, gpa, child, key, value, depth + node.partial_len + 1, old, replace);
-                        }
-
-                        const new_leaf_node = try Leaf.init(gpa, key, value);
-                        errdefer new_leaf_node.deinit(gpa);
-
-                        try node.addChild(gpa, ref, keyAt(key, depth + node.partial_len), @ptrToInt(new_leaf_node) | 1);
-
-                        return if (V == void) {} else null;
+                        return node.insertRecursiveSearch(gpa, ref, key, value, depth + node.partial_len, old, replace);
                     }
 
                     const new_node_metadata = try Metadata.init(gpa, .node_4);
@@ -619,36 +598,40 @@ pub fn Tree(comptime V: type) type {
 
                     const new_node = @fieldParentPtr(Node4, "metadata", new_node_metadata);
 
-                    const new_leaf_node = try Leaf.init(gpa, key, value);
-                    errdefer new_leaf_node.deinit(gpa);
-
-                    new_node_metadata.partial_len = @intCast(u16, prefix_diff);
+                    new_node_metadata.partial_len = @intCast(u8, prefix_diff);
                     mem.copy(u8, &new_node_metadata.partial, node.partial[0..@minimum(max_prefix_len, prefix_diff)]);
 
                     if (node.partial_len <= max_prefix_len) {
                         try new_node.addChild(gpa, ref, keyAt(&node.partial, prefix_diff), @ptrToInt(node));
-                        node.partial_len -= @intCast(u16, prefix_diff + 1);
+                        node.partial_len -= @intCast(u8, prefix_diff + 1);
                         mem.copy(u8, &node.partial, node.partial[prefix_diff + 1 ..][0..@minimum(max_prefix_len, node.partial_len)]);
                     } else {
-                        node.partial_len -= @intCast(u16, prefix_diff + 1);
+                        node.partial_len -= @intCast(u8, prefix_diff + 1);
                         const leaf_node = Metadata.minimum(self) orelse unreachable;
                         try new_node.addChild(gpa, ref, keyAt(leaf_node.keySlice(), depth + prefix_diff), @ptrToInt(node));
                         mem.copy(u8, &node.partial, leaf_node.keySlice()[depth + prefix_diff + 1 ..][0..@minimum(max_prefix_len, node.partial_len)]);
                     }
+
+                    const new_leaf_node = try Leaf.init(gpa, key, value);
+                    errdefer new_leaf_node.deinit(gpa);
 
                     try new_node.addChild(gpa, ref, keyAt(key, depth + prefix_diff), @ptrToInt(new_leaf_node) | 1);
 
                     return if (V == void) {} else null;
                 }
 
-                if (node.findChild(keyAt(key, depth))) |child| {
+                return node.insertRecursiveSearch(gpa, ref, key, value, depth, old, replace);
+            }
+
+            fn insertRecursiveSearch(self: *Metadata, gpa: *mem.Allocator, ref: *usize, key: []const u8, value: V, depth: usize, old: *bool, replace: bool) anyerror!if (V == void) V else ?V {
+                if (self.findChild(keyAt(key, depth))) |child| {
                     return Metadata.insert(child.*, gpa, child, key, value, depth + 1, old, replace);
                 }
 
                 const new_leaf_node = try Leaf.init(gpa, key, value);
                 errdefer new_leaf_node.deinit(gpa);
 
-                try node.addChild(gpa, ref, keyAt(key, depth), @ptrToInt(new_leaf_node) | 1);
+                try self.addChild(gpa, ref, keyAt(key, depth), @ptrToInt(new_leaf_node) | 1);
 
                 return if (V == void) {} else null;
             }
@@ -662,7 +645,7 @@ pub fn Tree(comptime V: type) type {
                 const bytes = try gpa.allocAdvanced(u8, @alignOf(Leaf), @sizeOf(Leaf) + key.len, .exact);
                 mem.copy(u8, bytes[@sizeOf(Leaf)..], key);
 
-                const leaf = @ptrCast(*Leaf, bytes.ptr);
+                const leaf = @intToPtr(*Leaf, @ptrToInt(bytes.ptr));
                 leaf.* = .{ .value = value, .key_len = @intCast(u32, key.len) };
 
                 return leaf;
@@ -681,12 +664,12 @@ pub fn Tree(comptime V: type) type {
             }
 
             pub fn keySlice(self: *Leaf) []const u8 {
-                return @ptrCast([*]u8, self)[0 .. @sizeOf(Leaf) + self.key_len][@sizeOf(Leaf)..];
+                return (@ptrCast([*]u8, self) + @sizeOf(Leaf))[0..self.key_len];
             }
 
             pub fn longestCommonPrefix(self: *Leaf, other: *Leaf, depth: usize) usize {
-                const max = @minimum(self.key_len, other.key_len) - depth;
-                return mem.indexOfDiff(u8, self.keySlice()[depth..][0..max], other.keySlice()[depth..][0..max]) orelse max;
+                const max_cmp = @minimum(self.key_len, other.key_len) - depth;
+                return mem.indexOfDiff(u8, self.keySlice()[depth..][0..max_cmp], other.keySlice()[depth..][0..max_cmp]) orelse max_cmp;
             }
         };
 
@@ -730,8 +713,8 @@ pub fn Tree(comptime V: type) type {
                     depth += node.partial_len;
                 }
 
-                if (node.findChild(keyAt(key, depth))) |parent_link| {
-                    it = parent_link.*;
+                if (node.findChild(keyAt(key, depth))) |child| {
+                    it = child.*;
                     continue;
                 }
                 break;
@@ -750,17 +733,79 @@ pub fn Tree(comptime V: type) type {
             if (Metadata.delete(self.root, gpa, &self.root, key, 0)) |leaf_node| {
                 self.size -= 1;
                 const value = leaf_node.value;
-                gpa.destroy(leaf_node);
+                leaf_node.deinit(gpa);
                 return value;
             }
             return if (V == void) {} else null;
         }
 
-        pub fn iterate(self: *Self, closure: anytype) void {
-            _ = self.iterateChildren(self.root, closure);
+        pub fn iterateNodes(self: *Self, closure: anytype) void {
+            _ = self.iterateNodesRecursive(self.root, 0, closure);
         }
 
-        pub fn iterateChildren(self: *Self, it: usize, closure: anytype) bool {
+        fn iterateNodesRecursive(self: *Self, it: usize, depth: usize, closure: anytype) bool {
+            if (it == 0) {
+                return closure.run(it, depth);
+            }
+
+            if (Leaf.from(it) != null) {
+                return closure.run(it, depth);
+            }
+
+            @setEvalBranchQuota(2000);
+
+            const metadata = @intToPtr(*Metadata, it);
+            if (!closure.run(it, depth)) {
+                return false;
+            }
+            switch (metadata.node_type) {
+                .node_4 => {
+                    const node = @fieldParentPtr(Node4, "metadata", metadata);
+                    for (node.children[0..metadata.num_children]) |child| {
+                        if (!self.iterateNodesRecursive(child, depth + 1, closure)) {
+                            return false;
+                        }
+                    }
+                },
+                .node_16 => {
+                    const node = @fieldParentPtr(Node16, "metadata", metadata);
+                    for (node.children[0..metadata.num_children]) |child| {
+                        if (!self.iterateNodesRecursive(child, depth + 1, closure)) {
+                            return false;
+                        }
+                    }
+                },
+                .node_48 => {
+                    const node = @fieldParentPtr(Node48, "metadata", metadata);
+                    comptime var i: usize = 0;
+                    inline while (i < node.keys.len) : (i += 1) {
+                        if (node.keys[i] != 0) {
+                            if (!self.iterateNodesRecursive(node.children[node.keys[i] - 1], depth + 1, closure)) {
+                                return false;
+                            }
+                        }
+                    }
+                },
+                .node_256 => {
+                    const node = @fieldParentPtr(Node256, "metadata", metadata);
+                    comptime var i: usize = 0;
+                    inline while (i < node.children.len) : (i += 1) {
+                        if (node.children[i] != 0) {
+                            if (!self.iterateNodesRecursive(node.children[i], depth + 1, closure)) {
+                                return false;
+                            }
+                        }
+                    }
+                },
+            }
+            return true;
+        }
+
+        pub fn iterate(self: *Self, closure: anytype) void {
+            _ = self.iterateRecursive(self.root, closure);
+        }
+
+        fn iterateRecursive(self: *Self, it: usize, closure: anytype) bool {
             if (it == 0) {
                 return true;
             }
@@ -776,7 +821,7 @@ pub fn Tree(comptime V: type) type {
                 .node_4 => {
                     const node = @fieldParentPtr(Node4, "metadata", metadata);
                     for (node.children[0..metadata.num_children]) |child| {
-                        if (!self.iterateChildren(child, closure)) {
+                        if (!self.iterateRecursive(child, closure)) {
                             return false;
                         }
                     }
@@ -784,7 +829,7 @@ pub fn Tree(comptime V: type) type {
                 .node_16 => {
                     const node = @fieldParentPtr(Node16, "metadata", metadata);
                     for (node.children[0..metadata.num_children]) |child| {
-                        if (!self.iterateChildren(child, closure)) {
+                        if (!self.iterateRecursive(child, closure)) {
                             return false;
                         }
                     }
@@ -794,7 +839,7 @@ pub fn Tree(comptime V: type) type {
                     comptime var i: usize = 0;
                     inline while (i < node.keys.len) : (i += 1) {
                         if (node.keys[i] != 0) {
-                            if (!self.iterateChildren(node.children[node.keys[i] - 1], closure)) {
+                            if (!self.iterateRecursive(node.children[node.keys[i] - 1], closure)) {
                                 return false;
                             }
                         }
@@ -805,11 +850,69 @@ pub fn Tree(comptime V: type) type {
                     comptime var i: usize = 0;
                     inline while (i < node.children.len) : (i += 1) {
                         if (node.children[i] != 0) {
-                            if (!self.iterateChildren(node.children[i], closure)) {
+                            if (!self.iterateRecursive(node.children[i], closure)) {
                                 return false;
                             }
                         }
                     }
+                },
+            }
+
+            return true;
+        }
+
+        pub fn print(it: usize, depth: usize) bool {
+            const spaces = [_]u8{' '} ** 256;
+
+            if (it == 0) {
+                std.debug.print("empty\n", .{});
+                return true;
+            }
+
+            if (Leaf.from(it)) |leaf| {
+                std.debug.print("{s}-> {s} = {}\n", .{ spaces[0 .. depth * 2], leaf.keySlice(), leaf.value });
+                return true;
+            }
+
+            const metadata = @intToPtr(*Metadata, it);
+            switch (metadata.node_type) {
+                .node_4 => {
+                    const node = @fieldParentPtr(Node4, "metadata", metadata);
+                    std.debug.print("{s}4   [{s}] ({s}) {} children\n", .{
+                        spaces[0 .. depth * 2],
+                        node.keys,
+                        metadata.partial[0..@minimum(max_prefix_len, metadata.partial_len)],
+                        @as(u16, metadata.num_children),
+                    });
+                },
+                .node_16 => {
+                    const node = @fieldParentPtr(Node16, "metadata", metadata);
+                    std.debug.print("{s}16  [{s}] ({s}) {} children\n", .{
+                        spaces[0 .. depth * 2],
+                        node.keys,
+                        metadata.partial[0..@minimum(max_prefix_len, metadata.partial_len)],
+                        @as(u16, metadata.num_children),
+                    });
+                },
+                .node_48 => {
+                    const node = @fieldParentPtr(Node48, "metadata", metadata);
+                    std.debug.print("{s}48  [", .{spaces[0 .. depth * 2]});
+                    for (node.keys) |character, i| {
+                        if (character != 0) {
+                            std.debug.print("{c}", .{@intCast(u8, i)});
+                        }
+                    }
+                    std.debug.print("] ({s}) {} children\n", .{ metadata.partial[0..@minimum(max_prefix_len, metadata.partial_len)], @as(u16, metadata.num_children) });
+                },
+                .node_256 => {
+                    const node = @fieldParentPtr(Node256, "metadata", metadata);
+                    std.debug.print("{s}256 [", .{spaces[0 .. depth * 2]});
+                    for (node.children) |child, i| {
+                        if (child != 0) {
+                            std.debug.print("{c}", .{@intCast(u8, i)});
+                        }
+                    }
+                    std.debug.print("] ({s}) {} children\n", .{ metadata.partial[0..@minimum(max_prefix_len, metadata.partial_len)], @as(u16, metadata.num_children) });
                 },
             }
 
@@ -853,42 +956,27 @@ test "insert" {
     try tree.insert(testing.allocator, "hello world", {});
     try testing.expectEqual(@as(?void, {}), tree.search("hello"));
     try testing.expectEqual(@as(?void, {}), tree.search("hello world"));
-
-    tree.iterate(struct {
-        pub fn run(key: []const u8, value: void) bool {
-            _ = key;
-            _ = value;
-            // std.debug.print("{s}\n", .{key});
-            return true;
-        }
-    });
 }
 
 test "stress insert" {
-    var tree: Tree(void) = .{};
+    const tree_size: usize = 5000;
+
+    var tree: Tree(*c_void) = .{};
     defer tree.deinit(testing.allocator);
 
     var rng = std.rand.DefaultPrng.init(1);
 
-    var i: usize = 0;
-    while (i < 100_000) : (i += 1) {
-        var key: [32]u8 = undefined;
-        rng.random.bytes(&key);
-        try tree.insert(testing.allocator, &key, {});
+    var keys = try testing.allocator.alloc([32:0]u8, tree_size);
+    defer testing.allocator.free(keys);
+
+    for (keys) |*key| {
+        for (key) |*c| c.* = rng.random.intRangeAtMost(u8, 'A', 'z');
+        key[32] = 0;
     }
 
-    var callback: struct {
-        count: usize = 0,
-        pub fn run(self: *@This(), key: []const u8, value: void) bool {
-            _ = key;
-            _ = value;
-            self.count += 1;
-            // std.debug.print("{}\n", .{std.fmt.fmtSliceHexLower(key)});
-            return true;
-        }
-    } = .{};
+    for (keys) |*key| {
+        _ = try tree.insert(testing.allocator, key, @intToPtr(*c_void, 0xdeadbeef));
+    }
 
-    tree.iterate(&callback);
-
-    try testing.expectEqual(@as(usize, 100_000), callback.count);
+    try testing.expectEqual(tree_size, tree.size);
 }

@@ -35,7 +35,7 @@ extern "C"
   {
     uint32_t partial_len;
     uint8_t type;
-    uint16_t num_children;
+    uint8_t num_children;
     unsigned char partial[MAX_PREFIX_LEN];
   } art_node;
 

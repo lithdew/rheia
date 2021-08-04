@@ -81,26 +81,26 @@ The benchmark code is available [here](benchmarks/mempool/main.zig). An example 
 ```
 $ zig run benchmarks/mempool/main.zig benchmarks/mempool/*.c -I benchmarks/mempool -lc -fno-sanitize-c --name mempool -O ReleaseFast
 
-info(btree): insert: 449.815ms
-info(btree): search: 460.462ms
-info(btree): delete: 449.945ms
-info(red_black_tree): insert: 653.616ms
-info(red_black_tree): search: 612.878ms
+info(btree): insert: 477.383ms
+info(btree): search: 425.205ms
+info(btree): delete: 474.398ms
+info(red_black_tree): insert: 689.203ms
+info(red_black_tree): search: 648.113ms
 info(red_black_tree): skipping delete...
-info(binary_heap): insert: 62.677ms
+info(binary_heap): insert: 62.174ms
 info(binary_heap): skipping search/delete...
-info(skiplist): insert: 1.4s
+info(skiplist): insert: 1.482s
 info(skiplist): skipping search/delete...
-info(libart): insert: 143.33ms
-info(libart): search: 78.175ms
-info(libart): delete: 208.693ms
-info(art_travis): insert: 186.45ms
-info(art_travis): search: 86.304ms
-info(art_travis): delete: 192.678ms
-info(art): insert: 169.749ms
-info(art): search: 162.432ms
-info(art): delete: 186.252ms
-info(rax): insert: 430.705ms
-info(rax): search: 316.481ms
-info(rax): delete: 559.38ms
+info(libart): insert: 146.589ms
+info(libart): search: 79.467ms
+info(libart): delete: 212.199ms
+info(art_travis): insert: 195.397ms
+info(art_travis): search: 85.063ms
+info(art_travis): delete: 197.009ms
+info(art): insert: 177.603ms
+info(art): search: 170.312ms
+info(art): delete: 195.265ms
+info(rax): insert: 469.846ms
+info(rax): search: 319.035ms
+info(rax): delete: 562.638ms
 ```
