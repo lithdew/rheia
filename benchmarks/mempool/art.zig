@@ -32,7 +32,7 @@ pub fn Tree(comptime V: type) type {
                         self.children[character] = 0;
                         self.metadata.num_children -= 1;
 
-                        if (self.metadata.num_children > 37) return;
+                        if (self.metadata.num_children != 37) return;
 
                         const old_children = self.children;
 
@@ -40,8 +40,8 @@ pub fn Tree(comptime V: type) type {
                         new_node.metadata.node_type = .node_48;
                         ref.* = @ptrToInt(&new_node.metadata);
 
-                        new_node.keys = [_]u8{0} ** 256;
-                        new_node.children = [_]usize{0} ** 48;
+                        mem.set(u8, &new_node.keys, 0);
+                        mem.set(usize, &new_node.children, 0);
 
                         var pos: u8 = 0;
                         comptime var i = 0;
@@ -62,17 +62,17 @@ pub fn Tree(comptime V: type) type {
 
                         self.metadata.num_children -= 1;
 
-                        if (self.metadata.num_children > 12) return;
+                        if (self.metadata.num_children != 12) return;
 
                         const old_keys = self.keys;
                         const old_children = self.children;
 
-                        const new_node = @ptrCast(*Node16, gpa.shrink(mem.span(mem.asBytes(self)), @sizeOf(Node16)));
+                        const new_node = @ptrCast(*Node16, gpa.shrink(mem.span(mem.asBytes(self)), @sizeOf(Node16)).ptr);
                         new_node.metadata.node_type = .node_16;
                         ref.* = @ptrToInt(&new_node.metadata);
 
-                        new_node.keys = [_]u8{0} ** 16;
-                        new_node.children = [_]usize{0} ** 16;
+                        mem.set(u8, &new_node.keys, 0);
+                        mem.set(usize, &new_node.children, 0);
 
                         var child: usize = 0;
                         comptime var i = 0;
@@ -89,35 +89,35 @@ pub fn Tree(comptime V: type) type {
                 struct {
                     pub fn removeChild(self: *N, gpa: *mem.Allocator, ref: *usize, leaf: *usize) void {
                         const pos = (@ptrToInt(leaf) - @ptrToInt(&self.children)) / @sizeOf(usize);
-                        mem.copy(u8, self.keys[pos..], self.keys[pos + 1 ..]);
-                        mem.copy(usize, self.children[pos..], self.children[pos + 1 ..]);
+                        mem.copy(u8, self.keys[pos..], self.keys[pos + 1 ..][0 .. self.metadata.num_children - 1 - pos]);
+                        mem.copy(usize, self.children[pos..], self.children[pos + 1 ..][0 .. self.metadata.num_children - 1 - pos]);
                         self.metadata.num_children -= 1;
 
-                        if (self.metadata.num_children > 3) return;
+                        if (self.metadata.num_children != 3) return;
 
                         const old_keys = self.keys;
                         const old_children = self.children;
 
-                        const new_node = @ptrCast(*Node4, gpa.shrink(mem.span(mem.asBytes(self)), @sizeOf(Node4)));
+                        const new_node = @ptrCast(*Node4, gpa.shrink(mem.span(mem.asBytes(self)), @sizeOf(Node4)).ptr);
                         new_node.metadata.node_type = .node_4;
                         ref.* = @ptrToInt(&new_node.metadata);
 
-                        new_node.keys = [_]u8{0} ** 4;
-                        new_node.children = [_]usize{0} ** 4;
+                        mem.set(u8, &new_node.keys, 0);
+                        mem.set(usize, &new_node.children, 0);
 
-                        mem.copy(u8, &new_node.keys, old_keys[0..4]);
-                        mem.copy(usize, &new_node.children, old_children[0..4]);
+                        mem.copy(u8, &new_node.keys, old_keys[0..new_node.keys.len]);
+                        mem.copy(usize, &new_node.children, old_children[0..new_node.children.len]);
                     }
                 }
             else if (N.num_keys == 4 and N.num_children == 4)
                 struct {
                     pub fn removeChild(self: *N, gpa: *mem.Allocator, ref: *usize, leaf: *usize) void {
                         const pos = (@ptrToInt(leaf) - @ptrToInt(&self.children)) / @sizeOf(usize);
-                        mem.copy(u8, self.keys[pos..], self.keys[pos + 1 ..]);
-                        mem.copy(usize, self.children[pos..], self.children[pos + 1 ..]);
+                        mem.copy(u8, self.keys[pos..], self.keys[pos + 1 ..][0 .. self.metadata.num_children - 1 - pos]);
+                        mem.copy(usize, self.children[pos..], self.children[pos + 1 ..][0 .. self.metadata.num_children - 1 - pos]);
                         self.metadata.num_children -= 1;
 
-                        if (self.metadata.num_children > 1) return;
+                        if (self.metadata.num_children != 1) return;
 
                         const child = self.children[0];
                         if (Leaf.from(child) == null) {
@@ -128,7 +128,7 @@ pub fn Tree(comptime V: type) type {
                             }
                             const child_node = @intToPtr(*Metadata, child);
                             if (prefix < max_prefix_len) {
-                                const sub_prefix = @minimum(child_node.partial_len, max_prefix_len);
+                                const sub_prefix = @minimum(child_node.partial_len, max_prefix_len - prefix);
                                 mem.copy(u8, self.metadata.partial[prefix..], child_node.partial[0..sub_prefix]);
                                 prefix += sub_prefix;
                             }
@@ -171,7 +171,7 @@ pub fn Tree(comptime V: type) type {
                         const new_node = @ptrCast(*Node256, (try gpa.realloc(mem.span(mem.asBytes(self)), @sizeOf(Node256))).ptr);
                         new_node.metadata.node_type = .node_256;
 
-                        new_node.children = [_]usize{0} ** 256;
+                        mem.set(usize, &new_node.children, 0);
 
                         comptime var i = 0;
                         inline while (i < old_keys.len) : (i += 1) {
@@ -189,7 +189,8 @@ pub fn Tree(comptime V: type) type {
                     pub fn addChild(self: *N, gpa: *mem.Allocator, ref: *usize, character: u8, child: usize) !void {
                         if (self.metadata.num_children < self.children.len) {
                             const cmp = @splat(16, character) < @as(Vector(16, u8), self.keys);
-                            const bitfield = @ptrCast(*const u17, &cmp).* & ((@as(u17, 1) << @intCast(u5, self.metadata.num_children)) - 1);
+                            const mask = (@as(u17, 1) << @intCast(u5, self.metadata.num_children)) - 1;
+                            const bitfield = @ptrCast(*const u17, &cmp).* & mask;
                             const idx = idx: {
                                 if (bitfield != 0) {
                                     const idx = @ctz(usize, bitfield);
@@ -213,8 +214,8 @@ pub fn Tree(comptime V: type) type {
                         const new_node = @ptrCast(*Node48, (try gpa.realloc(mem.span(mem.asBytes(self)), @sizeOf(Node48))).ptr);
                         new_node.metadata.node_type = .node_48;
 
-                        new_node.keys = [_]u8{0} ** 256;
-                        new_node.children = [_]usize{0} ** 48;
+                        mem.set(u8, &new_node.keys, 0);
+                        mem.set(usize, &new_node.children, 0);
 
                         mem.copy(usize, &new_node.children, &old_children);
 
@@ -251,8 +252,8 @@ pub fn Tree(comptime V: type) type {
                         const new_node = @ptrCast(*Node16, (try gpa.realloc(mem.span(mem.asBytes(self)), @sizeOf(Node16))).ptr);
                         new_node.metadata.node_type = .node_16;
 
-                        new_node.keys = [_]u8{0} ** 16;
-                        new_node.children = [_]usize{0} ** 16;
+                        mem.set(u8, &new_node.keys, 0);
+                        mem.set(usize, &new_node.children, 0);
 
                         mem.copy(u8, &new_node.keys, &old_keys);
                         mem.copy(usize, &new_node.children, &old_children);
@@ -615,7 +616,7 @@ pub fn Tree(comptime V: type) type {
                     const new_leaf_node = try Leaf.init(gpa, key, value);
                     errdefer new_leaf_node.deinit(gpa);
 
-                    try new_node.addChild(gpa, ref, keyAt(key, depth + prefix_diff), @ptrToInt(new_leaf_node) | 1);
+                    try new_node.addChild(gpa, ref, keyAt(new_leaf_node.keySlice(), depth + prefix_diff), @ptrToInt(new_leaf_node) | 1);
 
                     return if (V == void) {} else null;
                 }
@@ -631,7 +632,7 @@ pub fn Tree(comptime V: type) type {
                 const new_leaf_node = try Leaf.init(gpa, key, value);
                 errdefer new_leaf_node.deinit(gpa);
 
-                try self.addChild(gpa, ref, keyAt(key, depth), @ptrToInt(new_leaf_node) | 1);
+                try self.addChild(gpa, ref, keyAt(new_leaf_node.keySlice(), depth), @ptrToInt(new_leaf_node) | 1);
 
                 return if (V == void) {} else null;
             }

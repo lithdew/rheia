@@ -13,7 +13,7 @@ pub fn Art(comptime T: type) type {
         const Tree = @This();
         const max_prefix_len = 10;
         const BaseNode = struct {
-            num_children: u9,
+            num_children: u8,
             partial_len: u8,
             partial: [max_prefix_len]u8 = [1]u8{0} ** max_prefix_len,
         };
@@ -21,7 +21,7 @@ pub fn Art(comptime T: type) type {
             // work around for error: extern structs cannot contain fields of type '*[0]u8'
             const num_keys_adj = if (_num_keys == 0) 1 else _num_keys;
             return struct {
-                num_children: u9,
+                num_children: u8,
                 partial_len: u8,
                 partial: [max_prefix_len]u8 = [1]u8{0} ** max_prefix_len,
                 keys: *[num_keys_adj]u8,
@@ -573,13 +573,14 @@ pub fn Art(comptime T: type) type {
             }
         }
 
+        extern fn @"llvm.uadd.sat.i8"(u8, u8) u8;
         fn addChild256(t: *Tree, _n: ?*Node, _: *?*Node, c: u8, child: anytype) Error!void {
             _ = child;
             _ = t;
             const n = _n orelse return error.Missing;
             n.node256.children[c] = child;
             // prevent overflow with saturating addition
-            n.node256.num_children += 1;
+            n.node256.num_children = @"llvm.uadd.sat.i8"(n.node256.num_children, 1);
         }
         fn checkPrefix(n: *BaseNode, key: []const u8, depth: usize) usize {
             // FIXME should this be key.len - 1?
