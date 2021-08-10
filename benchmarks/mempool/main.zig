@@ -8,6 +8,7 @@ const c = @cImport({
 const rb = @import("rb.zig");
 const rax = @import("rax.zig");
 const art = @import("art.zig");
+const hash_map = @import("hash_map.zig");
 const skiplist = @import("skiplist.zig");
 const art_travis = @import("art_travis.zig");
 
@@ -18,6 +19,7 @@ pub const log_level = .debug;
 const gpa = std.heap.raw_c_allocator;
 
 pub fn main() !void {
+    try benchmarkHashMap();
     try benchmarkBTree();
     try benchmarkRedBlackTree();
     try benchmarkBinaryHeap();
@@ -26,6 +28,45 @@ pub fn main() !void {
     try benchmarkArtTravis();
     try benchmarkArt();
     try benchmarkRax();
+}
+
+fn benchmarkHashMap() !void {
+    const log = std.log.scoped(.hash_map).info;
+
+    const keys = try gpa.alloc([32]u8, 1_000_000);
+    defer gpa.free(keys);
+
+    var rng = std.rand.DefaultPrng.init(0);
+    for (keys) |*key| {
+        rng.random.bytes(key);
+    }
+
+    var map = try hash_map.HashMap(usize, 50).initCapacity(gpa, 1 << 21);
+    defer map.deinit(gpa);
+
+    var timer = try std.time.Timer.start();
+    for (keys) |key, i| {
+        try map.put(gpa, key, i);
+    }
+    log("insert: {}", .{std.fmt.fmtDuration(timer.read())});
+
+    timer.reset();
+    for (keys) |key, i| {
+        if (map.get(key) != i) {
+            return error.NotFound;
+        }
+    }
+    log("search: {}", .{std.fmt.fmtDuration(timer.read())});
+
+    timer.reset();
+    for (keys) |key, i| {
+        if (map.delete(key) != i) {
+            return error.NotFound;
+        }
+    }
+    log("delete: {}", .{std.fmt.fmtDuration(timer.read())});
+
+    log("put: {}, get: {}, del: {}", .{ map.put_probe_count, map.get_probe_count, map.del_probe_count });
 }
 
 fn benchmarkBTree() !void {

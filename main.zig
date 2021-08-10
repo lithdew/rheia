@@ -18,6 +18,7 @@ const IPv4 = std.x.os.IPv4;
 const Context = runtime.Context;
 const Blake3 = std.crypto.hash.Blake3;
 const Ed25519 = std.crypto.sign.Ed25519;
+const HashMap = @import("hash_map.zig").HashMap;
 const SinglyLinkedList = @import("intrusive.zig").SinglyLinkedList;
 
 const assert = std.debug.assert;
@@ -46,7 +47,8 @@ pub fn run() !void {
     var ctx: Context = .{};
     defer ctx.cancel();
 
-    var node = Node.init();
+    var node: Node = undefined;
+    try node.init(runtime.getAllocator());
     defer {
         var shutdown_ctx: Context = .{};
         defer shutdown_ctx.cancel();
@@ -112,20 +114,22 @@ pub fn runBenchmark(ctx: *Context, client: *net.Client) !void {
 
     var timer = try time.Timer.start();
     var count: usize = 0;
+    var nonce: u64 = 0;
 
     const keys = try Ed25519.KeyPair.create(null);
 
-    const tx = try Transaction.create(runtime.getAllocator(), keys, .{
-        .sender_nonce = 0,
-        .created_at = 0,
-        .tag = .no_op,
-        .data = "hello world",
-    });
-    defer tx.deinit(runtime.getAllocator());
-
     while (true) {
+        const tx = try Transaction.create(runtime.getAllocator(), keys, .{
+            .sender_nonce = nonce,
+            .created_at = 0,
+            .tag = .no_op,
+            .data = "hello world",
+        });
+        defer tx.deinit(runtime.getAllocator());
+
         try sendTransactions(ctx, client, &[_]*Transaction{tx});
         count += 1;
+        nonce += 1;
 
         if (timer.read() > 1 * time.ns_per_s) {
             log.info("{} requests/sec", .{count});
@@ -192,6 +196,89 @@ pub fn sendTestCommand(ctx: *Context, client: *net.Client) !void {
     try writer.writeAll("hello world");
 }
 
+pub const Block = struct {
+    pub const max_num_transaction_ids: u16 = math.maxInt(u16);
+
+    pub const Params = struct {
+        height: u64,
+        merkle_root: [32]u8,
+        transaction_ids: []const [32]u8,
+    };
+
+    id: [32]u8,
+    refs: usize = 1,
+
+    height: u64,
+    merkle_root: [32]u8,
+    num_transaction_ids: u16,
+    transaction_ids: [*][32]u8,
+
+    pub fn create(gpa: *mem.Allocator, params: Block.Params) !*Block {
+        const bytes = try gpa.alignedAlloc(u8, @alignOf(Block), @sizeOf(Block) + params.transaction_ids.len * @sizeOf([32]u8));
+        errdefer gpa.free(bytes);
+
+        const block = @ptrCast(*Block, bytes.ptr);
+
+        block.refs = 1;
+        block.height = params.height;
+        block.merkle_root = params.merkle_root;
+        block.num_transaction_ids = @intCast(u16, params.transaction_ids.len);
+
+        block.transaction_ids = @ptrCast([*][32]u8, bytes.ptr + @sizeOf(Block));
+        mem.copy([32]u8, block.transaction_ids[0..block.num_transaction_ids], params.transaction_ids);
+
+        // blake3 id
+
+        var hash = crypto.HashWriter(Blake3).wrap(Blake3.init(.{}));
+        try block.write(hash.writer());
+        block.id = hash.digest(32);
+
+        return block;
+    }
+
+    pub fn deinit(self: *Block, gpa: *mem.Allocator) void {
+        self.refs -= 1;
+        if (self.refs == 0) {
+            gpa.free(@ptrCast([*]const u8, self)[0 .. @sizeOf(Block) + @as(usize, self.num_transaction_ids) * @sizeOf([32]u8)]);
+        }
+    }
+
+    pub fn ref(self: *Block) *Block {
+        assert(self.refs >= 1);
+        self.refs += 1;
+        return self;
+    }
+
+    pub fn write(self: Block, writer: anytype) !void {
+        try writer.writeIntLittle(u64, self.height);
+        try writer.writeAll(&self.merkle_root);
+        try writer.writeIntLittle(u16, self.num_transaction_ids);
+        try writer.writeAll(mem.sliceAsBytes(self.transaction_ids[0..self.num_transaction_ids]));
+    }
+
+    pub fn read(gpa: *mem.Allocator, reader: anytype) !*Block {
+        var block = try gpa.create(Block);
+        errdefer gpa.destroy(block);
+
+        block.height = try reader.readIntLittle(u64);
+        block.merkle_root = try reader.readBytesNoEof(32);
+        block.num_transaction_ids = try reader.readIntLittle(u16);
+
+        block = @ptrCast(*Block, try gpa.realloc(mem.span(mem.asBytes(block)), @sizeOf(Block) + @as(usize, block.num_transaction_ids) * @sizeOf([32]u8)));
+
+        block.transaction_ids = @ptrCast([*][32]u8, @ptrCast([*]u8, block) + @sizeOf(Block));
+        try reader.readNoEof(mem.sliceAsBytes(block.transaction_ids[0..block.num_transaction_ids]));
+
+        var hash = crypto.HashWriter(Blake3).wrap(Blake3.init(.{}));
+        try block.write(hash.writer());
+        block.id = hash.digest(32);
+
+        block.refs = 1;
+
+        return block;
+    }
+};
+
 pub const Transaction = struct {
     pub const header_size = @sizeOf([32]u8) + @sizeOf([64]u8) + @sizeOf(u32) + @sizeOf(u64) + @sizeOf(u64) + @sizeOf(Transaction.Tag);
 
@@ -219,7 +306,7 @@ pub const Transaction = struct {
     data: [*]u8,
 
     pub fn create(gpa: *mem.Allocator, keys: Ed25519.KeyPair, params: Transaction.Params) !*Transaction {
-        const bytes = try gpa.alignedAlloc(u8, @alignOf(*Transaction), @sizeOf(Transaction) + params.data.len);
+        const bytes = try gpa.alignedAlloc(u8, @alignOf(Transaction), @sizeOf(Transaction) + params.data.len);
         errdefer gpa.free(bytes);
 
         const tx = @ptrCast(*Transaction, bytes.ptr);
@@ -306,6 +393,28 @@ pub const Transaction = struct {
     }
 };
 
+test "block: create, serialize, and deserialize" {
+    const expected = try Block.create(testing.allocator, .{
+        .height = 123,
+        .merkle_root = [_]u8{1} ** 32,
+        .transaction_ids = &[_][32]u8{ [_]u8{2} ** 32, [_]u8{3} ** 32, [_]u8{4} ** 32 },
+    });
+    defer expected.deinit(testing.allocator);
+
+    var data = std.ArrayList(u8).init(testing.allocator);
+    defer data.deinit();
+
+    try expected.write(data.writer());
+
+    const actual = try Block.read(testing.allocator, io.fixedBufferStream(data.items).reader());
+    defer actual.deinit(testing.allocator);
+
+    try testing.expectEqual(expected.height, actual.height);
+    try testing.expectEqual(expected.merkle_root, actual.merkle_root);
+    try testing.expectEqual(expected.num_transaction_ids, actual.num_transaction_ids);
+    try testing.expectEqualSlices([32]u8, expected.transaction_ids[0..expected.num_transaction_ids], actual.transaction_ids[0..actual.num_transaction_ids]);
+}
+
 test "transaction: create, serialize, and deserialize" {
     const keys = try Ed25519.KeyPair.create(null);
 
@@ -337,19 +446,27 @@ test "transaction: create, serialize, and deserialize" {
 pub const Node = struct {
     const log = std.log.scoped(.node);
 
+    chain: Chain,
     verifier: TransactionVerifier,
 
-    pub fn init() Node {
-        return Node{ .verifier = TransactionVerifier.init() };
+    pub fn init(self: *Node, gpa: *mem.Allocator) !void {
+        self.chain = try Chain.init(gpa);
+        errdefer self.chain.deinit(gpa);
+
+        self.verifier = TransactionVerifier.init(&self.chain);
     }
 
     pub fn deinit(self: *Node, ctx: *Context, gpa: *mem.Allocator) !void {
         try self.verifier.deinit(ctx, gpa);
+        self.chain.deinit(gpa);
     }
 
     pub fn run(self: *Node, ctx: *Context, gpa: *mem.Allocator) !void {
         var verifier_frame = async self.verifier.run(ctx, gpa);
         defer await verifier_frame catch |err| log.warn("transaction verifier error: {}", .{err});
+
+        var chain_frame = async self.chain.run(ctx, gpa);
+        defer await chain_frame catch |err| log.warn("chain error: {}", .{err});
     }
 
     pub fn handleServerPacket(
@@ -404,10 +521,122 @@ pub const Node = struct {
                             try self.verifier.push(ctx, gpa, tx);
                         }
                     },
-                    // else => return error.UnexpectedTag,
                 }
             },
             .response => return error.UnexpectedPacket,
+        }
+    }
+};
+
+pub const Chain = struct {
+    const log = std.log.scoped(.chain);
+
+    pub const propose_delay_min: i64 = 0 * time.ns_per_ms;
+    pub const propose_delay_max: i64 = 500 * time.ns_per_ms;
+
+    sampler: Sampler,
+    pending: HashMap(*Transaction, 50),
+
+    latest_block: ?*Block = null,
+    last_propose_time: i64 = 0,
+
+    pub fn init(gpa: *mem.Allocator) !Chain {
+        var sampler = try Sampler.init(gpa);
+        errdefer sampler.deinit(gpa);
+
+        var pending = try HashMap(*Transaction, 50).init(gpa);
+        errdefer pending.deinit(gpa);
+
+        return Chain{ .sampler = sampler, .pending = pending };
+    }
+
+    pub fn deinit(self: *Chain, gpa: *mem.Allocator) void {
+        for (self.pending.slice()) |entry| {
+            if (!entry.isEmpty()) {
+                entry.value.deinit(gpa);
+            }
+        }
+        self.pending.deinit(gpa);
+        if (self.latest_block) |latest_block| {
+            latest_block.deinit(gpa);
+        }
+        self.sampler.deinit(gpa);
+    }
+
+    pub fn run(self: *Chain, ctx: *Context, gpa: *mem.Allocator) !void {
+        var propose_delay: i64 = propose_delay_min;
+
+        var transaction_ids: std.ArrayListUnmanaged([32]u8) = .{};
+        defer transaction_ids.deinit(gpa);
+
+        var votes: std.ArrayListUnmanaged(Sampler.Vote) = .{};
+        defer votes.deinit(gpa);
+
+        while (true) {
+            const preferred_block = self.sampler.preferred orelse {
+                try runtime.timeout(ctx, .{ .nanoseconds = propose_delay });
+
+                if (self.pending.len == 0 or time.milliTimestamp() - self.last_propose_time < propose_delay_min / time.ns_per_ms) {
+                    propose_delay = math.min(propose_delay_max, propose_delay + (propose_delay_max - propose_delay_min) / 10);
+                    continue;
+                }
+
+                try transaction_ids.ensureTotalCapacity(gpa, math.min(Block.max_num_transaction_ids, self.pending.len));
+
+                transaction_ids.clearRetainingCapacity();
+
+                for (self.pending.slice()) |entry| {
+                    if (!entry.isEmpty()) {
+                        transaction_ids.appendAssumeCapacity(entry.value.id);
+                        if (transaction_ids.items.len == Block.max_num_transaction_ids) {
+                            break;
+                        }
+                    }
+                }
+
+                const block = try Block.create(gpa, .{
+                    .height = (if (self.latest_block) |latest_block| latest_block.height else 0) + 1,
+                    .merkle_root = [_]u8{0} ** 32,
+                    .transaction_ids = transaction_ids.items,
+                });
+                defer block.deinit(gpa);
+
+                self.sampler.prefer(gpa, block);
+                propose_delay = propose_delay_min;
+
+                log.info("proposed block {} (height {}, {} transaction(s))", .{
+                    fmt.fmtSliceHexLower(&block.id),
+                    block.height,
+                    block.num_transaction_ids,
+                });
+
+                continue;
+            };
+
+            try votes.ensureTotalCapacity(gpa, 1);
+
+            votes.clearRetainingCapacity();
+            votes.appendAssumeCapacity(Sampler.Vote{ .block = preferred_block, .tally = 1.0 });
+
+            const finalized_block = (try self.sampler.update(gpa, votes.items)) orelse continue;
+
+            for (finalized_block.transaction_ids[0..finalized_block.num_transaction_ids]) |tx_id| {
+                const tx = self.pending.delete(tx_id) orelse unreachable;
+                tx.deinit(gpa);
+            }
+
+            if (self.latest_block) |latest_block| {
+                latest_block.deinit(gpa);
+            }
+            self.latest_block = finalized_block.ref();
+
+            self.sampler.reset(gpa);
+
+            log.info("finalized block {} (height {}, {} transaction(s))", .{
+                fmt.fmtSliceHexLower(&finalized_block.id),
+                finalized_block.height,
+                finalized_block.num_transaction_ids,
+            });
         }
     }
 };
@@ -425,6 +654,8 @@ pub const TransactionVerifier = struct {
         next: ?*TransactionVerifier.Task = null,
     };
 
+    chain: *Chain,
+
     pool_wg: sync.WaitGroup = .{},
     pool_parker: sync.Parker(void) = .{},
     pool: SinglyLinkedList(TransactionVerifier.Task, .next) = .{},
@@ -432,8 +663,8 @@ pub const TransactionVerifier = struct {
     entries: std.ArrayListUnmanaged(*Transaction) = .{},
     last_flush_time: i64 = 0,
 
-    pub fn init() TransactionVerifier {
-        return TransactionVerifier{};
+    pub fn init(chain: *Chain) TransactionVerifier {
+        return TransactionVerifier{ .chain = chain };
     }
 
     pub fn deinit(self: *TransactionVerifier, ctx: *Context, gpa: *mem.Allocator) !void {
@@ -501,7 +732,7 @@ pub const TransactionVerifier = struct {
         self.last_flush_time = time.milliTimestamp();
     }
 
-    fn runTask(self: *TransactionVerifier, task: *TransactionVerifier.Task, gpa: *mem.Allocator, entries: []*Transaction) void {
+    fn runTask(self: *TransactionVerifier, task: *TransactionVerifier.Task, gpa: *mem.Allocator, entries: []*Transaction) !void {
         self.pool_wg.add(1);
         defer self.pool_wg.sub(1);
 
@@ -510,33 +741,179 @@ pub const TransactionVerifier = struct {
             self.pool_parker.notify({});
         }
 
-        runtime.startCpuBoundOperation();
-        defer runtime.endCpuBoundOperation();
+        var index: usize = 0;
 
-        var num: usize = 0;
-        while (entries.len - num >= max_signature_batch_size) : (num += max_signature_batch_size) {
-            crypto.verifyBatch(entries[num..][0..max_signature_batch_size]) catch |batch_err| {
-                log.warn("bad transaction batch: {}", .{batch_err});
+        {
+            runtime.startCpuBoundOperation();
+            defer runtime.endCpuBoundOperation();
 
-                for (entries[num..][0..max_signature_batch_size]) |tx| {
-                    crypto.verify(tx.signature, tx, tx.sender) catch |err| {
-                        log.warn("bad transaction {}: {}", .{ fmt.fmtSliceHexLower(&tx.id), err });
-                        continue;
-                    };
+            var num: usize = 0;
+            while (entries.len - num >= max_signature_batch_size) : (num += max_signature_batch_size) {
+                crypto.verifyBatch(entries[num..][0..max_signature_batch_size]) catch |batch_err| {
+                    log.warn("bad transaction batch: {}", .{batch_err});
+
+                    for (entries[num..][0..max_signature_batch_size]) |tx| {
+                        crypto.verify(tx.signature, tx, tx.sender) catch |err| {
+                            log.warn("bad transaction {}: {}", .{ fmt.fmtSliceHexLower(&tx.id), err });
+                            tx.deinit(gpa);
+                            continue;
+                        };
+
+                        entries[index] = tx;
+                        index += 1;
+                    }
+
+                    continue;
+                };
+
+                mem.copy(*Transaction, entries[index..], entries[num..][0..max_signature_batch_size]);
+                index += max_signature_batch_size;
+            }
+
+            for (entries[num..]) |tx| {
+                crypto.verify(tx.signature, tx, tx.sender) catch |err| {
+                    log.warn("bad transaction {}: {}", .{ fmt.fmtSliceHexLower(&tx.id), err });
+                    tx.deinit(gpa);
+                    continue;
+                };
+
+                entries[index] = tx;
+                index += 1;
+            }
+        }
+
+        defer gpa.free(entries);
+
+        self.chain.pending.ensureUnusedCapacity(gpa, index) catch {
+            for (entries[0..index]) |tx| {
+                tx.deinit(gpa);
+            }
+            return;
+        };
+
+        for (entries[0..index]) |tx| {
+            self.chain.pending.putAssumeCapacity(tx.id, tx);
+        }
+    }
+};
+
+pub const Sampler = struct {
+    pub const default_alpha = 0.80;
+    pub const default_beta = 150;
+
+    pub const Vote = struct {
+        block: ?*Block,
+        tally: f64,
+    };
+
+    counts: HashMap(usize, 50),
+    count: usize = 0,
+    stalled: usize = 0,
+    preferred: ?*Block = null,
+    last: ?*Block = null,
+
+    pub fn init(gpa: *mem.Allocator) !Sampler {
+        var counts = try HashMap(usize, 50).init(gpa);
+        errdefer counts.deinit(gpa);
+
+        return Sampler{ .counts = counts };
+    }
+
+    pub fn deinit(self: *Sampler, gpa: *mem.Allocator) void {
+        self.counts.deinit(gpa);
+        if (self.preferred) |preferred| {
+            preferred.deinit(gpa);
+        }
+        if (self.last) |last| {
+            last.deinit(gpa);
+        }
+    }
+
+    pub fn reset(self: *Sampler, gpa: *mem.Allocator) void {
+        self.counts.clearRetainingCapacity();
+        self.count = 0;
+        self.stalled = 0;
+
+        if (self.preferred) |preferred| {
+            preferred.deinit(gpa);
+        }
+        self.preferred = null;
+
+        if (self.last) |last| {
+            last.deinit(gpa);
+        }
+        self.last = null;
+    }
+
+    pub fn prefer(self: *Sampler, gpa: *mem.Allocator, block: *Block) void {
+        if (self.preferred) |preferred| {
+            preferred.deinit(gpa);
+        }
+        self.preferred = block.ref();
+    }
+
+    pub fn update(self: *Sampler, gpa: *mem.Allocator, votes: []const Vote) !?*Block {
+        try self.counts.ensureUnusedCapacity(gpa, 1);
+
+        if (votes.len == 0) return null;
+
+        var majority_vote = votes[0];
+        for (votes[1..]) |vote| {
+            if (vote.block == null) continue;
+            if (majority_vote.tally >= vote.tally) continue;
+            majority_vote = vote;
+        }
+
+        const majority_block = majority_vote.block orelse {
+            self.count = 0;
+            return null;
+        };
+
+        if (majority_vote.tally < default_alpha) {
+            self.stalled += 1;
+            if (self.stalled >= default_beta) {
+                if (self.preferred) |preferred| {
+                    preferred.deinit(gpa);
                 }
-            };
+                self.preferred = null;
+                self.stalled = 0;
+            }
+            self.count = 0;
+            return null;
         }
 
-        for (entries[num..]) |tx| {
-            crypto.verify(tx.signature, tx, tx.sender) catch |err| {
-                log.warn("bad transaction {}: {}", .{ fmt.fmtSliceHexLower(&tx.id), err });
-                continue;
-            };
+        // TODO: getEntry() can be added to allow for emplacement of value
+
+        const count = (self.counts.get(majority_block.id) orelse 0) + 1;
+        self.counts.putAssumeCapacity(majority_block.id, count);
+
+        if (self.preferred) |preferred| {
+            if (count > self.counts.get(preferred.id).?) {
+                self.preferred = majority_block.ref();
+                preferred.deinit(gpa);
+            }
+        } else {
+            self.preferred = majority_block.ref();
         }
 
-        for (entries) |tx| {
-            tx.deinit(gpa);
+        if (self.last) |last| {
+            if (!mem.eql(u8, &last.id, &majority_block.id)) {
+                self.last = majority_block.ref();
+                self.count = 1;
+                last.deinit(gpa);
+                return null;
+            }
+        } else {
+            self.last = majority_block.ref();
+            self.count = 1;
+            return null;
         }
-        gpa.free(entries);
+
+        self.count += 1;
+        if (self.count > default_beta) {
+            return self.preferred;
+        }
+
+        return null;
     }
 };
