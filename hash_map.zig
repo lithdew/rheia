@@ -76,7 +76,7 @@ pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) typ
         pub fn ensureTotalCapacity(self: *Self, gpa: *mem.Allocator, count: usize) !void {
             while (true) {
                 const capacity = @as(u64, 1) << (63 - self.shift + 1);
-                if (count < capacity * max_load_percentage / 100) {
+                if (count <= capacity * max_load_percentage / 100) {
                     break;
                 }
                 try self.grow(gpa);
@@ -147,10 +147,12 @@ pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) typ
             while (true) : (i += 1) {
                 const entry = self.entries[i];
                 if (@byteSwap(u64, @bitCast(u64, key[0..8].*)) <= @byteSwap(u64, @bitCast(u64, @ptrCast(*const [32]u8, &entry.hash)[0..8].*))) {
-                    if (entry.hash != hash) {
+                    if (entry.hash == hash) {
+                        return entry.value;
+                    }
+                    if (entry.hash == empty_hash) {
                         return null;
                     }
-                    return entry.value;
                 }
 
                 self.get_probe_count += 1;
@@ -165,10 +167,12 @@ pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) typ
             while (true) : (i += 1) {
                 const entry = self.entries[i];
                 if (@byteSwap(u64, @bitCast(u64, key[0..8].*)) <= @byteSwap(u64, @bitCast(u64, @ptrCast(*const [32]u8, &entry.hash)[0..8].*))) {
-                    if (entry.hash != hash) {
+                    if (entry.hash == hash) {
+                        break;
+                    }
+                    if (entry.hash == empty_hash) {
                         return null;
                     }
-                    break;
                 }
                 self.del_probe_count += 1;
             }
@@ -216,4 +220,56 @@ test "hash map: put, get, delete, grow" {
     try testing.expectEqual(@as(usize, 406), map.put_probe_count);
     try testing.expectEqual(@as(usize, 251), map.get_probe_count);
     try testing.expectEqual(@as(usize, 251), map.del_probe_count);
+}
+
+test "hash map: collision test" {
+    const prefix = [_]u8{22} ** 8 ++ [_]u8{1} ** 23;
+
+    var map = try HashMap(usize, 100).initCapacity(testing.allocator, 4);
+    defer map.deinit(testing.allocator);
+
+    try map.put(testing.allocator, prefix ++ [_]u8{0}, 0);
+    try map.put(testing.allocator, prefix ++ [_]u8{1}, 1);
+    try map.put(testing.allocator, prefix ++ [_]u8{2}, 2);
+    try map.put(testing.allocator, prefix ++ [_]u8{3}, 3);
+
+    try testing.expectEqual(@as(usize, 0), map.get(prefix ++ [_]u8{0}).?);
+    try testing.expectEqual(@as(usize, 1), map.get(prefix ++ [_]u8{1}).?);
+    try testing.expectEqual(@as(usize, 2), map.get(prefix ++ [_]u8{2}).?);
+    try testing.expectEqual(@as(usize, 3), map.get(prefix ++ [_]u8{3}).?);
+
+    try testing.expectEqual(@as(usize, 2), map.delete(prefix ++ [_]u8{2}).?);
+    try testing.expectEqual(@as(usize, 0), map.delete(prefix ++ [_]u8{0}).?);
+    try testing.expectEqual(@as(usize, 1), map.delete(prefix ++ [_]u8{1}).?);
+    try testing.expectEqual(@as(usize, 3), map.delete(prefix ++ [_]u8{3}).?);
+
+    try map.put(testing.allocator, prefix ++ [_]u8{0}, 0);
+    try map.put(testing.allocator, prefix ++ [_]u8{2}, 2);
+    try map.put(testing.allocator, prefix ++ [_]u8{3}, 3);
+    try map.put(testing.allocator, prefix ++ [_]u8{1}, 1);
+
+    try testing.expectEqual(@as(usize, 0), map.delete(prefix ++ [_]u8{0}).?);
+    try testing.expectEqual(@as(usize, 1), map.delete(prefix ++ [_]u8{1}).?);
+    try testing.expectEqual(@as(usize, 2), map.delete(prefix ++ [_]u8{2}).?);
+    try testing.expectEqual(@as(usize, 3), map.delete(prefix ++ [_]u8{3}).?);
+
+    try map.put(testing.allocator, prefix ++ [_]u8{0}, 0);
+    try map.put(testing.allocator, prefix ++ [_]u8{2}, 2);
+    try map.put(testing.allocator, prefix ++ [_]u8{1}, 1);
+    try map.put(testing.allocator, prefix ++ [_]u8{3}, 3);
+
+    try testing.expectEqual(@as(usize, 3), map.delete(prefix ++ [_]u8{3}).?);
+    try testing.expectEqual(@as(usize, 2), map.delete(prefix ++ [_]u8{2}).?);
+    try testing.expectEqual(@as(usize, 1), map.delete(prefix ++ [_]u8{1}).?);
+    try testing.expectEqual(@as(usize, 0), map.delete(prefix ++ [_]u8{0}).?);
+
+    try map.put(testing.allocator, prefix ++ [_]u8{3}, 3);
+    try map.put(testing.allocator, prefix ++ [_]u8{0}, 0);
+    try map.put(testing.allocator, prefix ++ [_]u8{1}, 1);
+    try map.put(testing.allocator, prefix ++ [_]u8{2}, 2);
+
+    try testing.expectEqual(@as(usize, 3), map.delete(prefix ++ [_]u8{3}).?);
+    try testing.expectEqual(@as(usize, 0), map.delete(prefix ++ [_]u8{0}).?);
+    try testing.expectEqual(@as(usize, 1), map.delete(prefix ++ [_]u8{1}).?);
+    try testing.expectEqual(@as(usize, 2), map.delete(prefix ++ [_]u8{2}).?);
 }
