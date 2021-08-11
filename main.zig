@@ -88,19 +88,9 @@ pub fn run() !void {
     var server_frame = async server.serve(&ctx, runtime.getAllocator(), listener);
     defer await server_frame catch |err| log.warn("server error: {}", .{err});
 
-    var client = try net.Client.init(runtime.getAllocator(), ip.Address.initIPv4(IPv4.localhost, 9000));
-    defer {
-        var shutdown_ctx: Context = .{};
-        defer shutdown_ctx.cancel();
+    const client_address = ip.Address.initIPv4(IPv4.localhost, 9000);
 
-        if (client.deinit(runtime.getAllocator(), &shutdown_ctx)) |_| {
-            log.info("client successfully shutdown", .{});
-        } else |err| {
-            log.warn("client reported an error while shutting down: {}", .{err});
-        }
-    }
-
-    var client_frame = async runBenchmark(&ctx, &client);
+    var client_frame = async runBenchmark(&ctx, &node, client_address);
     defer await client_frame catch |err| log.warn("client error: {}", .{err});
 
     runtime.waitForSignal(&ctx, .{os.SIGINT}) catch {};
@@ -109,7 +99,7 @@ pub fn run() !void {
     ctx.cancel();
 }
 
-pub fn runBenchmark(ctx: *Context, client: *net.Client) !void {
+pub fn runBenchmark(ctx: *Context, node: *Node, client_address: ip.Address) !void {
     const log = std.log.scoped(.main);
 
     var timer = try time.Timer.start();
@@ -127,7 +117,7 @@ pub fn runBenchmark(ctx: *Context, client: *net.Client) !void {
         });
         defer tx.deinit(runtime.getAllocator());
 
-        try sendTransactions(ctx, client, &[_]*Transaction{tx});
+        try sendTransactions(ctx, node, client_address, &[_]*Transaction{tx});
         count += 1;
         nonce += 1;
 
@@ -139,14 +129,14 @@ pub fn runBenchmark(ctx: *Context, client: *net.Client) !void {
     }
 }
 
-pub fn sendTransactions(ctx: *Context, client: *net.Client, transactions: []*Transaction) !void {
+pub fn sendTransactions(ctx: *Context, node: *Node, client_address: ip.Address, transactions: []*Transaction) !void {
     var len: u32 = 0;
     for (transactions) |tx| {
         len += tx.size();
     }
 
-    const writer = try await async client.acquireWriter(ctx, runtime.getAllocator());
-    defer client.releaseWriter(writer);
+    const writer = try await async node.acquireWriter(ctx, runtime.getAllocator(), client_address);
+    defer node.releaseWriter(client_address, writer);
 
     try (net.Packet{
         .len = len,
@@ -160,13 +150,13 @@ pub fn sendTransactions(ctx: *Context, client: *net.Client, transactions: []*Tra
     }
 }
 
-pub fn sendTestRequest(ctx: *Context, client: *net.Client) !void {
+pub fn sendTestRequest(ctx: *Context, node: *Node, client_address: ip.Address) !void {
     var entry: RPC.Entry = .{};
     var nonce = try client.rpc.register(ctx, &entry);
 
     {
-        const writer = try await async client.acquireWriter(ctx, runtime.getAllocator());
-        defer client.releaseWriter(writer);
+        const writer = try await async node.acquireWriter(ctx, runtime.getAllocator(), client_address);
+        defer node.releaseWriter(client_address, writer);
 
         try (net.Packet{
             .len = "hello world".len,
@@ -182,9 +172,9 @@ pub fn sendTestRequest(ctx: *Context, client: *net.Client) !void {
     defer response.deinit(runtime.getAllocator());
 }
 
-pub fn sendTestCommand(ctx: *Context, client: *net.Client) !void {
-    const writer = try await async client.acquireWriter(ctx, runtime.getAllocator());
-    defer client.releaseWriter(writer);
+pub fn sendTestCommand(ctx: *Context, node: *Node, client_address: ip.Address) !void {
+    const writer = try await async node.acquireWriter(ctx, runtime.getAllocator(), client_address);
+    defer node.releaseWriter(client_address, writer);
 
     try (net.Packet{
         .len = "hello world".len,
@@ -197,6 +187,7 @@ pub fn sendTestCommand(ctx: *Context, client: *net.Client) !void {
 }
 
 pub const Block = struct {
+    pub const header_size = @sizeOf(u64) + @sizeOf([32]u8) + @sizeOf(u16);
     pub const max_num_transaction_ids: u16 = math.maxInt(u16);
 
     pub const Params = struct {
@@ -254,6 +245,10 @@ pub const Block = struct {
         try writer.writeAll(&self.merkle_root);
         try writer.writeIntLittle(u16, self.num_transaction_ids);
         try writer.writeAll(mem.sliceAsBytes(self.transaction_ids[0..self.num_transaction_ids]));
+    }
+
+    pub fn size(self: Block) u32 {
+        return Block.header_size + @as(u32, self.num_transaction_ids) * @sizeOf([32]u8);
     }
 
     pub fn read(gpa: *mem.Allocator, reader: anytype) !*Block {
@@ -448,17 +443,59 @@ pub const Node = struct {
 
     chain: Chain,
     verifier: TransactionVerifier,
+    clients: std.AutoHashMapUnmanaged(ip.Address, *net.Client),
 
     pub fn init(self: *Node, gpa: *mem.Allocator) !void {
         self.chain = try Chain.init(gpa);
         errdefer self.chain.deinit(gpa);
 
         self.verifier = TransactionVerifier.init(&self.chain);
+
+        self.clients = .{};
     }
 
     pub fn deinit(self: *Node, ctx: *Context, gpa: *mem.Allocator) !void {
+        var client_it = self.clients.valueIterator();
+        while (client_it.next()) |client| {
+            var shutdown_ctx: Context = .{};
+            defer shutdown_ctx.cancel();
+
+            if (client.*.deinit(runtime.getAllocator(), &shutdown_ctx)) |_| {
+                log.info("client {} successfully shutdown", .{client.*.address});
+            } else |err| {
+                log.warn("client {} reported an error while shutting down: {}", .{ client.*.address, err });
+            }
+
+            gpa.destroy(client.*);
+        }
+        self.clients.deinit(gpa);
+
         try self.verifier.deinit(ctx, gpa);
+
         self.chain.deinit(gpa);
+    }
+
+    pub fn getOrCreateClient(self: *Node, gpa: *mem.Allocator, address: ip.Address) !*net.Client {
+        const result = try self.clients.getOrPut(gpa, address);
+        if (!result.found_existing) {
+            errdefer assert(self.clients.remove(address));
+
+            result.value_ptr.* = try gpa.create(net.Client);
+            errdefer gpa.destroy(result.value_ptr.*);
+
+            result.value_ptr.*.* = try net.Client.init(gpa, address);
+        }
+        return result.value_ptr.*;
+    }
+
+    pub fn acquireWriter(self: *Node, ctx: *Context, gpa: *mem.Allocator, address: ip.Address) !std.ArrayList(u8).Writer {
+        const client = try self.getOrCreateClient(gpa, address);
+        return client.acquireWriter(ctx, gpa);
+    }
+
+    pub fn releaseWriter(self: *Node, address: ip.Address, writer: std.ArrayList(u8).Writer) void {
+        const client = self.clients.get(address) orelse unreachable;
+        return client.releaseWriter(writer);
     }
 
     pub fn run(self: *Node, ctx: *Context, gpa: *mem.Allocator) !void {
@@ -492,6 +529,44 @@ pub const Node = struct {
 
                         conn.writer_parker.notify({});
                     },
+                    .pull_block => {
+                        const requested_height = try frame.reader().readIntLittle(u64);
+                        const latest_height = if (self.chain.blocks.latest()) |latest_block| latest_block.height else 0;
+
+                        const requested_block = cache_hit: {
+                            const block = block: {
+                                if (requested_height == latest_height + 1) {
+                                    break :block self.chain.sampler.preferred orelse break :cache_hit null;
+                                }
+                                if (self.chain.blocks.get(requested_height)) |old_block| {
+                                    break :block old_block;
+                                }
+                                break :cache_hit null;
+                            };
+
+                            const cache_id = frame.reader().readBytesNoEof(32) catch break :cache_hit block;
+                            if (!mem.eql(u8, &block.id, &cache_id)) {
+                                break :cache_hit block;
+                            }
+                            break :cache_hit null;
+                        };
+
+                        try (net.Packet{
+                            .len = 1 + (if (requested_block) |block| block.size() else 0),
+                            .nonce = packet.nonce,
+                            .op = .response,
+                            .tag = .pull_block,
+                        }).write(conn.buffer.writer());
+
+                        if (requested_block) |block| {
+                            try conn.buffer.writer().writeByte(1);
+                            try block.write(conn.buffer.writer());
+                        } else {
+                            try conn.buffer.writer().writeByte(0);
+                        }
+
+                        conn.writer_parker.notify({});
+                    },
                     else => return error.UnexpectedTag,
                 }
             },
@@ -521,6 +596,7 @@ pub const Node = struct {
                             try self.verifier.push(ctx, gpa, tx);
                         }
                     },
+                    else => return error.UnexpectedTag,
                 }
             },
             .response => return error.UnexpectedPacket,
@@ -537,7 +613,7 @@ pub const Chain = struct {
     sampler: Sampler,
     pending: HashMap(*Transaction, 50),
 
-    latest_block: ?*Block = null,
+    blocks: BlockRingBuffer = .{},
     last_propose_time: i64 = 0,
 
     pub fn init(gpa: *mem.Allocator) !Chain {
@@ -557,9 +633,11 @@ pub const Chain = struct {
             }
         }
         self.pending.deinit(gpa);
-        if (self.latest_block) |latest_block| {
-            latest_block.deinit(gpa);
+
+        while (self.blocks.pop()) |block| {
+            block.deinit(gpa);
         }
+
         self.sampler.deinit(gpa);
     }
 
@@ -595,7 +673,7 @@ pub const Chain = struct {
                 }
 
                 const block = try Block.create(gpa, .{
-                    .height = (if (self.latest_block) |latest_block| latest_block.height else 0) + 1,
+                    .height = (if (self.blocks.latest()) |latest_block| latest_block.height else 0) + 1,
                     .merkle_root = [_]u8{0} ** 32,
                     .transaction_ids = transaction_ids.items,
                 });
@@ -625,10 +703,9 @@ pub const Chain = struct {
                 tx.deinit(gpa);
             }
 
-            if (self.latest_block) |latest_block| {
-                latest_block.deinit(gpa);
+            if (self.blocks.push(finalized_block.ref())) |evicted_block| {
+                evicted_block.deinit(gpa);
             }
-            self.latest_block = finalized_block.ref();
 
             self.sampler.reset(gpa);
 
@@ -915,5 +992,77 @@ pub const Sampler = struct {
         }
 
         return null;
+    }
+};
+
+/// 'head' and 'tail' are set at 1 until genesis blocks are implemented. Genesis
+/// blocks are blocks whose height is 0. Until they are implemented it is safe to
+/// assume that the first block that is to be pushed into this ring buffer starts
+/// at height 1.
+pub const BlockRingBuffer = struct {
+    pub const capacity = 32;
+
+    comptime {
+        assert(math.isPowerOfTwo(capacity));
+    }
+
+    const Self = @This();
+
+    head: u64 = 1,
+    tail: u64 = 1,
+    entries: [capacity]*Block = undefined,
+
+    /// This routine pushes a block, and optionally returns an evicted block should
+    /// the insertion of the provided block overflow the existing buffer.
+    ///
+    /// The block that is pushed in is assumed to have a height that is one larger
+    /// than the most recently buffered block.
+    pub fn push(self: *Self, item: *Block) ?*Block {
+        assert(item.height == self.head);
+
+        const evicted = evicted: {
+            if (self.count() == capacity) {
+                const evicted = self.entries[self.tail & (capacity - 1)];
+                self.tail +%= 1;
+                break :evicted evicted;
+            }
+            break :evicted null;
+        };
+
+        self.entries[self.head & (capacity - 1)] = item;
+        self.head +%= 1;
+
+        return evicted;
+    }
+
+    /// This routine pops a block from the tail of the buffer and returns it provided
+    /// that the buffer is not empty.
+    ///
+    /// This routine is typically used in order to pop and de-initialize all blocks
+    /// stored in the buffer.
+    pub fn pop(self: *Self) ?*Block {
+        if (self.count() == 0) return null;
+        const evicted = self.entries[self.tail & (capacity - 1)];
+        self.tail +%= 1;
+        return evicted;
+    }
+
+    pub fn get(self: Self, height: u64) ?*Block {
+        if (height < self.tail or height >= self.head) return null;
+        return self.entries[height & (capacity - 1)];
+    }
+
+    pub fn count(self: Self) usize {
+        return self.head -% self.tail;
+    }
+
+    pub fn latest(self: Self) ?*Block {
+        if (self.count() == 0) return null;
+        return self.entries[(self.head - 1) & (capacity - 1)];
+    }
+
+    pub fn oldest(self: *Self) ?*Block {
+        if (self.count() == 0) return null;
+        return self.entries[(self.tail - 1) & (capacity - 1)];
     }
 };
