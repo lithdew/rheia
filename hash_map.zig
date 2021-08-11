@@ -7,8 +7,8 @@ const testing = std.testing;
 const assert = std.debug.assert;
 
 /// In release-fast mode, LLVM will optimize this into:
-/// 1. 336 cycles in the case it is able to guarantee 'a' and 'b' <= u64's
-/// 2. 612 cycles in the case it is not able to guarantee 'a' and 'b' are > u64's
+/// 1. 260 cycles in the case it is able to guarantee 'a' and 'b' <= u64's
+/// 2. 561 cycles in the case it is not able to guarantee 'a' and 'b' are > u64's
 ///
 /// Using mem.order instead of manually casting to u256 and using math.order takes 3311 cycles. If it
 /// is guaranteed 'a' and 'b' are <= u64's, it takes 1261 cycles.
@@ -19,32 +19,33 @@ const assert = std.debug.assert;
 ///
 /// Manually casting to u256 and using math.order takes 12715 cycles. If it is guaranteed 'a' and 'b'
 /// are <= u64's, it takes 407 cycles.
+///
+/// Provided that both 'a' and 'b' are assumed to be cryptographic hashes (they are collision-resistant
+/// under the random oracle model), it may be be more performant to first check for equality over the
+/// first 64 bits, then proceed to break ties by running a full scan over the rest of the bits.
 fn cmp(a: [32]u8, b: [32]u8) math.Order {
-    const aa = mem.bigToNative(u256, @bitCast(u256, a));
-    const bb = mem.bigToNative(u256, @bitCast(u256, b));
-    switch (math.order(mem.readIntNative(u64, mem.asBytes(&aa)[24..32]), mem.readIntNative(u64, mem.asBytes(&bb)[24..32]))) {
+    switch (math.order(mem.readIntBig(u64, a[0..8]), mem.readIntBig(u64, b[0..8]))) {
         .eq => {},
         .lt => return .lt,
         .gt => return .gt,
     }
-    switch (math.order(mem.readIntNative(u64, mem.asBytes(&aa)[16..24]), mem.readIntNative(u64, mem.asBytes(&bb)[16..24]))) {
+    switch (math.order(mem.readIntBig(u64, a[8..16]), mem.readIntBig(u64, b[8..16]))) {
         .eq => {},
         .lt => return .lt,
         .gt => return .gt,
     }
-    switch (math.order(mem.readIntNative(u64, mem.asBytes(&aa)[8..16]), mem.readIntNative(u64, mem.asBytes(&bb)[8..16]))) {
+    switch (math.order(mem.readIntBig(u64, a[16..24]), mem.readIntBig(u64, b[16..24]))) {
         .eq => {},
         .lt => return .lt,
         .gt => return .gt,
     }
-    return math.order(mem.readIntNative(u64, mem.asBytes(&aa)[0..8]), mem.readIntNative(u64, mem.asBytes(&bb)[0..8]));
+    return math.order(mem.readIntBig(u64, a[24..32]), mem.readIntBig(u64, b[24..32]));
 }
 
 /// In release-fast mode, LLVM will optimize this into 109 cycles. Scatters hash values across a table
 /// into buckets which are lexicographically ordered from one another in ascending order. 
-fn idx(a: [32]u8, shift: u6) u64 {
-    const aa = mem.bigToNative(u256, @bitCast(u256, a));
-    return mem.readIntNative(u64, mem.asBytes(&aa)[24..32]) >> shift;
+fn idx(a: [32]u8, shift: u6) usize {
+    return @intCast(usize, mem.readIntBig(u64, a[0..8]) >> shift);
 }
 
 pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) type {
@@ -80,13 +81,13 @@ pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) typ
             return Self.initCapacity(gpa, 16);
         }
 
-        pub fn initCapacity(gpa: *mem.Allocator, capacity: usize) !Self {
+        pub fn initCapacity(gpa: *mem.Allocator, capacity: u64) !Self {
             assert(math.isPowerOfTwo(capacity));
 
             const shift = 63 - math.log2_int(u64, capacity) + 1;
-            const overflow = capacity / 10 + (63 - @as(usize, shift) + 1) << 1;
+            const overflow = capacity / 10 + (63 - @as(u64, shift) + 1) << 1;
 
-            const entries = try gpa.alloc(Entry, capacity + overflow);
+            const entries = try gpa.alloc(Entry, @intCast(usize, capacity + overflow));
             mem.set(Entry, entries, .{});
 
             return Self{
@@ -107,7 +108,7 @@ pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) typ
         pub fn slice(self: *Self) []Entry {
             const capacity = @as(u64, 1) << (63 - self.shift + 1);
             const overflow = capacity / 10 + (63 - @as(usize, self.shift) + 1) << 1;
-            return self.entries[0 .. capacity + overflow];
+            return self.entries[0..@intCast(usize, capacity + overflow)];
         }
 
         pub fn ensureUnusedCapacity(self: *Self, gpa: *mem.Allocator, count: usize) !void {
@@ -127,9 +128,9 @@ pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) typ
         pub fn grow(self: *Self, gpa: *mem.Allocator) !void {
             const capacity = @as(u64, 1) << (63 - self.shift + 1);
             const overflow = capacity / 10 + (63 - @as(usize, self.shift) + 1) << 1;
-            const end = self.entries + capacity + overflow;
+            const end = self.entries + @intCast(usize, capacity + overflow);
 
-            var map = try Self.initCapacity(gpa, capacity * 2);
+            var map = try Self.initCapacity(gpa, @intCast(usize, capacity * 2));
             var src = self.entries;
             var dst = map.entries;
 
