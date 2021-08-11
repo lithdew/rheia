@@ -6,44 +6,34 @@ const testing = std.testing;
 
 const assert = std.debug.assert;
 
-/// In release-fast mode, LLVM will optimize this into:
-/// 1. 260 cycles in the case it is able to guarantee 'a' and 'b' <= u64's
-/// 2. 561 cycles in the case it is not able to guarantee 'a' and 'b' are > u64's
-///
-/// Using mem.order instead of manually casting to u256 and using math.order takes 3311 cycles. If it
-/// is guaranteed 'a' and 'b' are <= u64's, it takes 1261 cycles.
-///
-/// Breaking ties on the first 64 bits by comparing the remaining 192 bits by using mem.order instead
-/// of manually casting to u256 and using math.order also takes 3311 cycles. If it is guaranteed 'a'
-/// and 'b' are <= u64's, it takes 1261 cycles.
-///
-/// Manually casting to u256 and using math.order takes 12715 cycles. If it is guaranteed 'a' and 'b'
-/// are <= u64's, it takes 407 cycles.
-///
-/// Provided that both 'a' and 'b' are assumed to be cryptographic hashes (they are collision-resistant
-/// under the random oracle model), it may be be more performant to first check for equality over the
-/// first 64 bits, then proceed to break ties by running a full scan over the rest of the bits.
+/// The following routine has its branches optimized against inputs that are cryptographic hashes by
+/// assuming that if the first 64 bits of 'a' and 'b' are equivalent, then 'a' and 'b' are most likely
+/// equivalent.
 fn cmp(a: [32]u8, b: [32]u8) math.Order {
-    switch (math.order(mem.readIntBig(u64, a[0..8]), mem.readIntBig(u64, b[0..8]))) {
-        .eq => {},
-        .lt => return .lt,
-        .gt => return .gt,
+    const msa = @bitCast(u64, a[0..8].*);
+    const msb = @bitCast(u64, b[0..8].*);
+    if (msa != msb) {
+        return if (mem.bigToNative(u64, msa) < mem.bigToNative(u64, msb)) .lt else .gt;
+    } else if (@reduce(.And, @as(std.meta.Vector(32, u8), a) == @as(std.meta.Vector(32, u8), b))) {
+        return .eq;
+    } else {
+        switch (math.order(mem.readIntBig(u64, a[8..16]), mem.readIntBig(u64, b[8..16]))) {
+            .eq => {},
+            .lt => return .lt,
+            .gt => return .gt,
+        }
+        switch (math.order(mem.readIntBig(u64, a[16..24]), mem.readIntBig(u64, b[16..24]))) {
+            .eq => {},
+            .lt => return .lt,
+            .gt => return .gt,
+        }
+        return math.order(mem.readIntBig(u64, a[24..32]), mem.readIntBig(u64, b[24..32]));
     }
-    switch (math.order(mem.readIntBig(u64, a[8..16]), mem.readIntBig(u64, b[8..16]))) {
-        .eq => {},
-        .lt => return .lt,
-        .gt => return .gt,
-    }
-    switch (math.order(mem.readIntBig(u64, a[16..24]), mem.readIntBig(u64, b[16..24]))) {
-        .eq => {},
-        .lt => return .lt,
-        .gt => return .gt,
-    }
-    return math.order(mem.readIntBig(u64, a[24..32]), mem.readIntBig(u64, b[24..32]));
 }
 
-/// In release-fast mode, LLVM will optimize this into 109 cycles. Scatters hash values across a table
-/// into buckets which are lexicographically ordered from one another in ascending order. 
+/// In release-fast mode, LLVM will optimize this routine to utilize 109 cycles. This routine scatters
+/// hash values across a table into buckets which are lexicographically ordered from one another in
+/// ascending order. 
 fn idx(a: [32]u8, shift: u6) usize {
     return @intCast(usize, mem.readIntBig(u64, a[0..8]) >> shift);
 }
