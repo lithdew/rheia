@@ -6,16 +6,57 @@ const testing = std.testing;
 
 const assert = std.debug.assert;
 
+/// In release-fast mode, LLVM will optimize this into:
+/// 1. 336 cycles in the case it is able to guarantee 'a' and 'b' <= u64's
+/// 2. 612 cycles in the case it is not able to guarantee 'a' and 'b' are > u64's
+///
+/// Using mem.order instead of manually casting to u256 and using math.order takes 3311 cycles. If it
+/// is guaranteed 'a' and 'b' are <= u64's, it takes 1261 cycles.
+///
+/// Breaking ties on the first 64 bits by comparing the remaining 192 bits by using mem.order instead
+/// of manually casting to u256 and using math.order also takes 3311 cycles. If it is guaranteed 'a'
+/// and 'b' are <= u64's, it takes 1261 cycles.
+///
+/// Manually casting to u256 and using math.order takes 12715 cycles. If it is guaranteed 'a' and 'b'
+/// are <= u64's, it takes 407 cycles.
+fn cmp(a: [32]u8, b: [32]u8) math.Order {
+    const aa = mem.bigToNative(u256, @bitCast(u256, a));
+    const bb = mem.bigToNative(u256, @bitCast(u256, b));
+    switch (math.order(mem.readIntNative(u64, mem.asBytes(&aa)[24..32]), mem.readIntNative(u64, mem.asBytes(&bb)[24..32]))) {
+        .eq => {},
+        .lt => return .lt,
+        .gt => return .gt,
+    }
+    switch (math.order(mem.readIntNative(u64, mem.asBytes(&aa)[16..24]), mem.readIntNative(u64, mem.asBytes(&bb)[16..24]))) {
+        .eq => {},
+        .lt => return .lt,
+        .gt => return .gt,
+    }
+    switch (math.order(mem.readIntNative(u64, mem.asBytes(&aa)[8..16]), mem.readIntNative(u64, mem.asBytes(&bb)[8..16]))) {
+        .eq => {},
+        .lt => return .lt,
+        .gt => return .gt,
+    }
+    return math.order(mem.readIntNative(u64, mem.asBytes(&aa)[0..8]), mem.readIntNative(u64, mem.asBytes(&bb)[0..8]));
+}
+
+/// In release-fast mode, LLVM will optimize this into 109 cycles. Scatters hash values across a table
+/// into buckets which are lexicographically ordered from one another in ascending order.
+fn idx(a: [32]u8, shift: u6) u64 {
+    const aa = mem.bigToNative(u256, @bitCast(u256, a));
+    return mem.readIntNative(u64, mem.asBytes(&aa)[24..32]) >> shift;
+}
+
 pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) type {
     return struct {
-        const empty_hash: u256 = math.maxInt(u256);
+        const empty_hash: [32]u8 = [_]u8{0xFF} ** 32;
 
         pub const Entry = struct {
-            hash: u256 = empty_hash,
+            hash: [32]u8 = empty_hash,
             value: V = undefined,
 
             pub fn isEmpty(self: Entry) bool {
-                return self.hash == empty_hash;
+                return cmp(self.hash, empty_hash) == .eq;
             }
 
             pub fn format(self: Entry, comptime layout: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
@@ -95,7 +136,7 @@ pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) typ
             while (src != end) {
                 const entry = src[0];
 
-                const i = if (entry.hash != empty_hash) @byteSwap(u64, @bitCast(u64, @ptrCast(*const [32]u8, &entry.hash)[0..8].*)) >> map.shift else 0;
+                const i = if (!entry.isEmpty()) idx(entry.hash, map.shift) else 0;
                 const p = map.entries + i;
 
                 dst = if (@ptrToInt(p) >= @ptrToInt(dst)) p else dst;
@@ -116,20 +157,18 @@ pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) typ
         }
 
         pub fn putAssumeCapacity(self: *Self, key: [32]u8, value: V) void {
-            const hash = @bitCast(u256, key);
-            assert(hash != empty_hash);
+            assert(cmp(key, empty_hash) != .eq);
 
-            var it: Entry = .{ .hash = hash, .value = value };
-            var i = @byteSwap(u64, @bitCast(u64, key[0..8].*)) >> self.shift;
+            var it: Entry = .{ .hash = key, .value = value };
+            var i = idx(key, self.shift);
             while (true) : (i += 1) {
                 const entry = self.entries[i];
-
-                if (@byteSwap(u64, @bitCast(u64, @ptrCast(*const [32]u8, &it.hash)[0..8].*)) <= @byteSwap(u64, @bitCast(u64, @ptrCast(*const [32]u8, &entry.hash)[0..8].*))) {
+                if (cmp(entry.hash, it.hash).compare(.gte)) {
                     self.entries[i] = it;
-                    if (entry.hash == hash) {
+                    if (cmp(entry.hash, key) == .eq) {
                         return;
                     }
-                    if (entry.hash == empty_hash) {
+                    if (entry.isEmpty()) {
                         self.len += 1;
                         return;
                     }
@@ -140,39 +179,32 @@ pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) typ
         }
 
         pub fn get(self: *Self, key: [32]u8) ?V {
-            const hash = @bitCast(u256, key);
-            assert(hash != empty_hash);
+            assert(cmp(key, empty_hash) != .eq);
 
-            var i = @byteSwap(u64, @bitCast(u64, key[0..8].*)) >> self.shift;
+            var i = idx(key, self.shift);
             while (true) : (i += 1) {
                 const entry = self.entries[i];
-                if (@byteSwap(u64, @bitCast(u64, key[0..8].*)) <= @byteSwap(u64, @bitCast(u64, @ptrCast(*const [32]u8, &entry.hash)[0..8].*))) {
-                    if (entry.hash == hash) {
-                        return entry.value;
-                    }
-                    if (entry.hash == empty_hash) {
+                if (cmp(entry.hash, key).compare(.gte)) {
+                    if (cmp(entry.hash, key) != .eq) {
                         return null;
                     }
+                    return entry.value;
                 }
-
                 self.get_probe_count += 1;
             }
         }
 
         pub fn delete(self: *Self, key: [32]u8) ?V {
-            const hash = @bitCast(u256, key);
-            assert(hash != empty_hash);
+            assert(cmp(key, empty_hash) != .eq);
 
-            var i = @byteSwap(u64, @bitCast(u64, key[0..8].*)) >> self.shift;
+            var i = idx(key, self.shift);
             while (true) : (i += 1) {
                 const entry = self.entries[i];
-                if (@byteSwap(u64, @bitCast(u64, key[0..8].*)) <= @byteSwap(u64, @bitCast(u64, @ptrCast(*const [32]u8, &entry.hash)[0..8].*))) {
-                    if (entry.hash == hash) {
-                        break;
-                    }
-                    if (entry.hash == empty_hash) {
+                if (cmp(entry.hash, key).compare(.gte)) {
+                    if (cmp(entry.hash, key) != .eq) {
                         return null;
                     }
+                    break;
                 }
                 self.del_probe_count += 1;
             }
@@ -180,8 +212,8 @@ pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) typ
             const value = self.entries[i].value;
 
             while (true) : (i += 1) {
-                const j = @byteSwap(u64, @bitCast(u64, @ptrCast(*const [32]u8, &self.entries[i + 1].hash)[0..8].*)) >> self.shift;
-                if (i < j or self.entries[i + 1].hash == empty_hash) {
+                const j = idx(self.entries[i + 1].hash, self.shift);
+                if (i < j or self.entries[i + 1].isEmpty()) {
                     break;
                 }
                 self.entries[i] = self.entries[i + 1];
@@ -195,31 +227,52 @@ pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) typ
     };
 }
 
+test "hash map: cmp" {
+    const prefix = [_]u8{'0'} ** 8 ++ [_]u8{'1'} ** 23;
+    const a = prefix ++ [_]u8{0};
+    const b = prefix ++ [_]u8{1};
+
+    try testing.expect(cmp(a, b) == .lt);
+    try testing.expect(cmp(b, a) == .gt);
+    try testing.expect(cmp(a, a) == .eq);
+    try testing.expect(cmp(b, b) == .eq);
+    try testing.expect(cmp([_]u8{'i'} ++ [_]u8{'0'} ** 31, [_]u8{'o'} ++ [_]u8{'0'} ** 31) == .lt);
+    try testing.expect(cmp([_]u8{ 'h', 'i' } ++ [_]u8{'0'} ** 30, [_]u8{ 'h', 'o' } ++ [_]u8{'0'} ** 30) == .lt);
+}
+
 test "hash map: put, get, delete, grow" {
-    var rng = std.rand.DefaultPrng.init(1);
+    var seed: usize = 0;
+    while (seed < 128) : (seed += 1) {
+        var rng = std.rand.DefaultPrng.init(seed);
 
-    const keys = try testing.allocator.alloc([32]u8, 512);
-    defer testing.allocator.free(keys);
+        const keys = try testing.allocator.alloc([32]u8, 512);
+        defer testing.allocator.free(keys);
 
-    for (keys) |*key| rng.random.bytes(key);
+        for (keys) |*key| rng.random.bytes(key);
 
-    var map = try HashMap(usize, 50).initCapacity(testing.allocator, 16);
-    defer map.deinit(testing.allocator);
+        var map = try HashMap(usize, 50).initCapacity(testing.allocator, 16);
+        defer map.deinit(testing.allocator);
 
-    try testing.expectEqual(@as(u6, 60), map.shift);
+        try testing.expectEqual(@as(u6, 60), map.shift);
 
-    for (keys) |key, i| try map.put(testing.allocator, key, i);
+        for (keys) |key, i| try map.put(testing.allocator, key, i);
 
-    try testing.expectEqual(@as(u6, 54), map.shift);
-    try testing.expectEqual(keys.len, map.len);
+        try testing.expectEqual(@as(u6, 54), map.shift);
+        try testing.expectEqual(keys.len, map.len);
 
-    for (keys) |key, i| try testing.expectEqual(i, map.get(key).?);
-    for (keys) |key, i| try testing.expectEqual(i, map.delete(key).?);
+        var it = [_]u8{0} ** 32;
+        for (map.slice()) |entry| {
+            if (!entry.isEmpty()) {
+                if (!mem.order(u8, &it, &entry.hash).compare(.lte)) {
+                    return error.Unsorted;
+                }
+                it = entry.hash;
+            }
+        }
 
-    try testing.expectEqual(@as(usize, 0), map.len);
-    try testing.expectEqual(@as(usize, 406), map.put_probe_count);
-    try testing.expectEqual(@as(usize, 251), map.get_probe_count);
-    try testing.expectEqual(@as(usize, 251), map.del_probe_count);
+        for (keys) |key, i| try testing.expectEqual(i, map.get(key).?);
+        for (keys) |key, i| try testing.expectEqual(i, map.delete(key).?);
+    }
 }
 
 test "hash map: collision test" {
@@ -232,6 +285,16 @@ test "hash map: collision test" {
     try map.put(testing.allocator, prefix ++ [_]u8{1}, 1);
     try map.put(testing.allocator, prefix ++ [_]u8{2}, 2);
     try map.put(testing.allocator, prefix ++ [_]u8{3}, 3);
+
+    var it = [_]u8{0} ** 32;
+    for (map.slice()) |entry| {
+        if (!entry.isEmpty()) {
+            if (!mem.order(u8, &it, &entry.hash).compare(.lte)) {
+                return error.Unsorted;
+            }
+            it = entry.hash;
+        }
+    }
 
     try testing.expectEqual(@as(usize, 0), map.get(prefix ++ [_]u8{0}).?);
     try testing.expectEqual(@as(usize, 1), map.get(prefix ++ [_]u8{1}).?);
@@ -248,6 +311,16 @@ test "hash map: collision test" {
     try map.put(testing.allocator, prefix ++ [_]u8{3}, 3);
     try map.put(testing.allocator, prefix ++ [_]u8{1}, 1);
 
+    it = [_]u8{0} ** 32;
+    for (map.slice()) |entry| {
+        if (!entry.isEmpty()) {
+            if (!mem.order(u8, &it, &entry.hash).compare(.lte)) {
+                return error.Unsorted;
+            }
+            it = entry.hash;
+        }
+    }
+
     try testing.expectEqual(@as(usize, 0), map.delete(prefix ++ [_]u8{0}).?);
     try testing.expectEqual(@as(usize, 1), map.delete(prefix ++ [_]u8{1}).?);
     try testing.expectEqual(@as(usize, 2), map.delete(prefix ++ [_]u8{2}).?);
@@ -258,6 +331,16 @@ test "hash map: collision test" {
     try map.put(testing.allocator, prefix ++ [_]u8{1}, 1);
     try map.put(testing.allocator, prefix ++ [_]u8{3}, 3);
 
+    it = [_]u8{0} ** 32;
+    for (map.slice()) |entry| {
+        if (!entry.isEmpty()) {
+            if (!mem.order(u8, &it, &entry.hash).compare(.lte)) {
+                return error.Unsorted;
+            }
+            it = entry.hash;
+        }
+    }
+
     try testing.expectEqual(@as(usize, 3), map.delete(prefix ++ [_]u8{3}).?);
     try testing.expectEqual(@as(usize, 2), map.delete(prefix ++ [_]u8{2}).?);
     try testing.expectEqual(@as(usize, 1), map.delete(prefix ++ [_]u8{1}).?);
@@ -267,6 +350,16 @@ test "hash map: collision test" {
     try map.put(testing.allocator, prefix ++ [_]u8{0}, 0);
     try map.put(testing.allocator, prefix ++ [_]u8{1}, 1);
     try map.put(testing.allocator, prefix ++ [_]u8{2}, 2);
+
+    it = [_]u8{0} ** 32;
+    for (map.slice()) |entry| {
+        if (!entry.isEmpty()) {
+            if (!mem.order(u8, &it, &entry.hash).compare(.lte)) {
+                return error.Unsorted;
+            }
+            it = entry.hash;
+        }
+    }
 
     try testing.expectEqual(@as(usize, 3), map.delete(prefix ++ [_]u8{3}).?);
     try testing.expectEqual(@as(usize, 0), map.delete(prefix ++ [_]u8{0}).?);
