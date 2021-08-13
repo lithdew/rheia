@@ -141,8 +141,7 @@ pub const Context = struct {
     pub fn register(self: *Context, callback: *Context.Callback) !void {
         if (self.cancelled) {
             var frame: [1024]u8 align(@alignOf(anyframe)) = undefined;
-            var frame_result: void = undefined;
-            await @asyncCall(&frame, &frame_result, callback.run, .{callback});
+            await @asyncCall(&frame, {}, callback.run, .{callback});
             return error.Cancelled;
         }
         self.callbacks.append(callback);

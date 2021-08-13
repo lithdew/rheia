@@ -8,7 +8,7 @@ const c = @cImport({
 const rb = @import("rb.zig");
 const rax = @import("rax.zig");
 const art = @import("art.zig");
-const hash_map = @import("hash_map.zig");
+const hash_map = @import("../../hash_map.zig");
 const skiplist = @import("skiplist.zig");
 const art_travis = @import("art_travis.zig");
 

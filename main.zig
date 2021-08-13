@@ -16,6 +16,7 @@ const testing = std.testing;
 
 const IPv4 = std.x.os.IPv4;
 const Context = runtime.Context;
+const Atomic = std.atomic.Atomic;
 const Blake3 = std.crypto.hash.Blake3;
 const Ed25519 = std.crypto.sign.Ed25519;
 const HashMap = @import("hash_map.zig").HashMap;
@@ -90,8 +91,20 @@ pub fn run() !void {
 
     const client_address = ip.Address.initIPv4(IPv4.localhost, 9000);
 
-    var client_frame = async runBenchmark(&ctx, &node, client_address);
-    defer await client_frame catch |err| log.warn("client error: {}", .{err});
+    var benchmark_frame = async reportBenchmarkStats(&ctx);
+    defer await benchmark_frame catch |err| log.warn("benchmark stats error: {}", .{err});
+
+    var frames = try runtime.getAllocator().alloc(@Frame(runBenchmark), 4);
+    defer runtime.getAllocator().free(frames);
+
+    var frame_index: usize = 0;
+    defer for (frames[0..frame_index]) |*frame| {
+        await frame catch |err| log.warn("benchmark error: {}", .{err});
+    };
+
+    while (frame_index < frames.len) : (frame_index += 1) {
+        frames[frame_index] = async runBenchmark(&ctx, &node, client_address);
+    }
 
     runtime.waitForSignal(&ctx, .{os.SIGINT}) catch {};
     log.info("gracefully shutting down...", .{});
@@ -99,37 +112,42 @@ pub fn run() !void {
     ctx.cancel();
 }
 
-pub fn runBenchmark(ctx: *Context, node: *Node, client_address: ip.Address) !void {
-    const log = std.log.scoped(.main);
+var benchmark_count: Atomic(u64) = .{ .value = 0 };
 
-    var timer = try time.Timer.start();
-    var count: usize = 0;
-    var nonce: u64 = 0;
-
-    const keys = try Ed25519.KeyPair.create(null);
+pub fn reportBenchmarkStats(ctx: *Context) !void {
+    const log = std.log.scoped(.benchmark);
 
     while (true) {
-        const tx = try Transaction.create(runtime.getAllocator(), keys, .{
-            .sender_nonce = nonce,
-            .created_at = 0,
-            .tag = .no_op,
-            .data = "hello world",
-        });
-        defer tx.deinit(runtime.getAllocator());
-
-        try sendTransactions(ctx, node, client_address, &[_]*Transaction{tx});
-        count += 1;
-        nonce += 1;
-
-        if (timer.read() > 1 * time.ns_per_s) {
-            log.info("{} requests/sec", .{count});
-            count = 0;
-            timer.reset();
-        }
+        try runtime.timeout(ctx, .{ .nanoseconds = 1 * time.ns_per_s });
+        log.info("{} transactions/sec", .{benchmark_count.swap(0, .Monotonic)});
     }
 }
 
-pub fn sendTransactions(ctx: *Context, node: *Node, client_address: ip.Address, transactions: []*Transaction) !void {
+pub fn runBenchmark(ctx: *Context, node: *Node, client_address: ip.Address) !void {
+    const keys = try Ed25519.KeyPair.create(null);
+
+    while (true) {
+        const nonce = benchmark_count.fetchAdd(1, .Monotonic);
+        const created_at = if (node.chain.blocks.latest()) |latest_block| latest_block.height else 0;
+
+        const tx = tx: {
+            runtime.startCpuBoundOperation();
+            defer runtime.endCpuBoundOperation();
+
+            break :tx try Transaction.create(runtime.getAllocator(), keys, .{
+                .sender_nonce = nonce,
+                .created_at = created_at,
+                .tag = .no_op,
+                .data = "hello world",
+            });
+        };
+        defer tx.deinit(runtime.getAllocator());
+
+        try sendTransactions(ctx, node, client_address, &[_]*Transaction{tx});
+    }
+}
+
+pub fn sendTransactions(ctx: *Context, node: *Node, client_address: ip.Address, transactions: []const *Transaction) !void {
     var len: u32 = 0;
     for (transactions) |tx| {
         len += tx.size();
@@ -205,7 +223,8 @@ pub const Block = struct {
     transaction_ids: [*][32]u8,
 
     pub fn create(gpa: *mem.Allocator, params: Block.Params) !*Block {
-        const bytes = try gpa.alignedAlloc(u8, @alignOf(Block), @sizeOf(Block) + params.transaction_ids.len * @sizeOf([32]u8));
+        const bytes_len = @sizeOf(Block) + params.transaction_ids.len * @sizeOf([32]u8);
+        const bytes = try gpa.alignedAlloc(u8, @alignOf(Block), bytes_len);
         errdefer gpa.free(bytes);
 
         const block = @ptrCast(*Block, bytes.ptr);
@@ -230,7 +249,8 @@ pub const Block = struct {
     pub fn deinit(self: *Block, gpa: *mem.Allocator) void {
         self.refs -= 1;
         if (self.refs == 0) {
-            gpa.free(@ptrCast([*]const u8, self)[0 .. @sizeOf(Block) + @as(usize, self.num_transaction_ids) * @sizeOf([32]u8)]);
+            const bytes_len = @sizeOf(Block) + @as(usize, self.num_transaction_ids) * @sizeOf([32]u8);
+            gpa.free(@ptrCast([*]const u8, self)[0..bytes_len]);
         }
     }
 
@@ -258,8 +278,10 @@ pub const Block = struct {
         block.height = try reader.readIntLittle(u64);
         block.merkle_root = try reader.readBytesNoEof(32);
         block.num_transaction_ids = try reader.readIntLittle(u16);
+        if (block.num_transaction_ids == 0) return error.NoTransactionIds;
 
-        block = @ptrCast(*Block, try gpa.realloc(mem.span(mem.asBytes(block)), @sizeOf(Block) + @as(usize, block.num_transaction_ids) * @sizeOf([32]u8)));
+        const bytes_len = @sizeOf(Block) + @as(usize, block.num_transaction_ids) * @sizeOf([32]u8);
+        block = @ptrCast(*Block, try gpa.realloc(mem.span(mem.asBytes(block)), bytes_len));
 
         block.transaction_ids = @ptrCast([*][32]u8, @ptrCast([*]u8, block) + @sizeOf(Block));
         try reader.readNoEof(mem.sliceAsBytes(block.transaction_ids[0..block.num_transaction_ids]));
@@ -407,7 +429,12 @@ test "block: create, serialize, and deserialize" {
     try testing.expectEqual(expected.height, actual.height);
     try testing.expectEqual(expected.merkle_root, actual.merkle_root);
     try testing.expectEqual(expected.num_transaction_ids, actual.num_transaction_ids);
-    try testing.expectEqualSlices([32]u8, expected.transaction_ids[0..expected.num_transaction_ids], actual.transaction_ids[0..actual.num_transaction_ids]);
+
+    try testing.expectEqualSlices(
+        [32]u8,
+        expected.transaction_ids[0..expected.num_transaction_ids],
+        actual.transaction_ids[0..actual.num_transaction_ids],
+    );
 }
 
 test "transaction: create, serialize, and deserialize" {
@@ -444,6 +471,7 @@ pub const Node = struct {
     chain: Chain,
     verifier: TransactionVerifier,
     clients: std.AutoHashMapUnmanaged(ip.Address, *net.Client),
+    closed: bool = false,
 
     pub fn init(self: *Node, gpa: *mem.Allocator) !void {
         self.chain = try Chain.init(gpa);
@@ -455,12 +483,14 @@ pub const Node = struct {
     }
 
     pub fn deinit(self: *Node, ctx: *Context, gpa: *mem.Allocator) !void {
+        self.closed = true;
+
         var client_it = self.clients.valueIterator();
         while (client_it.next()) |client| {
             var shutdown_ctx: Context = .{};
             defer shutdown_ctx.cancel();
 
-            if (client.*.deinit(runtime.getAllocator(), &shutdown_ctx)) |_| {
+            if (client.*.deinit(gpa, &shutdown_ctx)) |_| {
                 log.info("client {} successfully shutdown", .{client.*.address});
             } else |err| {
                 log.warn("client {} reported an error while shutting down: {}", .{ client.*.address, err });
@@ -476,6 +506,8 @@ pub const Node = struct {
     }
 
     pub fn getOrCreateClient(self: *Node, gpa: *mem.Allocator, address: ip.Address) !*net.Client {
+        if (self.closed) return error.Closed;
+
         const result = try self.clients.getOrPut(gpa, address);
         if (!result.found_existing) {
             errdefer assert(self.clients.remove(address));
@@ -485,6 +517,7 @@ pub const Node = struct {
 
             result.value_ptr.*.* = try net.Client.init(gpa, address);
         }
+
         return result.value_ptr.*;
     }
 
@@ -502,7 +535,7 @@ pub const Node = struct {
         var verifier_frame = async self.verifier.run(ctx, gpa);
         defer await verifier_frame catch |err| log.warn("transaction verifier error: {}", .{err});
 
-        var chain_frame = async self.chain.run(ctx, gpa);
+        var chain_frame = async self.chain.run(ctx, gpa, self);
         defer await chain_frame catch |err| log.warn("chain error: {}", .{err});
     }
 
@@ -607,14 +640,37 @@ pub const Node = struct {
 pub const Chain = struct {
     const log = std.log.scoped(.chain);
 
+    const BlockProposalMap = std.HashMapUnmanaged(
+        ?*Block,
+        usize,
+        struct {
+            pub fn hash(_: @This(), maybe_block: ?*Block) u64 {
+                const block = maybe_block orelse return 0;
+                return mem.readIntNative(u64, block.id[0..8]);
+            }
+            pub fn eql(_: @This(), maybe_block_a: ?*Block, maybe_block_b: ?*Block) bool {
+                const block_a = maybe_block_a orelse return maybe_block_b == null;
+                const block_b = maybe_block_b orelse return false;
+                return mem.eql(u8, &block_a.id, &block_b.id);
+            }
+        },
+        std.hash_map.default_max_load_percentage,
+    );
+
     pub const propose_delay_min: i64 = 0 * time.ns_per_ms;
     pub const propose_delay_max: i64 = 500 * time.ns_per_ms;
 
+    pub const connected_delay_min: i64 = 0 * time.ns_per_ms;
+    pub const connected_delay_max: i64 = 500 * time.ns_per_ms;
+
     sampler: Sampler,
     pending: HashMap(*Transaction, 50),
+    missing: HashMap(u64, 50),
 
     blocks: BlockRingBuffer = .{},
-    last_propose_time: i64 = 0,
+
+    propose_delay: i64 = propose_delay_min,
+    connected_delay: i64 = connected_delay_min,
 
     pub fn init(gpa: *mem.Allocator) !Chain {
         var sampler = try Sampler.init(gpa);
@@ -623,7 +679,10 @@ pub const Chain = struct {
         var pending = try HashMap(*Transaction, 50).init(gpa);
         errdefer pending.deinit(gpa);
 
-        return Chain{ .sampler = sampler, .pending = pending };
+        var missing = try HashMap(u64, 50).init(gpa);
+        errdefer missing.deinit(gpa);
+
+        return Chain{ .sampler = sampler, .pending = pending, .missing = missing };
     }
 
     pub fn deinit(self: *Chain, gpa: *mem.Allocator) void {
@@ -634,6 +693,8 @@ pub const Chain = struct {
         }
         self.pending.deinit(gpa);
 
+        self.missing.deinit(gpa);
+
         while (self.blocks.pop()) |block| {
             block.deinit(gpa);
         }
@@ -641,62 +702,68 @@ pub const Chain = struct {
         self.sampler.deinit(gpa);
     }
 
-    pub fn run(self: *Chain, ctx: *Context, gpa: *mem.Allocator) !void {
-        var propose_delay: i64 = propose_delay_min;
-
+    pub fn run(self: *Chain, ctx: *Context, gpa: *mem.Allocator, node: *Node) !void {
         var transaction_ids: std.ArrayListUnmanaged([32]u8) = .{};
         defer transaction_ids.deinit(gpa);
+
+        var blocks: BlockProposalMap = .{};
+        defer {
+            var it = blocks.keyIterator();
+            while (it.next()) |block_ptr| {
+                if (block_ptr.*) |block| {
+                    block.deinit(gpa);
+                }
+            }
+            blocks.deinit(gpa);
+        }
 
         var votes: std.ArrayListUnmanaged(Sampler.Vote) = .{};
         defer votes.deinit(gpa);
 
         while (true) {
             const preferred_block = self.sampler.preferred orelse {
-                try runtime.timeout(ctx, .{ .nanoseconds = propose_delay });
-
-                if (self.pending.len == 0 or time.milliTimestamp() - self.last_propose_time < propose_delay_min / time.ns_per_ms) {
-                    propose_delay = math.min(propose_delay_max, propose_delay + (propose_delay_max - propose_delay_min) / 10);
-                    continue;
-                }
-
-                try transaction_ids.ensureTotalCapacity(gpa, math.min(Block.max_num_transaction_ids, self.pending.len));
-
-                transaction_ids.clearRetainingCapacity();
-
-                for (self.pending.slice()) |entry| {
-                    if (!entry.isEmpty()) {
-                        transaction_ids.appendAssumeCapacity(entry.value.id);
-                        if (transaction_ids.items.len == Block.max_num_transaction_ids) {
-                            break;
-                        }
-                    }
-                }
-
-                const block = try Block.create(gpa, .{
-                    .height = (if (self.blocks.latest()) |latest_block| latest_block.height else 0) + 1,
-                    .merkle_root = [_]u8{0} ** 32,
-                    .transaction_ids = transaction_ids.items,
-                });
-                defer block.deinit(gpa);
-
-                self.sampler.prefer(gpa, block);
-                propose_delay = propose_delay_min;
-
-                log.info("proposed block {} (height {}, {} transaction(s))", .{
-                    fmt.fmtSliceHexLower(&block.id),
-                    block.height,
-                    block.num_transaction_ids,
-                });
-
+                try self.proposeBlock(ctx, gpa, &transaction_ids);
                 continue;
             };
 
-            try votes.ensureTotalCapacity(gpa, 1);
+            // ensure sufficient memory is available for tallying block proposals and for
+            // grouping block proposals together into votes
 
-            votes.clearRetainingCapacity();
-            votes.appendAssumeCapacity(Sampler.Vote{ .block = preferred_block, .tally = 1.0 });
+            try votes.ensureTotalCapacity(gpa, node.clients.count() + 1);
+            try blocks.ensureTotalCapacity(gpa, node.clients.count() + 1);
+
+            defer {
+                var it = blocks.keyIterator();
+                while (it.next()) |block_ptr| {
+                    if (block_ptr.*) |block| {
+                        block.deinit(gpa);
+                    }
+                }
+                blocks.clearRetainingCapacity();
+                votes.clearRetainingCapacity();
+            }
+
+            // query peers for block proposals
+
+            try self.pullBlockProposals(ctx, gpa, node, &blocks, preferred_block);
+
+            // group tallies together by block id
+
+            var blocks_it = blocks.iterator();
+            while (blocks_it.next()) |entry| {
+                const count = @intToFloat(f64, entry.value_ptr.*);
+                const total = @intToFloat(f64, node.clients.count() + 1);
+                votes.appendAssumeCapacity(.{ .block = entry.key_ptr.*, .tally = @divExact(count, total) });
+            }
+
+            // update the block sampler
+
+            // if the block sampler concludes that a block has been finalized, mark all transactions in
+            // the block by their id to have been finalized, store the block on-disk, and reset the
+            // block sampler
 
             const finalized_block = (try self.sampler.update(gpa, votes.items)) orelse continue;
+            defer self.sampler.reset(gpa);
 
             for (finalized_block.transaction_ids[0..finalized_block.num_transaction_ids]) |tx_id| {
                 const tx = self.pending.delete(tx_id) orelse unreachable;
@@ -707,14 +774,178 @@ pub const Chain = struct {
                 evicted_block.deinit(gpa);
             }
 
-            self.sampler.reset(gpa);
-
-            log.info("finalized block {} (height {}, {} transaction(s))", .{
-                fmt.fmtSliceHexLower(&finalized_block.id),
-                finalized_block.height,
-                finalized_block.num_transaction_ids,
-            });
+            // log.info("finalized block {} (height {}, {} transaction(s))", .{
+            //     fmt.fmtSliceHexLower(&finalized_block.id),
+            //     finalized_block.height,
+            //     finalized_block.num_transaction_ids,
+            // });
         }
+    }
+
+    fn proposeBlock(
+        self: *Chain,
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        transaction_ids: *std.ArrayListUnmanaged([32]u8),
+    ) !void {
+        try runtime.timeout(ctx, .{ .nanoseconds = self.propose_delay });
+        if (self.pending.len == 0) {
+            self.propose_delay = math.min(propose_delay_max, self.propose_delay + (propose_delay_max - propose_delay_min) / 10);
+            return;
+        }
+
+        try transaction_ids.ensureTotalCapacity(gpa, math.min(Block.max_num_transaction_ids, self.pending.len));
+        defer transaction_ids.clearRetainingCapacity();
+
+        for (self.pending.slice()) |entry| {
+            if (!entry.isEmpty()) {
+                transaction_ids.appendAssumeCapacity(entry.value.id);
+                if (transaction_ids.items.len == Block.max_num_transaction_ids) {
+                    break;
+                }
+            }
+        }
+
+        const block = try Block.create(gpa, .{
+            .height = (if (self.blocks.latest()) |latest_block| latest_block.height else 0) + 1,
+            .merkle_root = [_]u8{0} ** 32,
+            .transaction_ids = transaction_ids.items,
+        });
+        defer block.deinit(gpa);
+
+        self.sampler.prefer(gpa, block);
+        self.propose_delay = propose_delay_min;
+
+        // log.debug("proposed block {} (height {}, {} transaction(s))", .{
+        //     fmt.fmtSliceHexLower(&block.id),
+        //     block.height,
+        //     block.num_transaction_ids,
+        // });
+    }
+
+    fn pullBlockProposals(
+        self: *Chain,
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        node: *Node,
+        blocks: *BlockProposalMap,
+        preferred_block: *Block,
+    ) !void {
+        try runtime.timeout(ctx, .{ .nanoseconds = self.connected_delay });
+        if (node.clients.count() == 0) {
+            self.connected_delay = math.min(connected_delay_max, self.connected_delay + (connected_delay_max - connected_delay_min) / 10);
+            return;
+        }
+
+        const frames = try gpa.alloc(@Frame(pullBlock), node.clients.count());
+        defer gpa.free(frames);
+
+        var wg: sync.WaitGroup = .{};
+
+        var frame_index: usize = 0;
+        errdefer for (frames[0..frame_index]) |*frame| {
+            const block_proposal = await frame catch continue;
+            block_proposal.deinit(gpa);
+        };
+
+        var client_it = node.clients.keyIterator();
+        while (client_it.next()) |address_ptr| : (frame_index += 1) {
+            frames[frame_index] = async pullBlock(ctx, gpa, &wg, node, address_ptr.*, preferred_block.height);
+        }
+
+        try wg.wait(ctx);
+
+        for (frames[0..frame_index]) |*frame| {
+            const maybe_block_proposal = await frame catch null;
+
+            const result = blocks.getOrPutAssumeCapacity(maybe_block_proposal);
+            if (result.found_existing) {
+                if (maybe_block_proposal) |block_proposal| {
+                    block_proposal.deinit(gpa);
+                }
+            } else {
+                result.value_ptr.* = 0;
+            }
+            result.value_ptr.* += 1;
+        }
+
+        const result = blocks.getOrPutAssumeCapacity(preferred_block.ref());
+        if (result.found_existing) {
+            preferred_block.deinit(gpa);
+        } else {
+            result.value_ptr.* = 0;
+        }
+        result.value_ptr.* += 1;
+    }
+
+    fn pullBlock(
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        wg: *sync.WaitGroup,
+        node: *Node,
+        address: ip.Address,
+        block_height: u64,
+    ) !*Block {
+        wg.add(1);
+        defer wg.sub(1);
+
+        const client = try node.getOrCreateClient(gpa, address);
+
+        var entry: net.Client.RPC.Entry = .{};
+        var nonce = try client.rpc.register(ctx, &entry);
+
+        {
+            const writer = try client.acquireWriter(ctx, gpa);
+            defer client.releaseWriter(writer);
+
+            try (net.Packet{
+                .len = @sizeOf(u64),
+                .nonce = nonce,
+                .op = .request,
+                .tag = .pull_block,
+            }).write(writer);
+
+            try writer.writeIntLittle(u64, block_height);
+        }
+
+        const response = try await entry.response;
+        defer response.deinit(gpa);
+
+        var body = io.fixedBufferStream(response.body);
+
+        const exists = (try body.reader().readByte()) != 0;
+        if (!exists) return error.BlockNotExists;
+
+        const block = try Block.read(gpa, body.reader());
+        errdefer block.deinit(gpa);
+
+        if (block.height != block_height) {
+            return error.UnexpectedPulledBlockHeight;
+        }
+
+        try node.chain.missing.ensureUnusedCapacity(gpa, block.num_transaction_ids);
+
+        var maybe_err: ?anyerror = null;
+
+        var it = [_]u8{0} ** 32;
+        for (block.transaction_ids[0..block.num_transaction_ids]) |tx_id| {
+            if (!mem.lessThan(u8, &it, &tx_id)) {
+                maybe_err = error.BlockProposalTransactionIdsNotSorted;
+            }
+            if (node.chain.pending.get(tx_id) == null) {
+                node.chain.missing.putAssumeCapacity(tx_id, block_height);
+                if (maybe_err == null) {
+                    maybe_err = error.BlockProposalContainsUnknownTransactionId;
+                }
+            }
+            it = tx_id;
+        }
+
+        if (maybe_err) |err| {
+            return err;
+        }
+
+        return block;
     }
 };
 
@@ -870,6 +1101,7 @@ pub const TransactionVerifier = struct {
 
         for (entries[0..index]) |tx| {
             self.chain.pending.putAssumeCapacity(tx.id, tx);
+            _ = self.chain.missing.delete(tx.id);
         }
     }
 };

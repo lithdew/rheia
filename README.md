@@ -42,6 +42,28 @@ $ zig run main.zig --name rheia -lc
 
 ## research
 
+### lru cache
+
+Rheia makes heavy use of LRU caches to keep track of unbounded sets of data that may be readily regenerated at any time in a lossy manner such as i.e. the set of all transactions that have already been gossiped to a particular destination address.
+
+[Rheia's LRU cache](lru.zig) is an amalgamation of both a Robin Hood Hash Table and a Doubly-linked Deque. The idea of meshing a hash table and doubly-linked deque together to construct a LRU cache is inspired by [this blog post](https://medium.com/@udaysagar.2177/fastest-lru-cache-in-java-c22262de42ad).
+
+On my laptop, using Rheia's LRU cache with a max load factor of 50%, roughly:
+
+1. 19.81 million entries can be upserted per second.
+2. 20.19 million entries can be queried per second.
+3. 9.97 million entries can be queried and removed per second.
+
+The benchmark code is available [here](benchmarks/lru/main.zig). An example run is provided below.
+
+```
+$ zig run benchmarks/lru/main.zig -lc --name lru --main-pkg-path . -O ReleaseFast
+info(lru): insert: 50.459ms
+info(lru): search: 49.516ms
+info(lru): delete: 100.211ms
+info(lru): put: 453964, get: 453964, del: 453964
+```
+
 ### mempool
 
 One of the most critical data structures required by Rheia is a main-memory index that is meant to keep track of all transactions that have yet to be finalized under Rheia's consensus protocol (or in other words, a mempool).
@@ -73,7 +95,7 @@ The robin hood hash table showed the highest average overall throughput over the
 2. Check if 1 million different hashes exist in the data structure.
 3. Delete 1 million different hashes from the data structure.
 
-Using the robin hood hash table, roughly:
+Using the robin hood hash table with a max load factor of 50%, roughly:
 
 1. 19.58 million transactions can be indexed per second.
 2. 25.07 million transactions can be searched for by their ID per second.
@@ -82,7 +104,7 @@ Using the robin hood hash table, roughly:
 The benchmark code is available [here](benchmarks/mempool/main.zig). An example run is provided below.
 
 ```
-$ zig run benchmarks/mempool/main.zig benchmarks/mempool/*.c -I benchmarks/mempool -lc -fno-sanitize-c --name mempool -O ReleaseFast
+$ zig run benchmarks/mempool/main.zig benchmarks/mempool/*.c -I benchmarks/mempool -lc -fno-sanitize-c --name mempool --main-pkg-path . -O ReleaseFast
 
 info(hash_map): insert: 45.657ms
 info(hash_map): search: 33.438ms

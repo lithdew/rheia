@@ -78,9 +78,6 @@ pub const Mutex = struct {
             pub fn run(state: *Context.Callback) void {
                 const callback = @fieldParentPtr(@This(), "state", state);
                 if (callback.self.waiters.remove(callback.waiter)) {
-                    if (callback.self.waiters.isEmpty()) {
-                        callback.self.locked = false;
-                    }
                     runtime.schedule(callback.waiter);
                 }
             }
@@ -95,6 +92,8 @@ pub const Mutex = struct {
         }
 
         suspend self.waiters.append(&waiter);
+        if (ctx.cancelled) return error.Cancelled;
+        assert(self.locked);
     }
 
     pub fn release(self: *Mutex) void {
@@ -133,6 +132,7 @@ pub const WaitGroup = struct {
         if (self.len == 0) return;
 
         suspend self.waiters.append(&waiter);
+        if (ctx.cancelled) return error.Cancelled;
     }
 
     pub fn add(self: *WaitGroup, delta: usize) void {
