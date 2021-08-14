@@ -100,10 +100,10 @@ pub fn HashMap(comptime K: type, comptime V: type, comptime max_load_percentage:
             while (true) : (i += 1) {
                 if (self.entries[i].isEmpty(self)) {
                     self.prependNode(&it, &self.entries[i], inserted);
-                    defer self.len += 1;
+                    self.len += 1;
 
                     const capacity = @as(u64, 1) << (63 - self.shift + 1);
-                    if (self.len < capacity * max_load_percentage / 100) {
+                    if (self.len <= capacity * max_load_percentage / 100) {
                         return .inserted;
                     }
 

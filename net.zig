@@ -15,7 +15,7 @@ const Context = runtime.Context;
 const DoublyLinkedDeque = @import("intrusive.zig").DoublyLinkedDeque;
 
 pub const Packet = struct {
-    pub const max_size = 1 * 1024 * 1024;
+    pub const max_size = 65536;
     pub const size = @sizeOf(u32) + @sizeOf(u32) + @sizeOf(Packet.Op) + @sizeOf(Packet.Tag);
 
     pub const Op = enum(u8) {
@@ -424,7 +424,7 @@ pub const Client = struct {
         try client.setKeepAlive(true);
         try client.setQuickACK(true);
 
-        try runtime.connect(&self.ctx, client.socket, self.address.into());
+        try runtime.connect(ctx, client.socket, self.address.into());
 
         log.debug("{} [{}] successfully established a connection", .{ self.address, conn.id });
         self.breaker.reportSuccess();

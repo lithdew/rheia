@@ -148,20 +148,40 @@ pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) typ
         }
 
         pub fn putAssumeCapacity(self: *Self, key: [32]u8, value: V) void {
+            const result = self.getOrPutAssumeCapacity(key);
+            if (!result.found_existing) result.value_ptr.* = value;
+        }
+
+        pub const GetOrPutResult = struct {
+            value_ptr: *V,
+            found_existing: bool,
+        };
+
+        pub fn getOrPut(self: *Self, gpa: *mem.Allocator, key: [32]u8) GetOrPutResult {
+            try self.ensureUnusedCapacity(gpa, 1);
+            return self.getOrPutAssumeCapacity(key);
+        }
+
+        pub fn getOrPutAssumeCapacity(self: *Self, key: [32]u8) GetOrPutResult {
             assert(cmp(key, empty_hash) != .eq);
 
-            var it: Entry = .{ .hash = key, .value = value };
+            var it: Entry = .{ .hash = key, .value = undefined };
             var i = idx(key, self.shift);
+
+            var inserted_at: ?usize = null;
             while (true) : (i += 1) {
                 const entry = self.entries[i];
                 if (cmp(entry.hash, it.hash).compare(.gte)) {
-                    self.entries[i] = it;
                     if (cmp(entry.hash, key) == .eq) {
-                        return;
+                        return .{ .found_existing = true, .value_ptr = &self.entries[i].value };
                     }
+                    self.entries[i] = it;
                     if (entry.isEmpty()) {
                         self.len += 1;
-                        return;
+                        return .{ .found_existing = false, .value_ptr = &self.entries[inserted_at orelse i].value };
+                    }
+                    if (inserted_at == null) {
+                        inserted_at = i;
                     }
                     it = entry;
                 }

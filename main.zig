@@ -55,11 +55,7 @@ pub fn run() !void {
         var shutdown_ctx: Context = .{};
         defer shutdown_ctx.cancel();
 
-        if (node.deinit(&shutdown_ctx, runtime.getAllocator())) |_| {
-            log.info("node successfully shutdown", .{});
-        } else |err| {
-            log.warn("node reported an error while shutting down: {}", .{err});
-        }
+        node.deinit(&shutdown_ctx, runtime.getAllocator());
     }
 
     var node_frame = async node.run(&ctx, runtime.getAllocator());
@@ -81,7 +77,7 @@ pub fn run() !void {
         defer shutdown_ctx.cancel();
 
         if (server.deinit(&shutdown_ctx)) |_| {
-            log.info("server successfully shutdown", .{});
+            log.info("server successfully shut down", .{});
         } else |err| {
             log.warn("server reported an error while shutting down: {}", .{err});
         }
@@ -114,13 +110,20 @@ pub fn run() !void {
 }
 
 var benchmark_count: Atomic(u64) = .{ .value = 0 };
+var pusher_count: Atomic(u64) = .{ .value = 0 };
+var pusher_bytes: Atomic(u64) = .{ .value = 0 };
 
 pub fn reportBenchmarkStats(ctx: *Context) !void {
     const log = std.log.scoped(.benchmark);
 
     while (true) {
         try runtime.timeout(ctx, .{ .nanoseconds = 1 * time.ns_per_s });
-        log.info("{} transactions/sec", .{benchmark_count.swap(0, .Monotonic)});
+
+        log.info("created(tx): {}, pushed(tx): {}, pushed(bytes(tx)): {}", .{
+            benchmark_count.swap(0, .Monotonic),
+            pusher_count.swap(0, .Monotonic),
+            fmt.fmtIntSizeBin(pusher_bytes.swap(0, .Monotonic)),
+        });
     }
 }
 
@@ -131,11 +134,11 @@ pub fn runBenchmark(ctx: *Context, node: *Node, client_address: ip.Address) !voi
         const nonce = benchmark_count.fetchAdd(1, .Monotonic);
         const created_at = if (node.chain.blocks.latest()) |latest_block| latest_block.height else 0;
 
-        const tx = tx: {
+        const tx = try tx: {
             runtime.startCpuBoundOperation();
             defer runtime.endCpuBoundOperation();
 
-            break :tx try Transaction.create(runtime.getAllocator(), keys, .{
+            break :tx Transaction.create(runtime.getAllocator(), keys, .{
                 .sender_nonce = nonce,
                 .created_at = created_at,
                 .tag = .no_op,
@@ -154,7 +157,7 @@ pub fn sendTransactions(ctx: *Context, node: *Node, client_address: ip.Address, 
         len += tx.size();
     }
 
-    const writer = try await async node.acquireWriter(ctx, runtime.getAllocator(), client_address);
+    const writer = try node.acquireWriter(ctx, runtime.getAllocator(), client_address);
     defer node.releaseWriter(client_address, writer);
 
     try (net.Packet{
@@ -174,7 +177,7 @@ pub fn sendTestRequest(ctx: *Context, node: *Node, client_address: ip.Address) !
     var nonce = try client.rpc.register(ctx, &entry);
 
     {
-        const writer = try await async node.acquireWriter(ctx, runtime.getAllocator(), client_address);
+        const writer = try node.acquireWriter(ctx, runtime.getAllocator(), client_address);
         defer node.releaseWriter(client_address, writer);
 
         try (net.Packet{
@@ -192,7 +195,7 @@ pub fn sendTestRequest(ctx: *Context, node: *Node, client_address: ip.Address) !
 }
 
 pub fn sendTestCommand(ctx: *Context, node: *Node, client_address: ip.Address) !void {
-    const writer = try await async node.acquireWriter(ctx, runtime.getAllocator(), client_address);
+    const writer = try node.acquireWriter(ctx, runtime.getAllocator(), client_address);
     defer node.releaseWriter(client_address, writer);
 
     try (net.Packet{
@@ -470,6 +473,7 @@ pub const Node = struct {
     const log = std.log.scoped(.node);
 
     chain: Chain,
+    pusher: TransactionPusher,
     verifier: TransactionVerifier,
     clients: std.AutoHashMapUnmanaged(ip.Address, *net.Client),
     closed: bool = false,
@@ -478,32 +482,36 @@ pub const Node = struct {
         self.chain = try Chain.init(gpa);
         errdefer self.chain.deinit(gpa);
 
-        self.verifier = TransactionVerifier.init(&self.chain);
+        self.pusher = try TransactionPusher.init(gpa, self);
+        self.verifier = TransactionVerifier.init(&self.chain, &self.pusher);
 
         self.clients = .{};
     }
 
-    pub fn deinit(self: *Node, ctx: *Context, gpa: *mem.Allocator) !void {
+    pub fn deinit(self: *Node, ctx: *Context, gpa: *mem.Allocator) void {
+        log.info("shutting down...", .{});
+
         self.closed = true;
 
         var client_it = self.clients.valueIterator();
-        while (client_it.next()) |client| {
-            var shutdown_ctx: Context = .{};
-            defer shutdown_ctx.cancel();
+        while (client_it.next()) |client_ptr| {
+            log.info("shutting down client {}...", .{client_ptr.*.address});
 
-            if (client.*.deinit(gpa, &shutdown_ctx)) |_| {
-                log.info("client {} successfully shutdown", .{client.*.address});
+            if (client_ptr.*.deinit(gpa, ctx)) |_| {
+                log.info("client {} successfully shut down", .{client_ptr.*.address});
             } else |err| {
-                log.warn("client {} reported an error while shutting down: {}", .{ client.*.address, err });
+                log.warn("client {} reported an error while shutting down: {}", .{ client_ptr.*.address, err });
             }
 
-            gpa.destroy(client.*);
+            gpa.destroy(client_ptr.*);
         }
         self.clients.deinit(gpa);
 
-        try self.verifier.deinit(ctx, gpa);
-
+        self.verifier.deinit(ctx, gpa);
+        self.pusher.deinit(ctx, gpa);
         self.chain.deinit(gpa);
+
+        log.info("successfully shut down", .{});
     }
 
     pub fn getOrCreateClient(self: *Node, gpa: *mem.Allocator, address: ip.Address) !*net.Client {
@@ -533,11 +541,14 @@ pub const Node = struct {
     }
 
     pub fn run(self: *Node, ctx: *Context, gpa: *mem.Allocator) !void {
+        var pusher_frame = async self.pusher.run(ctx, gpa);
+        defer await pusher_frame catch |err| if (err != error.Cancelled) log.warn("transaction pusher error: {}", .{err});
+
         var verifier_frame = async self.verifier.run(ctx, gpa);
-        defer await verifier_frame catch |err| log.warn("transaction verifier error: {}", .{err});
+        defer await verifier_frame catch |err| if (err != error.Cancelled) log.warn("transaction verifier error: {}", .{err});
 
         var chain_frame = async self.chain.run(ctx, gpa, self);
-        defer await chain_frame catch |err| log.warn("chain error: {}", .{err});
+        defer await chain_frame catch |err| if (err != error.Cancelled) log.warn("chain error: {}", .{err});
     }
 
     pub fn handleServerPacket(
@@ -699,6 +710,8 @@ pub const Chain = struct {
     }
 
     pub fn deinit(self: *Chain, gpa: *mem.Allocator) void {
+        log.info("shutting down...", .{});
+
         var it = self.block_proposal_cache.head;
         while (it) |entry| : (it = entry.next) {
             entry.value.deinit(gpa);
@@ -719,6 +732,8 @@ pub const Chain = struct {
         }
 
         self.sampler.deinit(gpa);
+
+        log.info("successfully shut down", .{});
     }
 
     pub fn run(self: *Chain, ctx: *Context, gpa: *mem.Allocator, node: *Node) !void {
@@ -977,6 +992,204 @@ pub const Chain = struct {
     }
 };
 
+pub const TransactionPusher = struct {
+    const log = std.log.scoped(.tx_pusher);
+
+    const Cache = lru.HashMap(Entry, void, 50, struct {
+        pub fn hash(_: @This(), entry: Entry) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            hasher.update(mem.asBytes(&entry.address));
+            hasher.update(&entry.transaction_id);
+            return hasher.final();
+        }
+
+        pub fn eql(_: @This(), a: Entry, b: Entry) bool {
+            const eql_address = mem.eql(u8, mem.asBytes(&a.address), mem.asBytes(&b.address));
+            const eql_transaction_id = mem.eql(u8, &a.transaction_id, &b.transaction_id);
+            return eql_address and eql_transaction_id;
+        }
+    });
+
+    const Entry = struct {
+        address: ip.Address,
+        transaction_id: [32]u8,
+    };
+
+    pub const max_num_bytes_per_batch = net.Packet.max_size - net.Packet.size;
+
+    pub const flush_delay_min: i64 = 100 * time.ns_per_ms;
+    pub const flush_delay_max: i64 = 500 * time.ns_per_ms;
+
+    pub const connected_delay_min: i64 = 0 * time.ns_per_ms;
+    pub const connected_delay_max: i64 = 500 * time.ns_per_ms;
+
+    node: *Node,
+    cache: Cache,
+
+    last_flush_time: i64 = 0,
+    flush_delay: i64 = flush_delay_min,
+    connected_delay: i64 = connected_delay_min,
+
+    wg: sync.WaitGroup = .{},
+    pending: std.ArrayListUnmanaged(*Transaction) = .{},
+    num_bytes_pending: usize = 0,
+
+    pub fn init(gpa: *mem.Allocator, node: *Node) !TransactionPusher {
+        var cache = try Cache.initCapacity(gpa, 1 << 16);
+        errdefer cache.deinit(gpa);
+
+        return TransactionPusher{ .node = node, .cache = cache };
+    }
+
+    pub fn deinit(self: *TransactionPusher, ctx: *Context, gpa: *mem.Allocator) void {
+        log.info("shutting down...", .{});
+
+        self.wg.wait(ctx) catch |err| log.warn("reported an error while shutting down: {}", .{err});
+
+        self.cache.deinit(gpa);
+
+        for (self.pending.items) |tx| {
+            tx.deinit(gpa);
+        }
+        self.pending.deinit(gpa);
+
+        log.info("successfully shut down", .{});
+    }
+
+    pub fn push(self: *TransactionPusher, ctx: *Context, gpa: *mem.Allocator, tx: *Transaction) !void {
+        const tx_size = tx.size();
+        if (self.num_bytes_pending + tx_size >= max_num_bytes_per_batch) {
+            try self.flush(ctx, gpa);
+        }
+
+        try self.pending.append(gpa, tx);
+        self.num_bytes_pending += tx_size;
+    }
+
+    pub fn run(self: *TransactionPusher, ctx: *Context, gpa: *mem.Allocator) !void {
+        while (true) {
+            try runtime.timeout(ctx, .{ .nanoseconds = self.flush_delay });
+
+            if (self.num_bytes_pending == 0 or time.milliTimestamp() - self.last_flush_time < flush_delay_min / time.ns_per_ms) {
+                self.flush_delay = math.min(flush_delay_max, self.flush_delay * 2);
+                continue;
+            }
+
+            self.flush_delay = flush_delay_min;
+
+            try self.flush(ctx, gpa);
+        }
+    }
+
+    pub fn flush(self: *TransactionPusher, ctx: *Context, gpa: *mem.Allocator) !void {
+        while (self.node.clients.count() == 0) {
+            try runtime.timeout(ctx, .{ .nanoseconds = self.connected_delay });
+            self.connected_delay = math.min(connected_delay_max, self.connected_delay + (connected_delay_max - connected_delay_min) / 10);
+        }
+
+        self.connected_delay = connected_delay_min;
+
+        const task = try gpa.create(@Frame(gossipTransactions));
+        task.* = async self.gossipTransactions(ctx, gpa);
+    }
+
+    fn destroyGossipTransactionsFrame(self: *TransactionPusher, gpa: *mem.Allocator, frame: *@Frame(gossipTransactions)) void {
+        gpa.destroy(frame);
+        self.wg.sub(1);
+    }
+
+    fn gossipTransactions(self: *TransactionPusher, ctx: *Context, gpa: *mem.Allocator) !void {
+        self.wg.add(1);
+        defer {
+            suspend {
+                self.destroyGossipTransactionsFrame(gpa, @frame());
+            }
+        }
+
+        const transactions = self.pending.toOwnedSlice(gpa);
+        defer {
+            for (transactions) |tx| {
+                tx.deinit(gpa);
+            }
+            gpa.free(transactions);
+        }
+
+        self.num_bytes_pending = 0;
+
+        const frames = try gpa.alloc(@Frame(pushTransactions), self.node.clients.count());
+        defer gpa.free(frames);
+
+        var frame_index: usize = 0;
+        defer for (frames[0..frame_index]) |*frame| await frame catch {};
+
+        var wg: sync.WaitGroup = .{};
+        defer wg.wait(ctx) catch {};
+
+        var it = self.node.clients.keyIterator();
+        while (it.next()) |address_ptr| : (frame_index += 1) {
+            var filtered_transactions: std.ArrayListUnmanaged(*Transaction) = .{};
+            defer filtered_transactions.deinit(gpa);
+
+            var filtered_transactions_len: u32 = 0;
+            for (transactions) |tx| {
+                const entry: Entry = .{
+                    .address = address_ptr.*,
+                    .transaction_id = tx.id,
+                };
+
+                switch (self.cache.update(entry, {})) {
+                    .inserted, .evicted => {},
+                    .updated => continue,
+                }
+
+                try filtered_transactions.append(gpa, tx);
+                filtered_transactions_len += tx.size();
+            }
+
+            frames[frame_index] = async self.pushTransactions(
+                ctx,
+                gpa,
+                &wg,
+                address_ptr.*,
+                filtered_transactions.toOwnedSlice(gpa),
+                filtered_transactions_len,
+            );
+        }
+    }
+
+    fn pushTransactions(
+        self: *TransactionPusher,
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        wg: *sync.WaitGroup,
+        address: ip.Address,
+        transactions: []const *Transaction,
+        transactions_len: u32,
+    ) !void {
+        wg.add(1);
+        defer wg.sub(1);
+
+        _ = pusher_count.fetchAdd(transactions.len, .Monotonic);
+        _ = pusher_bytes.fetchAdd(transactions_len, .Monotonic);
+
+        defer gpa.free(transactions);
+
+        const writer = try self.node.acquireWriter(ctx, gpa, address);
+        defer self.node.releaseWriter(address, writer);
+
+        try (net.Packet{
+            .len = transactions_len,
+            .nonce = 0,
+            .op = .command,
+            .tag = .push_transaction,
+        }).write(writer);
+
+        for (transactions) |tx| {
+            try tx.write(writer);
+        }
+    }
+};
+
 pub const TransactionVerifier = struct {
     const log = std.log.scoped(.tx_verifier);
 
@@ -991,6 +1204,7 @@ pub const TransactionVerifier = struct {
     };
 
     chain: *Chain,
+    pusher: *TransactionPusher,
 
     pool_wg: sync.WaitGroup = .{},
     pool_parker: sync.Parker(void) = .{},
@@ -999,12 +1213,14 @@ pub const TransactionVerifier = struct {
     entries: std.ArrayListUnmanaged(*Transaction) = .{},
     last_flush_time: i64 = 0,
 
-    pub fn init(chain: *Chain) TransactionVerifier {
-        return TransactionVerifier{ .chain = chain };
+    pub fn init(chain: *Chain, pusher: *TransactionPusher) TransactionVerifier {
+        return TransactionVerifier{ .chain = chain, .pusher = pusher };
     }
 
-    pub fn deinit(self: *TransactionVerifier, ctx: *Context, gpa: *mem.Allocator) !void {
-        try self.pool_wg.wait(ctx);
+    pub fn deinit(self: *TransactionVerifier, ctx: *Context, gpa: *mem.Allocator) void {
+        log.info("shutting down...", .{});
+
+        self.pool_wg.wait(ctx) catch |err| log.warn("error while shutting down: {}", .{err});
 
         for (self.entries.items) |tx| {
             tx.deinit(gpa);
@@ -1014,6 +1230,8 @@ pub const TransactionVerifier = struct {
         while (self.pool.popFirst()) |task| {
             gpa.free(@ptrCast([*]u8, task)[0 .. @sizeOf(TransactionVerifier.Task) + @frameSize(TransactionVerifier.runTask)]);
         }
+
+        log.info("successfully shut down", .{});
     }
 
     pub fn push(self: *TransactionVerifier, ctx: *Context, gpa: *mem.Allocator, tx: *Transaction) !void {
@@ -1024,7 +1242,7 @@ pub const TransactionVerifier = struct {
         try self.entries.append(gpa, tx);
 
         if (self.entries.items.len == max_signature_batch_size) {
-            try self.flush(gpa);
+            try self.flush(ctx, gpa);
         }
     }
 
@@ -1043,13 +1261,13 @@ pub const TransactionVerifier = struct {
                 continue;
             }
 
-            try self.flush(gpa);
+            try self.flush(ctx, gpa);
 
             flush_delay = flush_delay_min;
         }
     }
 
-    fn flush(self: *TransactionVerifier, gpa: *mem.Allocator) !void {
+    fn flush(self: *TransactionVerifier, ctx: *Context, gpa: *mem.Allocator) !void {
         const task = task: {
             if (self.pool.popFirst()) |task| {
                 break :task task;
@@ -1063,12 +1281,12 @@ pub const TransactionVerifier = struct {
         const task_frame = @ptrCast(*@Frame(TransactionVerifier.runTask), @ptrCast([*]u8, task) + @sizeOf(TransactionVerifier.Task));
 
         task.* = .{};
-        task_frame.* = async self.runTask(task, gpa, self.entries.toOwnedSlice(gpa));
+        task_frame.* = async self.runTask(ctx, task, gpa, self.entries.toOwnedSlice(gpa));
 
         self.last_flush_time = time.milliTimestamp();
     }
 
-    fn runTask(self: *TransactionVerifier, task: *TransactionVerifier.Task, gpa: *mem.Allocator, entries: []*Transaction) !void {
+    fn runTask(self: *TransactionVerifier, ctx: *Context, task: *TransactionVerifier.Task, gpa: *mem.Allocator, entries: []*Transaction) void {
         self.pool_wg.add(1);
         defer self.pool_wg.sub(1);
 
@@ -1128,8 +1346,19 @@ pub const TransactionVerifier = struct {
         };
 
         for (entries[0..index]) |tx| {
-            self.chain.pending.putAssumeCapacity(tx.id, tx);
+            const result = self.chain.pending.getOrPutAssumeCapacity(tx.id);
+            if (result.found_existing) {
+                tx.deinit(gpa);
+                continue;
+            }
+            result.value_ptr.* = tx;
+
             _ = self.chain.missing.delete(tx.id);
+
+            self.pusher.push(ctx, gpa, tx.ref()) catch {
+                tx.deinit(gpa);
+                continue;
+            };
         }
     }
 };
