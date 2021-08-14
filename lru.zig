@@ -70,6 +70,8 @@ pub fn HashMap(comptime K: type, comptime V: type, comptime max_load_percentage:
         pub fn clear(self: *Self) void {
             mem.set(Entry, self.slice(), .{});
             self.len = 0;
+            self.head = null;
+            self.tail = null;
         }
 
         pub fn slice(self: *Self) []Entry {
@@ -80,7 +82,7 @@ pub fn HashMap(comptime K: type, comptime V: type, comptime max_load_percentage:
 
         pub const UpdateResult = union(enum) {
             evicted: struct { key: K, value: V },
-            updated,
+            updated: V,
             inserted,
         };
 
@@ -112,9 +114,10 @@ pub fn HashMap(comptime K: type, comptime V: type, comptime max_load_percentage:
                     self.prependNode(&it, &self.entries[i], inserted);
                     inserted = true;
                 } else if (ctx.eql(self.entries[i].key, key)) {
+                    const old_value = self.entries[i].value;
                     self.removeNode(&self.entries[i]);
                     self.prependNode(&it, &self.entries[i], inserted);
-                    return .updated;
+                    return .{ .updated = old_value };
                 }
                 self.put_probe_count += 1;
             }

@@ -1,5 +1,6 @@
 const std = @import("std");
 const net = @import("net.zig");
+const lru = @import("lru.zig");
 const sync = @import("sync.zig");
 const crypto = @import("crypto.zig");
 const runtime = @import("runtime.zig");
@@ -566,26 +567,27 @@ pub const Node = struct {
                         const requested_height = try frame.reader().readIntLittle(u64);
                         const latest_height = if (self.chain.blocks.latest()) |latest_block| latest_block.height else 0;
 
-                        const requested_block = cache_hit: {
-                            const block = block: {
-                                if (requested_height == latest_height + 1) {
-                                    break :block self.chain.sampler.preferred orelse break :cache_hit null;
-                                }
-                                if (self.chain.blocks.get(requested_height)) |old_block| {
-                                    break :block old_block;
-                                }
-                                break :cache_hit null;
-                            };
-
-                            const cache_id = frame.reader().readBytesNoEof(32) catch break :cache_hit block;
-                            if (!mem.eql(u8, &block.id, &cache_id)) {
-                                break :cache_hit block;
+                        const requested_block = block: {
+                            if (requested_height == latest_height + 1) {
+                                break :block self.chain.sampler.preferred;
                             }
-                            break :cache_hit null;
+                            if (self.chain.blocks.get(requested_height)) |old_block| {
+                                break :block old_block;
+                            }
+                            break :block null;
+                        };
+
+                        const cache_hit = cache_hit: {
+                            const cache_id = frame.reader().readBytesNoEof(32) catch break :cache_hit false;
+                            const block = requested_block orelse break :cache_hit false;
+                            if (!mem.eql(u8, &block.id, &cache_id)) {
+                                break :cache_hit false;
+                            }
+                            break :cache_hit true;
                         };
 
                         try (net.Packet{
-                            .len = 1 + (if (requested_block) |block| block.size() else 0),
+                            .len = 1 + (if (requested_block) |block| if (!cache_hit) block.size() else 0 else 0),
                             .nonce = packet.nonce,
                             .op = .response,
                             .tag = .pull_block,
@@ -593,7 +595,9 @@ pub const Node = struct {
 
                         if (requested_block) |block| {
                             try conn.buffer.writer().writeByte(1);
-                            try block.write(conn.buffer.writer());
+                            if (!cache_hit) {
+                                try block.write(conn.buffer.writer());
+                            }
                         } else {
                             try conn.buffer.writer().writeByte(0);
                         }
@@ -668,6 +672,7 @@ pub const Chain = struct {
     missing: HashMap(u64, 50),
 
     blocks: BlockRingBuffer = .{},
+    block_proposal_cache: lru.AutoHashMap(ip.Address, *Block, 50),
 
     propose_delay: i64 = propose_delay_min,
     connected_delay: i64 = connected_delay_min,
@@ -682,10 +687,24 @@ pub const Chain = struct {
         var missing = try HashMap(u64, 50).init(gpa);
         errdefer missing.deinit(gpa);
 
-        return Chain{ .sampler = sampler, .pending = pending, .missing = missing };
+        var block_proposal_cache = try lru.AutoHashMap(ip.Address, *Block, 50).initCapacity(gpa, 128);
+        errdefer block_proposal_cache.deinit(gpa);
+
+        return Chain{
+            .sampler = sampler,
+            .pending = pending,
+            .missing = missing,
+            .block_proposal_cache = block_proposal_cache,
+        };
     }
 
     pub fn deinit(self: *Chain, gpa: *mem.Allocator) void {
+        var it = self.block_proposal_cache.head;
+        while (it) |entry| : (it = entry.next) {
+            entry.value.deinit(gpa);
+        }
+        self.block_proposal_cache.deinit(gpa);
+
         for (self.pending.slice()) |entry| {
             if (!entry.isEmpty()) {
                 entry.value.deinit(gpa);
@@ -706,16 +725,8 @@ pub const Chain = struct {
         var transaction_ids: std.ArrayListUnmanaged([32]u8) = .{};
         defer transaction_ids.deinit(gpa);
 
-        var blocks: BlockProposalMap = .{};
-        defer {
-            var it = blocks.keyIterator();
-            while (it.next()) |block_ptr| {
-                if (block_ptr.*) |block| {
-                    block.deinit(gpa);
-                }
-            }
-            blocks.deinit(gpa);
-        }
+        var block_proposals: BlockProposalMap = .{};
+        defer block_proposals.deinit(gpa);
 
         var votes: std.ArrayListUnmanaged(Sampler.Vote) = .{};
         defer votes.deinit(gpa);
@@ -730,30 +741,32 @@ pub const Chain = struct {
             // grouping block proposals together into votes
 
             try votes.ensureTotalCapacity(gpa, node.clients.count() + 1);
-            try blocks.ensureTotalCapacity(gpa, node.clients.count() + 1);
+            try block_proposals.ensureTotalCapacity(gpa, node.clients.count() + 1);
 
             defer {
-                var it = blocks.keyIterator();
-                while (it.next()) |block_ptr| {
-                    if (block_ptr.*) |block| {
-                        block.deinit(gpa);
-                    }
-                }
-                blocks.clearRetainingCapacity();
+                block_proposals.clearRetainingCapacity();
                 votes.clearRetainingCapacity();
             }
 
-            // query peers for block proposals
+            // sample block proposals proposals and tally them
 
-            try self.pullBlockProposals(ctx, gpa, node, &blocks, preferred_block);
+            try self.pullBlockProposals(ctx, gpa, node, &block_proposals, preferred_block.height);
 
-            // group tallies together by block id
+            // tally our own preferred block proposal
 
-            var blocks_it = blocks.iterator();
+            const result = block_proposals.getOrPutAssumeCapacity(preferred_block);
+            if (!result.found_existing) {
+                result.value_ptr.* = 0;
+            }
+            result.value_ptr.* += 1;
+
+            // group block proposal tallies together by block id
+
+            var blocks_it = block_proposals.iterator();
             while (blocks_it.next()) |entry| {
                 const count = @intToFloat(f64, entry.value_ptr.*);
                 const total = @intToFloat(f64, node.clients.count() + 1);
-                votes.appendAssumeCapacity(.{ .block = entry.key_ptr.*, .tally = @divExact(count, total) });
+                votes.appendAssumeCapacity(.{ .block = entry.key_ptr.*, .tally = @divTrunc(count, total) });
             }
 
             // update the block sampler
@@ -763,7 +776,15 @@ pub const Chain = struct {
             // block sampler
 
             const finalized_block = (try self.sampler.update(gpa, votes.items)) orelse continue;
-            defer self.sampler.reset(gpa);
+            defer {
+                var it = self.block_proposal_cache.head;
+                while (it) |entry| : (it = entry.next) {
+                    entry.value.deinit(gpa);
+                }
+                self.block_proposal_cache.clear();
+
+                self.sampler.reset(gpa);
+            }
 
             for (finalized_block.transaction_ids[0..finalized_block.num_transaction_ids]) |tx_id| {
                 const tx = self.pending.delete(tx_id) orelse unreachable;
@@ -794,6 +815,8 @@ pub const Chain = struct {
             return;
         }
 
+        self.propose_delay = propose_delay_min;
+
         try transaction_ids.ensureTotalCapacity(gpa, math.min(Block.max_num_transaction_ids, self.pending.len));
         defer transaction_ids.clearRetainingCapacity();
 
@@ -811,10 +834,8 @@ pub const Chain = struct {
             .merkle_root = [_]u8{0} ** 32,
             .transaction_ids = transaction_ids.items,
         });
-        defer block.deinit(gpa);
 
         self.sampler.prefer(gpa, block);
-        self.propose_delay = propose_delay_min;
 
         // log.debug("proposed block {} (height {}, {} transaction(s))", .{
         //     fmt.fmtSliceHexLower(&block.id),
@@ -828,14 +849,16 @@ pub const Chain = struct {
         ctx: *Context,
         gpa: *mem.Allocator,
         node: *Node,
-        blocks: *BlockProposalMap,
-        preferred_block: *Block,
+        block_proposals: *BlockProposalMap,
+        block_proposal_height: u64,
     ) !void {
         try runtime.timeout(ctx, .{ .nanoseconds = self.connected_delay });
         if (node.clients.count() == 0) {
             self.connected_delay = math.min(connected_delay_max, self.connected_delay + (connected_delay_max - connected_delay_min) / 10);
             return;
         }
+
+        self.connected_delay = connected_delay_min;
 
         const frames = try gpa.alloc(@Frame(pullBlock), node.clients.count());
         defer gpa.free(frames);
@@ -844,13 +867,12 @@ pub const Chain = struct {
 
         var frame_index: usize = 0;
         errdefer for (frames[0..frame_index]) |*frame| {
-            const block_proposal = await frame catch continue;
-            block_proposal.deinit(gpa);
+            _ = await frame catch continue;
         };
 
         var client_it = node.clients.keyIterator();
         while (client_it.next()) |address_ptr| : (frame_index += 1) {
-            frames[frame_index] = async pullBlock(ctx, gpa, &wg, node, address_ptr.*, preferred_block.height);
+            frames[frame_index] = async self.pullBlock(ctx, gpa, &wg, node, address_ptr.*, block_proposal_height);
         }
 
         try wg.wait(ctx);
@@ -858,27 +880,16 @@ pub const Chain = struct {
         for (frames[0..frame_index]) |*frame| {
             const maybe_block_proposal = await frame catch null;
 
-            const result = blocks.getOrPutAssumeCapacity(maybe_block_proposal);
-            if (result.found_existing) {
-                if (maybe_block_proposal) |block_proposal| {
-                    block_proposal.deinit(gpa);
-                }
-            } else {
+            const result = block_proposals.getOrPutAssumeCapacity(maybe_block_proposal);
+            if (!result.found_existing) {
                 result.value_ptr.* = 0;
             }
             result.value_ptr.* += 1;
         }
-
-        const result = blocks.getOrPutAssumeCapacity(preferred_block.ref());
-        if (result.found_existing) {
-            preferred_block.deinit(gpa);
-        } else {
-            result.value_ptr.* = 0;
-        }
-        result.value_ptr.* += 1;
     }
 
     fn pullBlock(
+        self: *Chain,
         ctx: *Context,
         gpa: *mem.Allocator,
         wg: *sync.WaitGroup,
@@ -890,6 +901,7 @@ pub const Chain = struct {
         defer wg.sub(1);
 
         const client = try node.getOrCreateClient(gpa, address);
+        const cached_block_proposal = self.block_proposal_cache.get(address);
 
         var entry: net.Client.RPC.Entry = .{};
         var nonce = try client.rpc.register(ctx, &entry);
@@ -899,13 +911,16 @@ pub const Chain = struct {
             defer client.releaseWriter(writer);
 
             try (net.Packet{
-                .len = @sizeOf(u64),
+                .len = @sizeOf(u64) + @as(u32, if (cached_block_proposal != null) @sizeOf([32]u8) else 0),
                 .nonce = nonce,
                 .op = .request,
                 .tag = .pull_block,
             }).write(writer);
 
             try writer.writeIntLittle(u64, block_height);
+            if (cached_block_proposal) |block_proposal| {
+                try writer.writeAll(&block_proposal.id);
+            }
         }
 
         const response = try await entry.response;
@@ -916,7 +931,14 @@ pub const Chain = struct {
         const exists = (try body.reader().readByte()) != 0;
         if (!exists) return error.BlockNotExists;
 
-        const block = try Block.read(gpa, body.reader());
+        const block = Block.read(gpa, body.reader()) catch |err| {
+            if (response.body.len > 1) {
+                return err;
+            }
+            const block_proposal = cached_block_proposal orelse return err;
+            assert(self.block_proposal_cache.update(address, block_proposal) == .updated);
+            return block_proposal;
+        };
         errdefer block.deinit(gpa);
 
         if (block.height != block_height) {
@@ -943,6 +965,12 @@ pub const Chain = struct {
 
         if (maybe_err) |err| {
             return err;
+        }
+
+        switch (self.block_proposal_cache.update(address, block)) {
+            .inserted => {},
+            .evicted => |old_entry| old_entry.value.deinit(gpa),
+            .updated => |old_block| old_block.deinit(gpa),
         }
 
         return block;
@@ -1158,7 +1186,7 @@ pub const Sampler = struct {
         if (self.preferred) |preferred| {
             preferred.deinit(gpa);
         }
-        self.preferred = block.ref();
+        self.preferred = block;
     }
 
     pub fn update(self: *Sampler, gpa: *mem.Allocator, votes: []const Vote) !?*Block {
