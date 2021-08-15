@@ -261,7 +261,7 @@ pub const Client = struct {
     pub fn ensureConnectionAvailable(self: *Client, ctx: *Context, gpa: *mem.Allocator) !void {
         if (self.ctx.cancelled) return error.Closed;
 
-        if (self.wg.len < self.capacity) {
+        if (self.wg.len == 0 or (!self.breaker.hasFailuresReported() and self.buffer.items.len > 0 and self.wg.len < self.capacity)) {
             log.debug("{} [{}] was spawned", .{ self.address, self.id });
 
             const conn = try gpa.create(Client.Connection);

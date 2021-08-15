@@ -99,10 +99,12 @@ pub const Mutex = struct {
     pub fn release(self: *Mutex) void {
         assert(self.locked);
 
-        runtime.schedule(self.waiters.popFirst() orelse {
+        const waiter = self.waiters.popFirst() orelse {
             self.locked = false;
             return;
-        });
+        };
+
+        runtime.schedule(waiter);
     }
 };
 
