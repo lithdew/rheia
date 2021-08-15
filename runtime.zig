@@ -301,13 +301,13 @@ pub const Runtime = struct {
     }
 
     fn rearm(self: *Runtime) bool {
-        if (self.event_armed.load(.Monotonic) and self.event_count == 0) {
+        if (self.event_armed.load(.Monotonic) or self.event_count == 0) {
             return false;
         }
-        self.event_count = 0;
         if ((self.ring.read(0, self.event, mem.asBytes(&self.event_count), 0) catch null) == null) {
             return true; // return true so that the next call to rearm will attempt to re-submit a read()
         }
+        self.event_count = 0;
         self.event_armed.store(true, .Monotonic);
         return true;
     }

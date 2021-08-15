@@ -147,7 +147,7 @@ pub fn runBenchmark(ctx: *Context, node: *Node, client_address: ip.Address) !voi
         };
         defer tx.deinit(runtime.getAllocator());
 
-        try sendTransactions(ctx, node, client_address, &[_]*Transaction{tx});
+        try await async sendTransactions(ctx, node, client_address, &[_]*Transaction{tx});
     }
 }
 

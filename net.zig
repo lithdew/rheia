@@ -15,7 +15,7 @@ const Context = runtime.Context;
 const DoublyLinkedDeque = @import("intrusive.zig").DoublyLinkedDeque;
 
 pub const Packet = struct {
-    pub const max_size = 65536;
+    pub const max_size = 1 * 1024 * 1024;
     pub const size = @sizeOf(u32) + @sizeOf(u32) + @sizeOf(Packet.Op) + @sizeOf(Packet.Tag);
 
     pub const Op = enum(u8) {
