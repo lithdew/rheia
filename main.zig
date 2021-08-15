@@ -474,6 +474,7 @@ pub const Node = struct {
 
     chain: Chain,
     pusher: TransactionPusher,
+    puller: TransactionPuller,
     verifier: TransactionVerifier,
     clients: std.AutoHashMapUnmanaged(ip.Address, *net.Client),
     closed: bool = false,
@@ -483,7 +484,8 @@ pub const Node = struct {
         errdefer self.chain.deinit(gpa);
 
         self.pusher = try TransactionPusher.init(gpa, self);
-        self.verifier = TransactionVerifier.init(&self.chain, &self.pusher);
+        self.puller = TransactionPuller.init(self);
+        self.verifier = TransactionVerifier.init(self);
 
         self.clients = .{};
     }
@@ -508,6 +510,7 @@ pub const Node = struct {
         self.clients.deinit(gpa);
 
         self.verifier.deinit(ctx, gpa);
+        self.puller.deinit();
         self.pusher.deinit(ctx, gpa);
         self.chain.deinit(gpa);
 
@@ -544,11 +547,29 @@ pub const Node = struct {
         var pusher_frame = async self.pusher.run(ctx, gpa);
         defer await pusher_frame catch |err| if (err != error.Cancelled) log.warn("transaction pusher error: {}", .{err});
 
+        var puller_frame = async self.puller.run(ctx, gpa);
+        defer await puller_frame catch |err| if (err != error.Cancelled) log.warn("transaction puller error: {}", .{err});
+
         var verifier_frame = async self.verifier.run(ctx, gpa);
         defer await verifier_frame catch |err| if (err != error.Cancelled) log.warn("transaction verifier error: {}", .{err});
 
         var chain_frame = async self.chain.run(ctx, gpa, self);
         defer await chain_frame catch |err| if (err != error.Cancelled) log.warn("chain error: {}", .{err});
+    }
+
+    pub fn addTransaction(self: *Node, ctx: *Context, gpa: *mem.Allocator, tx: *Transaction) !void {
+        const result = self.chain.pending.getOrPutAssumeCapacity(tx.id);
+        if (result.found_existing) {
+            return error.AlreadyExists;
+        }
+        result.value_ptr.* = tx;
+
+        _ = self.chain.missing.delete(tx.id);
+
+        self.pusher.push(ctx, gpa, tx.ref()) catch |err| {
+            tx.deinit(gpa);
+            return err;
+        };
     }
 
     pub fn handleServerPacket(
@@ -571,6 +592,35 @@ pub const Node = struct {
                         }).write(conn.buffer.writer());
 
                         try conn.buffer.writer().writeAll("hello world");
+
+                        conn.writer_parker.notify({});
+                    },
+                    .pull_transaction => {
+                        var transactions: std.ArrayListUnmanaged(*Transaction) = .{};
+                        defer transactions.deinit(gpa);
+
+                        var num_bytes: u32 = 0;
+                        while (true) {
+                            const tx_id = frame.reader().readBytesNoEof(32) catch |err| switch (err) {
+                                error.EndOfStream => break,
+                                else => return err,
+                            };
+
+                            const tx = self.chain.pending.get(tx_id) orelse continue;
+                            try transactions.append(gpa, tx);
+                            num_bytes += tx.size();
+                        }
+
+                        try (net.Packet{
+                            .len = num_bytes,
+                            .nonce = packet.nonce,
+                            .op = .response,
+                            .tag = .pull_transaction,
+                        }).write(conn.buffer.writer());
+
+                        for (transactions.items) |tx| {
+                            try tx.write(conn.buffer.writer());
+                        }
 
                         conn.writer_parker.notify({});
                     },
@@ -680,7 +730,7 @@ pub const Chain = struct {
 
     sampler: Sampler,
     pending: HashMap(*Transaction, 50),
-    missing: HashMap(u64, 50),
+    missing: lru.AutoHashMap([32]u8, u64, 50),
 
     blocks: BlockRingBuffer = .{},
     block_proposal_cache: lru.AutoHashMap(ip.Address, *Block, 50),
@@ -695,7 +745,7 @@ pub const Chain = struct {
         var pending = try HashMap(*Transaction, 50).init(gpa);
         errdefer pending.deinit(gpa);
 
-        var missing = try HashMap(u64, 50).init(gpa);
+        var missing = try lru.AutoHashMap([32]u8, u64, 50).initCapacity(gpa, 1024);
         errdefer missing.deinit(gpa);
 
         var block_proposal_cache = try lru.AutoHashMap(ip.Address, *Block, 50).initCapacity(gpa, 128);
@@ -824,8 +874,8 @@ pub const Chain = struct {
         gpa: *mem.Allocator,
         transaction_ids: *std.ArrayListUnmanaged([32]u8),
     ) !void {
-        try runtime.timeout(ctx, .{ .nanoseconds = self.propose_delay });
         if (self.pending.len == 0) {
+            try runtime.timeout(ctx, .{ .nanoseconds = self.propose_delay });
             self.propose_delay = math.min(propose_delay_max, self.propose_delay + (propose_delay_max - propose_delay_min) / 10);
             return;
         }
@@ -867,8 +917,8 @@ pub const Chain = struct {
         block_proposals: *BlockProposalMap,
         block_proposal_height: u64,
     ) !void {
-        try runtime.timeout(ctx, .{ .nanoseconds = self.connected_delay });
         if (node.clients.count() == 0) {
+            try runtime.timeout(ctx, .{ .nanoseconds = self.connected_delay });
             self.connected_delay = math.min(connected_delay_max, self.connected_delay + (connected_delay_max - connected_delay_min) / 10);
             return;
         }
@@ -960,8 +1010,6 @@ pub const Chain = struct {
             return error.UnexpectedPulledBlockHeight;
         }
 
-        try node.chain.missing.ensureUnusedCapacity(gpa, block.num_transaction_ids);
-
         var maybe_err: ?anyerror = null;
 
         var it = [_]u8{0} ** 32;
@@ -970,7 +1018,7 @@ pub const Chain = struct {
                 maybe_err = error.BlockProposalTransactionIdsNotSorted;
             }
             if (node.chain.pending.get(tx_id) == null) {
-                node.chain.missing.putAssumeCapacity(tx_id, block_height);
+                _ = node.chain.missing.update(tx_id, block_height);
                 if (maybe_err == null) {
                     maybe_err = error.BlockProposalContainsUnknownTransactionId;
                 }
@@ -989,6 +1037,151 @@ pub const Chain = struct {
         }
 
         return block;
+    }
+};
+
+pub const TransactionPuller = struct {
+    const log = std.log.scoped(.tx_puller);
+
+    pub const max_num_bytes_per_batch = net.Packet.max_size - net.Packet.size;
+
+    pub const collect_delay_min: i64 = 100 * time.ns_per_ms;
+    pub const collect_delay_max: i64 = 500 * time.ns_per_ms;
+
+    pub const connected_delay_min: i64 = 0 * time.ns_per_ms;
+    pub const connected_delay_max: i64 = 500 * time.ns_per_ms;
+
+    node: *Node,
+
+    collect_delay: i64 = collect_delay_min,
+    connected_delay: i64 = connected_delay_min,
+
+    pub fn init(node: *Node) TransactionPuller {
+        return TransactionPuller{ .node = node };
+    }
+
+    pub fn deinit(self: *TransactionPuller) void {
+        _ = self;
+        log.info("shutting down...", .{});
+        log.info("successfully shut down", .{});
+    }
+
+    pub fn run(self: *TransactionPuller, ctx: *Context, gpa: *mem.Allocator) !void {
+        while (true) {
+            while (self.node.chain.missing.len == 0) {
+                try runtime.timeout(ctx, .{ .nanoseconds = self.collect_delay });
+                self.collect_delay = math.min(collect_delay_max, self.collect_delay * 2);
+                continue;
+            }
+
+            self.collect_delay = collect_delay_min;
+
+            while (self.node.clients.count() == 0) {
+                try runtime.timeout(ctx, .{ .nanoseconds = self.connected_delay });
+                self.connected_delay = math.min(connected_delay_max, self.connected_delay + (connected_delay_max - connected_delay_min) / 10);
+                continue;
+            }
+
+            self.connected_delay = connected_delay_min;
+
+            self.pullMissingTransactions(ctx, gpa) catch |err| log.warn("error while pulling: {}", .{err});
+        }
+    }
+
+    pub fn pullMissingTransactions(self: *TransactionPuller, ctx: *Context, gpa: *mem.Allocator) !void {
+        const ids = ids: {
+            var ids: std.ArrayListUnmanaged([32]u8) = .{};
+            errdefer ids.deinit(gpa);
+
+            var it = self.node.chain.missing.tail;
+            while (it) |entry| : (it = entry.prev) {
+                if (ids.items.len * @sizeOf([32]u8) + @sizeOf([32]u8) >= max_num_bytes_per_batch) {
+                    break;
+                }
+                try ids.append(gpa, entry.key);
+            }
+
+            break :ids ids.toOwnedSlice(gpa);
+        };
+        defer gpa.free(ids);
+
+        // TODO: push missing entries to top of 'missing' lru cache
+
+        const frames = try gpa.alloc(@Frame(pullTransactionsFromPeer), self.node.clients.count());
+        defer gpa.free(frames);
+
+        var frame_index: usize = 0;
+        defer for (frames[0..frame_index]) |*frame| {
+            const transactions = await frame catch continue;
+            defer gpa.free(transactions);
+
+            for (transactions) |tx| {
+                self.node.addTransaction(ctx, gpa, tx) catch {
+                    tx.deinit(gpa);
+                    continue;
+                };
+            }
+        };
+
+        var wg: sync.WaitGroup = .{};
+        defer wg.wait(ctx) catch {};
+
+        var it = self.node.clients.keyIterator();
+        while (it.next()) |address_ptr| : (frame_index += 1) {
+            frames[frame_index] = async self.pullTransactionsFromPeer(ctx, gpa, &wg, address_ptr.*, ids);
+        }
+    }
+
+    pub fn pullTransactionsFromPeer(
+        self: *TransactionPuller,
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        wg: *sync.WaitGroup,
+        address: ip.Address,
+        ids: []const [32]u8,
+    ) ![]const *Transaction {
+        wg.add(1);
+        defer wg.sub(1);
+
+        const client = try self.node.getOrCreateClient(gpa, address);
+
+        var entry: net.Client.RPC.Entry = .{};
+        var nonce = try client.rpc.register(ctx, &entry);
+
+        {
+            const writer = try client.acquireWriter(ctx, gpa);
+            defer client.releaseWriter(writer);
+
+            try (net.Packet{
+                .len = @intCast(u32, @sizeOf([32]u8) * ids.len),
+                .nonce = nonce,
+                .op = .request,
+                .tag = .pull_block,
+            }).write(writer);
+
+            for (ids) |id| {
+                try writer.writeAll(&id);
+            }
+        }
+
+        const response = try await entry.response;
+        defer response.deinit(gpa);
+
+        var body = io.fixedBufferStream(response.body);
+
+        var transactions: std.ArrayListUnmanaged(*Transaction) = .{};
+        defer transactions.deinit(gpa);
+
+        while (true) {
+            const tx = Transaction.read(gpa, body.reader()) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => continue,
+            };
+
+            transactions.append(gpa, tx) catch continue;
+        }
+
+        return transactions.toOwnedSlice(gpa);
     }
 };
 
@@ -1068,16 +1261,18 @@ pub const TransactionPusher = struct {
 
     pub fn run(self: *TransactionPusher, ctx: *Context, gpa: *mem.Allocator) !void {
         while (true) {
-            try runtime.timeout(ctx, .{ .nanoseconds = self.flush_delay });
-
             if (self.num_bytes_pending == 0 or time.milliTimestamp() - self.last_flush_time < flush_delay_min / time.ns_per_ms) {
+                try runtime.timeout(ctx, .{ .nanoseconds = self.flush_delay });
                 self.flush_delay = math.min(flush_delay_max, self.flush_delay * 2);
                 continue;
             }
 
             self.flush_delay = flush_delay_min;
 
-            try self.flush(ctx, gpa);
+            self.flush(ctx, gpa) catch |err| switch (err) {
+                error.Cancelled => return err,
+                else => log.warn("error while flushing: {}", .{err}),
+            };
         }
     }
 
@@ -1203,8 +1398,7 @@ pub const TransactionVerifier = struct {
         next: ?*TransactionVerifier.Task = null,
     };
 
-    chain: *Chain,
-    pusher: *TransactionPusher,
+    node: *Node,
 
     pool_wg: sync.WaitGroup = .{},
     pool_parker: sync.Parker(void) = .{},
@@ -1213,8 +1407,8 @@ pub const TransactionVerifier = struct {
     entries: std.ArrayListUnmanaged(*Transaction) = .{},
     last_flush_time: i64 = 0,
 
-    pub fn init(chain: *Chain, pusher: *TransactionPusher) TransactionVerifier {
-        return TransactionVerifier{ .chain = chain, .pusher = pusher };
+    pub fn init(node: *Node) TransactionVerifier {
+        return TransactionVerifier{ .node = node };
     }
 
     pub fn deinit(self: *TransactionVerifier, ctx: *Context, gpa: *mem.Allocator) void {
@@ -1254,16 +1448,15 @@ pub const TransactionVerifier = struct {
                 try self.pool_parker.park(ctx);
             }
 
-            try runtime.timeout(ctx, .{ .nanoseconds = flush_delay });
-
             if (self.entries.items.len == 0 or time.milliTimestamp() - self.last_flush_time < flush_delay_min / time.ns_per_ms) {
+                try runtime.timeout(ctx, .{ .nanoseconds = flush_delay });
                 flush_delay = math.min(flush_delay_max, flush_delay * 2);
                 continue;
             }
 
-            try self.flush(ctx, gpa);
-
             flush_delay = flush_delay_min;
+
+            self.flush(ctx, gpa) catch |err| log.warn("error while flushing: {}", .{err});
         }
     }
 
@@ -1338,7 +1531,7 @@ pub const TransactionVerifier = struct {
 
         defer gpa.free(entries);
 
-        self.chain.pending.ensureUnusedCapacity(gpa, index) catch {
+        self.node.chain.pending.ensureUnusedCapacity(gpa, index) catch {
             for (entries[0..index]) |tx| {
                 tx.deinit(gpa);
             }
@@ -1346,16 +1539,7 @@ pub const TransactionVerifier = struct {
         };
 
         for (entries[0..index]) |tx| {
-            const result = self.chain.pending.getOrPutAssumeCapacity(tx.id);
-            if (result.found_existing) {
-                tx.deinit(gpa);
-                continue;
-            }
-            result.value_ptr.* = tx;
-
-            _ = self.chain.missing.delete(tx.id);
-
-            self.pusher.push(ctx, gpa, tx.ref()) catch {
+            self.node.addTransaction(ctx, gpa, tx) catch {
                 tx.deinit(gpa);
                 continue;
             };

@@ -714,6 +714,10 @@ pub const Runtime = struct {
         try ctx.register(&callback.state);
         defer ctx.deregister(&callback.state);
 
+        if (params.seconds == 0 and params.nanoseconds == 0) {
+            return;
+        }
+
         const timespec: os.__kernel_timespec = .{
             .tv_sec = params.seconds,
             .tv_nsec = params.nanoseconds,

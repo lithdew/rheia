@@ -27,6 +27,7 @@ pub const Packet = struct {
     pub const Tag = enum(u8) {
         ping,
         push_transaction,
+        pull_transaction,
         pull_block,
     };
 
