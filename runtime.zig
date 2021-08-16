@@ -336,7 +336,7 @@ pub const Runtime = struct {
             }
 
             _ = self.ring.submit_and_wait(num_waiters: {
-                if (tasks_resumed > 0 or self.rearm()) {
+                if (self.rearm() or tasks_resumed > 0) {
                     break :num_waiters 0;
                 }
                 break :num_waiters 1;

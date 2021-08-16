@@ -12,6 +12,7 @@ const fmt = std.fmt;
 const mem = std.mem;
 const tcp = std.x.net.tcp;
 const math = std.math;
+const meta = std.meta;
 const time = std.time;
 const testing = std.testing;
 
@@ -1001,7 +1002,10 @@ pub const Chain = struct {
                 return err;
             }
             const block_proposal = cached_block_proposal orelse return err;
-            assert(self.block_proposal_cache.update(address, block_proposal) == .updated);
+            switch (self.block_proposal_cache.update(address, block_proposal.ref())) {
+                .updated => |old_block| old_block.deinit(gpa),
+                .evicted, .inserted => unreachable,
+            }
             return block_proposal;
         };
         errdefer block.deinit(gpa);
@@ -1089,23 +1093,26 @@ pub const TransactionPuller = struct {
     }
 
     pub fn pullMissingTransactions(self: *TransactionPuller, ctx: *Context, gpa: *mem.Allocator) !void {
+        assert(self.node.chain.missing.len > 0);
+
         const ids = ids: {
-            var ids: std.ArrayListUnmanaged([32]u8) = .{};
+            const total_num_ids = math.min(self.node.chain.missing.len, max_num_bytes_per_batch / @sizeOf([32]u8));
+
+            var ids = try std.ArrayListUnmanaged([32]u8).initCapacity(gpa, total_num_ids);
             errdefer ids.deinit(gpa);
 
             var it = self.node.chain.missing.tail;
             while (it) |entry| : (it = entry.prev) {
-                if (ids.items.len * @sizeOf([32]u8) + @sizeOf([32]u8) >= max_num_bytes_per_batch) {
+                ids.appendAssumeCapacity(entry.key);
+                self.node.chain.missing.moveEntryToFront(entry);
+                if (ids.items.len == ids.capacity) {
                     break;
                 }
-                try ids.append(gpa, entry.key);
             }
 
             break :ids ids.toOwnedSlice(gpa);
         };
         defer gpa.free(ids);
-
-        // TODO: push missing entries to top of 'missing' lru cache
 
         const frames = try gpa.alloc(@Frame(pullTransactionsFromPeer), self.node.clients.count());
         defer gpa.free(frames);
@@ -1188,20 +1195,7 @@ pub const TransactionPuller = struct {
 pub const TransactionPusher = struct {
     const log = std.log.scoped(.tx_pusher);
 
-    const Cache = lru.HashMap(Entry, void, 50, struct {
-        pub fn hash(_: @This(), entry: Entry) u64 {
-            var hasher = std.hash.Wyhash.init(0);
-            hasher.update(mem.asBytes(&entry.address));
-            hasher.update(&entry.transaction_id);
-            return hasher.final();
-        }
-
-        pub fn eql(_: @This(), a: Entry, b: Entry) bool {
-            const eql_address = mem.eql(u8, mem.asBytes(&a.address), mem.asBytes(&b.address));
-            const eql_transaction_id = mem.eql(u8, &a.transaction_id, &b.transaction_id);
-            return eql_address and eql_transaction_id;
-        }
-    });
+    const Cache = lru.AutoHashMap(Entry, void, 50);
 
     const Entry = struct {
         address: ip.Address,

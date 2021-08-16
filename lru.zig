@@ -35,6 +35,11 @@ pub fn HashMap(comptime K: type, comptime V: type, comptime max_load_percentage:
             }
         };
 
+        pub const KV = struct {
+            key: K,
+            value: V,
+        };
+
         const Self = @This();
 
         entries: [*]Entry,
@@ -81,7 +86,7 @@ pub fn HashMap(comptime K: type, comptime V: type, comptime max_load_percentage:
         }
 
         pub const UpdateResult = union(enum) {
-            evicted: struct { key: K, value: V },
+            evicted: KV,
             updated: V,
             inserted,
         };
@@ -94,30 +99,68 @@ pub fn HashMap(comptime K: type, comptime V: type, comptime max_load_percentage:
         }
 
         pub fn updateContext(self: *Self, key: K, value: V, ctx: Context) UpdateResult {
-            var it: Entry = .{ .key = key, .value = value };
+            const result = self.getOrPutContext(key, ctx);
+            if (result.found_existing) {
+                const old_value = result.value_ptr.*;
+                result.value_ptr.* = value;
+                return .{ .updated = old_value };
+            }
+
+            result.value_ptr.* = value;
+
+            if (self.len > (@as(u64, 1) << (63 - self.shift + 1)) * max_load_percentage / 100) {
+                return .{ .evicted = self.popOrNullContext(ctx).? };
+            }
+            return .inserted;
+        }
+
+        pub const GetOrPutResult = struct {
+            value_ptr: *V,
+            found_existing: bool,
+        };
+
+        pub fn getOrPut(self: *Self, key: K) GetOrPutResult {
+            if (@sizeOf(Context) != 0) {
+                @compileError("getOrPutContext must be used.");
+            }
+            return self.getOrPutContext(key, undefined);
+        }
+
+        pub fn getOrPutContext(self: *Self, key: K, ctx: Context) GetOrPutResult {
+            var it: Entry = .{ .key = key, .value = undefined };
             var i = ctx.hash(key) >> self.shift;
-            var inserted = false;
+
+            var inserted_at: ?usize = null;
             while (true) : (i += 1) {
                 if (self.entries[i].isEmpty(self)) {
-                    self.prependNode(&it, &self.entries[i], inserted);
-                    self.len += 1;
-
-                    const capacity = @as(u64, 1) << (63 - self.shift + 1);
-                    if (self.len <= capacity * max_load_percentage / 100) {
-                        return .inserted;
+                    if (inserted_at == null) {
+                        self.prependNode(&it, &self.entries[i]);
+                    } else {
+                        self.readjustNodePointers(&it, &self.entries[i]);
                     }
-
-                    const tail_key = self.tail.?.key;
-                    const tail_index = (@ptrToInt(self.tail.?) - @ptrToInt(self.entries)) / @sizeOf(Entry);
-                    return .{ .evicted = .{ .key = tail_key, .value = self.deleteEntryAtIndex(tail_index, ctx) } };
+                    self.entries[i] = it;
+                    self.len += 1;
+                    return .{
+                        .value_ptr = &self.entries[inserted_at orelse i].value,
+                        .found_existing = false,
+                    };
                 } else if (ctx.hash(self.entries[i].key) > ctx.hash(it.key)) {
-                    self.prependNode(&it, &self.entries[i], inserted);
-                    inserted = true;
+                    if (inserted_at == null) {
+                        self.prependNode(&it, &self.entries[i]);
+                        inserted_at = i;
+                    } else {
+                        self.readjustNodePointers(&it, &self.entries[i]);
+                    }
+                    mem.swap(Entry, &it, &self.entries[i]);
                 } else if (ctx.eql(self.entries[i].key, key)) {
-                    const old_value = self.entries[i].value;
                     self.removeNode(&self.entries[i]);
-                    self.prependNode(&it, &self.entries[i], inserted);
-                    return .{ .updated = old_value };
+                    self.prependNode(&it, &self.entries[i]);
+                    self.entries[i].prev = it.prev;
+                    self.entries[i].next = it.next;
+                    return .{
+                        .value_ptr = &self.entries[i].value,
+                        .found_existing = true,
+                    };
                 }
                 self.put_probe_count += 1;
             }
@@ -169,6 +212,24 @@ pub fn HashMap(comptime K: type, comptime V: type, comptime max_load_percentage:
             return self.deleteEntryAtIndex(i, ctx);
         }
 
+        pub fn moveEntryToFront(self: *Self, entry: *Entry) void {
+            self.removeNode(entry);
+            self.prependNode(entry, entry);
+        }
+
+        pub fn popOrNull(self: *Self) ?KV {
+            if (@sizeOf(Context) != 0) {
+                @compileError("popOrNullContext must be used.");
+            }
+            return self.popOrNullContext(undefined);
+        }
+
+        pub fn popOrNullContext(self: *Self, ctx: Context) ?KV {
+            const tail = self.tail orelse return null;
+            const tail_index = (@ptrToInt(tail) - @ptrToInt(self.entries)) / @sizeOf(Entry);
+            return KV{ .key = tail.key, .value = self.deleteEntryAtIndex(tail_index, ctx) };
+        }
+
         fn deleteEntryAtIndex(self: *Self, i_const: usize, ctx: Context) V {
             const value = self.entries[i_const].value;
             self.removeNode(&self.entries[i_const]);
@@ -180,7 +241,7 @@ pub fn HashMap(comptime K: type, comptime V: type, comptime max_load_percentage:
                     break;
                 }
                 self.entries[i] = self.entries[i + 1];
-                self.touchNode(&self.entries[i], &self.entries[i]);
+                self.readjustNodePointers(&self.entries[i], &self.entries[i]);
                 self.del_probe_count += 1;
             }
 
@@ -191,19 +252,14 @@ pub fn HashMap(comptime K: type, comptime V: type, comptime max_load_percentage:
         }
 
         /// Prepend entry to head of linked list, or fix up the entry's linked list pointers.
-        fn prependNode(self: *Self, it: *Entry, entry: *Entry, inserted: bool) void {
-            if (!inserted) {
-                it.next = self.head;
-                if (self.head) |head| {
-                    head.prev = entry;
-                } else {
-                    self.tail = entry;
-                }
-                self.head = entry;
+        fn prependNode(self: *Self, it: *Entry, entry: *Entry) void {
+            it.next = self.head;
+            if (self.head) |head| {
+                head.prev = entry;
             } else {
-                self.touchNode(it, entry);
+                self.tail = entry;
             }
-            mem.swap(Entry, it, entry);
+            self.head = entry;
         }
 
         /// Remove entry from the linked list.
@@ -223,7 +279,7 @@ pub fn HashMap(comptime K: type, comptime V: type, comptime max_load_percentage:
         }
 
         /// Re-adjust entry's linked list pointers.
-        fn touchNode(self: *Self, it: *Entry, entry: *Entry) void {
+        fn readjustNodePointers(self: *Self, it: *Entry, entry: *Entry) void {
             if (it.prev) |prev| {
                 prev.next = entry;
             } else {
