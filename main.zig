@@ -1121,7 +1121,7 @@ pub const Chain = struct {
         defer wg.sub(1);
 
         const client = try node.getOrCreateClient(ctx, gpa, address);
-        const cached_block_proposal = if (self.block_proposal_cache.get(address)) |entry| entry.value else null;
+        const cached_block_proposal = if (self.block_proposal_cache.get(address)) |entry| entry.value.ref() else null;
 
         var entry: net.Client.RPC.Entry = .{};
         var nonce = try client.rpc.register(ctx, &entry);
@@ -1162,8 +1162,8 @@ pub const Chain = struct {
             // been evicted by time we reach here, so an insertion may happen
             // yet again
 
-            switch (self.block_proposal_cache.update(address, block_proposal.ref())) {
-                .inserted => block_proposal.deinit(gpa),
+            switch (self.block_proposal_cache.update(address, block_proposal)) {
+                .inserted => {},
                 .updated => |old_block| old_block.deinit(gpa),
                 .evicted => |old_entry| old_entry.value.deinit(gpa),
             }
@@ -1356,7 +1356,38 @@ pub const TransactionPuller = struct {
 pub const TransactionPusher = struct {
     const log = std.log.scoped(.tx_pusher);
 
-    const Cache = lru.AutoIntrusiveHashMap(Entry, void, 50);
+    const Cache = lru.IntrusiveHashMap(Entry, void, 50, struct {
+        pub fn hash(_: @This(), entry: Entry) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            switch (entry.address) {
+                .ipv4 => |ipv4| {
+                    hasher.update(&ipv4.host.octets);
+                    hasher.update(mem.asBytes(&ipv4.port));
+                },
+                .ipv6 => |ipv6| {
+                    hasher.update(&ipv6.host.octets);
+                    hasher.update(mem.asBytes(&ipv6.host.scope_id));
+                    hasher.update(mem.asBytes(&ipv6.port));
+                },
+            }
+            hasher.update(&entry.transaction_id);
+            return hasher.final();
+        }
+
+        pub fn eql(_: @This(), a: Entry, b: Entry) bool {
+            switch (a.address) {
+                .ipv4 => {
+                    if (b.address != .ipv4) return false;
+                    if (!a.address.ipv4.host.eql(b.address.ipv4.host)) return false;
+                },
+                .ipv6 => {
+                    if (b.address != .ipv6) return false;
+                    if (!a.address.ipv6.host.eql(b.address.ipv6.host)) return false;
+                },
+            }
+            return mem.eql(u8, &a.transaction_id, &b.transaction_id);
+        }
+    });
 
     const Entry = struct {
         address: ip.Address,
