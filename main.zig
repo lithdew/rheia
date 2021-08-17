@@ -639,8 +639,7 @@ pub const Node = struct {
             errdefer gpa.destroy(result.value_ptr.*);
 
             result.value_ptr.*.* = try net.Client.init(gpa, address);
-
-            // TODO: move handshake code to net.Client
+            errdefer result.value_ptr.*.deinit(gpa, ctx);
 
             try result.value_ptr.*.ensureConnectionAvailable(ctx, gpa);
 
