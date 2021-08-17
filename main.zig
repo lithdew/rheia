@@ -51,8 +51,22 @@ pub fn run() !void {
     var ctx: Context = .{};
     defer ctx.cancel();
 
+    var listener = try tcp.Listener.init(.ip, .{ .close_on_exec = true });
+    defer listener.deinit();
+
+    try listener.setReuseAddress(true);
+    try listener.setReusePort(true);
+    try listener.setFastOpen(true);
+
+    try listener.bind(ip.Address.initIPv4(IPv4.localhost, 9000));
+    try listener.listen(128);
+
+    const keys = try Ed25519.KeyPair.create(null);
+    log.debug("public key: {}", .{fmt.fmtSliceHexLower(&keys.public_key)});
+    log.debug("secret key: {}", .{fmt.fmtSliceHexLower(keys.secret_key[0..Ed25519.seed_length])});
+
     var node: Node = undefined;
-    try node.init(runtime.getAllocator());
+    try node.init(runtime.getAllocator(), keys, try listener.getLocalAddress());
     defer {
         var shutdown_ctx: Context = .{};
         defer shutdown_ctx.cancel();
@@ -62,16 +76,6 @@ pub fn run() !void {
 
     var node_frame = async node.run(&ctx, runtime.getAllocator());
     defer await node_frame catch |err| log.warn("node error: {}", .{err});
-
-    var listener = try tcp.Listener.init(.ip, .{ .close_on_exec = true });
-    defer listener.deinit();
-
-    try listener.setReuseAddress(true);
-    try listener.setReusePort(true);
-    try listener.setFastOpen(true);
-
-    try listener.bind(ip.Address.initIPv4(IPv4.unspecified, 9000));
-    try listener.listen(128);
 
     var server = net.Server(Node).init(&node);
     defer {
@@ -130,8 +134,6 @@ pub fn reportBenchmarkStats(ctx: *Context) !void {
 }
 
 pub fn runBenchmark(ctx: *Context, node: *Node, client_address: ip.Address) !void {
-    const keys = try Ed25519.KeyPair.create(null);
-
     while (true) {
         const nonce = benchmark_count.fetchAdd(1, .Monotonic);
         const created_at = if (node.chain.blocks.latest()) |latest_block| latest_block.height else 0;
@@ -140,7 +142,7 @@ pub fn runBenchmark(ctx: *Context, node: *Node, client_address: ip.Address) !voi
             runtime.startCpuBoundOperation();
             defer runtime.endCpuBoundOperation();
 
-            break :tx Transaction.create(runtime.getAllocator(), keys, .{
+            break :tx Transaction.create(runtime.getAllocator(), node.keys, .{
                 .sender_nonce = nonce,
                 .created_at = created_at,
                 .tag = .no_op,
@@ -216,11 +218,11 @@ pub const ID = struct {
     public_key: [32]u8,
     address: ip.Address,
 
-    pub fn size(self: ID) usize {
-        return ID.header_size + @sizeOf(u8) + switch (self.address) {
+    pub fn size(self: ID) u32 {
+        return ID.header_size + @sizeOf(u8) + @as(u32, switch (self.address) {
             .ipv4 => @sizeOf([4]u8),
             .ipv6 => @sizeOf([16]u8) + @sizeOf(u32),
-        } + @sizeOf(u16);
+        }) + @sizeOf(u16);
     }
 
     pub fn write(self: ID, writer: anytype) !void {
@@ -260,6 +262,12 @@ pub const ID = struct {
         }
 
         return id;
+    }
+
+    pub fn format(self: ID, comptime layout: []const u8, options: fmt.FormatOptions, writer: anytype) !void {
+        _ = layout;
+        _ = options;
+        try fmt.format(writer, "{}[{}]", .{ self.address, fmt.fmtSliceHexLower(&self.public_key) });
     }
 };
 
@@ -569,6 +577,9 @@ test "transaction: create, serialize, and deserialize" {
 pub const Node = struct {
     const log = std.log.scoped(.node);
 
+    id: ID,
+    keys: Ed25519.KeyPair,
+
     chain: Chain,
     pusher: TransactionPusher,
     puller: TransactionPuller,
@@ -576,7 +587,10 @@ pub const Node = struct {
     clients: std.AutoHashMapUnmanaged(ip.Address, *net.Client),
     closed: bool = false,
 
-    pub fn init(self: *Node, gpa: *mem.Allocator) !void {
+    pub fn init(self: *Node, gpa: *mem.Allocator, keys: Ed25519.KeyPair, address: ip.Address) !void {
+        self.keys = keys;
+        self.id = ID{ .public_key = keys.public_key, .address = address };
+
         self.chain = try Chain.init(gpa);
         errdefer self.chain.deinit(gpa);
 
@@ -614,7 +628,7 @@ pub const Node = struct {
         log.info("successfully shut down", .{});
     }
 
-    pub fn getOrCreateClient(self: *Node, gpa: *mem.Allocator, address: ip.Address) !*net.Client {
+    pub fn getOrCreateClient(self: *Node, ctx: *Context, gpa: *mem.Allocator, address: ip.Address) !*net.Client {
         if (self.closed) return error.Closed;
 
         const result = try self.clients.getOrPut(gpa, address);
@@ -625,13 +639,42 @@ pub const Node = struct {
             errdefer gpa.destroy(result.value_ptr.*);
 
             result.value_ptr.*.* = try net.Client.init(gpa, address);
+
+            // TODO: move handshake code to net.Client
+
+            try result.value_ptr.*.ensureConnectionAvailable(ctx, gpa);
+
+            var entry: net.Client.RPC.Entry = .{};
+            var nonce = try result.value_ptr.*.rpc.register(ctx, &entry);
+
+            {
+                const writer = try result.value_ptr.*.acquireWriter(ctx, gpa);
+                defer result.value_ptr.*.releaseWriter(writer);
+
+                try (net.Packet{
+                    .len = self.id.size(),
+                    .nonce = nonce,
+                    .op = .request,
+                    .tag = .hello,
+                }).write(writer);
+
+                try self.id.write(writer);
+            }
+
+            const response = try await entry.response;
+            defer response.deinit(gpa);
+
+            var body = io.fixedBufferStream(response.body);
+
+            const peer_id = try ID.read(body.reader());
+            log.info("handshaked with {}", .{peer_id});
         }
 
         return result.value_ptr.*;
     }
 
     pub fn acquireWriter(self: *Node, ctx: *Context, gpa: *mem.Allocator, address: ip.Address) !std.ArrayList(u8).Writer {
-        const client = try self.getOrCreateClient(gpa, address);
+        const client = try self.getOrCreateClient(ctx, gpa, address);
         return client.acquireWriter(ctx, gpa);
     }
 
@@ -689,6 +732,21 @@ pub const Node = struct {
                         }).write(conn.buffer.writer());
 
                         try conn.buffer.writer().writeAll("hello world");
+
+                        conn.writer_parker.notify({});
+                    },
+                    .hello => {
+                        const peer_id = try ID.read(frame.reader());
+                        log.info("incoming handshake from {}", .{peer_id});
+
+                        try (net.Packet{
+                            .len = self.id.size(),
+                            .nonce = packet.nonce,
+                            .op = .response,
+                            .tag = .hello,
+                        }).write(conn.buffer.writer());
+
+                        try self.id.write(conn.buffer.writer());
 
                         conn.writer_parker.notify({});
                     },
@@ -827,10 +885,10 @@ pub const Chain = struct {
 
     sampler: Sampler,
     pending: HashMap(*Transaction, 50),
-    missing: lru.AutoHashMap([32]u8, u64, 50),
+    missing: lru.AutoIntrusiveHashMap([32]u8, u64, 50),
 
     blocks: BlockRingBuffer = .{},
-    block_proposal_cache: lru.AutoHashMap(ip.Address, *Block, 50),
+    block_proposal_cache: lru.AutoIntrusiveHashMap(ip.Address, *Block, 50),
 
     propose_delay: i64 = propose_delay_min,
     connected_delay: i64 = connected_delay_min,
@@ -842,10 +900,10 @@ pub const Chain = struct {
         var pending = try HashMap(*Transaction, 50).init(gpa);
         errdefer pending.deinit(gpa);
 
-        var missing = try lru.AutoHashMap([32]u8, u64, 50).initCapacity(gpa, 1024);
+        var missing = try lru.AutoIntrusiveHashMap([32]u8, u64, 50).initCapacity(gpa, 1024);
         errdefer missing.deinit(gpa);
 
-        var block_proposal_cache = try lru.AutoHashMap(ip.Address, *Block, 50).initCapacity(gpa, 128);
+        var block_proposal_cache = try lru.AutoIntrusiveHashMap(ip.Address, *Block, 50).initCapacity(gpa, 128);
         errdefer block_proposal_cache.deinit(gpa);
 
         return Chain{
@@ -1062,8 +1120,8 @@ pub const Chain = struct {
         wg.add(1);
         defer wg.sub(1);
 
-        const client = try node.getOrCreateClient(gpa, address);
-        const cached_block_proposal = self.block_proposal_cache.get(address);
+        const client = try node.getOrCreateClient(ctx, gpa, address);
+        const cached_block_proposal = if (self.block_proposal_cache.get(address)) |entry| entry.value else null;
 
         var entry: net.Client.RPC.Entry = .{};
         var nonce = try client.rpc.register(ctx, &entry);
@@ -1097,10 +1155,17 @@ pub const Chain = struct {
             if (response.body.len > 1) {
                 return err;
             }
+
             const block_proposal = cached_block_proposal orelse return err;
+
+            // it is possible that our cached block proposal response may have
+            // been evicted by time we reach here, so an insertion may happen
+            // yet again
+
             switch (self.block_proposal_cache.update(address, block_proposal.ref())) {
+                .inserted => block_proposal.deinit(gpa),
                 .updated => |old_block| old_block.deinit(gpa),
-                .evicted, .inserted => unreachable,
+                .evicted => |old_entry| old_entry.value.deinit(gpa),
             }
             return block_proposal;
         };
@@ -1132,8 +1197,8 @@ pub const Chain = struct {
 
         switch (self.block_proposal_cache.update(address, block)) {
             .inserted => {},
-            .evicted => |old_entry| old_entry.value.deinit(gpa),
             .updated => |old_block| old_block.deinit(gpa),
+            .evicted => |old_entry| old_entry.value.deinit(gpa),
         }
 
         return block;
@@ -1200,7 +1265,7 @@ pub const TransactionPuller = struct {
             var it = self.node.chain.missing.tail;
             while (it) |entry| : (it = entry.prev) {
                 ids.appendAssumeCapacity(entry.key);
-                self.node.chain.missing.moveEntryToFront(entry);
+                self.node.chain.missing.moveToFront(entry);
                 if (ids.items.len == ids.capacity) {
                     break;
                 }
@@ -1246,7 +1311,7 @@ pub const TransactionPuller = struct {
         wg.add(1);
         defer wg.sub(1);
 
-        const client = try self.node.getOrCreateClient(gpa, address);
+        const client = try self.node.getOrCreateClient(ctx, gpa, address);
 
         var entry: net.Client.RPC.Entry = .{};
         var nonce = try client.rpc.register(ctx, &entry);
@@ -1291,7 +1356,7 @@ pub const TransactionPuller = struct {
 pub const TransactionPusher = struct {
     const log = std.log.scoped(.tx_pusher);
 
-    const Cache = lru.AutoHashMap(Entry, void, 50);
+    const Cache = lru.AutoIntrusiveHashMap(Entry, void, 50);
 
     const Entry = struct {
         address: ip.Address,

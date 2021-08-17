@@ -48,6 +48,8 @@ Rheia makes heavy use of LRU caches to keep track of unbounded sets of data that
 
 [Rheia's LRU cache](lru.zig) is an amalgamation of both a Robin Hood Hash Table and a Doubly-linked Deque. The idea of meshing a hash table and doubly-linked deque together to construct a LRU cache is inspired by [this blog post](https://medium.com/@udaysagar.2177/fastest-lru-cache-in-java-c22262de42ad).
 
+An alternative LRU cache implementation was also experimented with, where deque entries and hash table entries were separately allocated. Such an implementation only yielded better overall throughput in comparison to Rheia's existing LRU cache implementation however when the cache's capacity is small and the maximum load factor is 50%. 
+
 On my laptop, using Rheia's LRU cache with a max load factor of 50%, roughly:
 
 1. 19.81 million entries can be upserted per second.
@@ -57,11 +59,39 @@ On my laptop, using Rheia's LRU cache with a max load factor of 50%, roughly:
 The benchmark code is available [here](benchmarks/lru/main.zig). An example run is provided below.
 
 ```
-$ zig run benchmarks/lru/main.zig -lc --name lru --main-pkg-path . -O ReleaseFast
-info(lru): insert: 50.459ms
-info(lru): search: 49.516ms
-info(lru): delete: 100.211ms
-info(lru): put: 453964, get: 453964, del: 453964
+$ zig run benchmarks/lru/main.zig -lc -O ReleaseFast --main-pkg-path .
+info(linked-list lru w/ load factor 50% (4096 elements)): insert: 61.92us
+info(linked-list lru w/ load factor 50% (4096 elements)): search: 64.429us
+info(linked-list lru w/ load factor 50% (4096 elements)): delete: 100.595us
+info(linked-list lru w/ load factor 50% (4096 elements)): put: 2010, get: 2010, del: 2010
+info(intrusive lru w/ load factor 50% (4096 elements)): insert: 129.446us
+info(intrusive lru w/ load factor 50% (4096 elements)): search: 79.754us
+info(intrusive lru w/ load factor 50% (4096 elements)): delete: 169.099us
+info(intrusive lru w/ load factor 50% (4096 elements)): put: 2010, get: 2010, del: 2010
+info(linked-list lru w/ load factor 100% (4096 elements)): insert: 178.883us
+info(linked-list lru w/ load factor 100% (4096 elements)): search: 37.786us
+info(linked-list lru w/ load factor 100% (4096 elements)): delete: 37.522us
+info(linked-list lru w/ load factor 100% (4096 elements)): put: 3798, get: 1905, del: 2827
+info(intrusive lru w/ load factor 100% (4096 elements)): insert: 154.161us
+info(intrusive lru w/ load factor 100% (4096 elements)): search: 21.533us
+info(intrusive lru w/ load factor 100% (4096 elements)): delete: 61.936us
+info(intrusive lru w/ load factor 100% (4096 elements)): put: 3798, get: 934, del: 2827
+info(linked-list lru w/ load factor 50% (1 million elements)): insert: 79.469ms
+info(linked-list lru w/ load factor 50% (1 million elements)): search: 48.164ms
+info(linked-list lru w/ load factor 50% (1 million elements)): delete: 101.94ms
+info(linked-list lru w/ load factor 50% (1 million elements)): put: 453964, get: 453964, del: 453964
+info(intrusive lru w/ load factor 50% (1 million elements)): insert: 65.143ms
+info(intrusive lru w/ load factor 50% (1 million elements)): search: 38.909ms
+info(intrusive lru w/ load factor 50% (1 million elements)): delete: 95.001ms
+info(intrusive lru w/ load factor 50% (1 million elements)): put: 453964, get: 453964, del: 453964
+info(linked-list lru w/ load factor 100% (1 million elements)): insert: 123.995ms
+info(linked-list lru w/ load factor 100% (1 million elements)): search: 29.77ms
+info(linked-list lru w/ load factor 100% (1 million elements)): delete: 48.993ms
+info(linked-list lru w/ load factor 100% (1 million elements)): put: 974504, get: 487369, del: 736132
+info(intrusive lru w/ load factor 100% (1 million elements)): insert: 104.109ms
+info(intrusive lru w/ load factor 100% (1 million elements)): search: 19.557ms
+info(intrusive lru w/ load factor 100% (1 million elements)): delete: 47.728ms
+info(intrusive lru w/ load factor 100% (1 million elements)): put: 974504, get: 249260, del: 736132
 ```
 
 ### mempool

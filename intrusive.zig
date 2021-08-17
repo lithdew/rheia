@@ -16,6 +16,7 @@ pub fn SinglyLinkedList(comptime T: type, comptime next_field: meta.FieldEnum(T)
         }
 
         pub fn prepend(self: *Self, value: *T) void {
+            if (!self.isEmpty() and self.head == value) return;
             @field(value, next) = self.head;
             self.head = value;
         }
@@ -46,6 +47,7 @@ pub fn DoublyLinkedDeque(comptime T: type, comptime next_field: anytype, comptim
 
         pub fn prepend(self: *Self, value: *T) void {
             if (self.head) |head| {
+                if (head == value) return;
                 @field(head, prev) = value;
             } else {
                 self.tail = value;
@@ -57,6 +59,7 @@ pub fn DoublyLinkedDeque(comptime T: type, comptime next_field: anytype, comptim
 
         pub fn append(self: *Self, value: *T) void {
             if (self.tail) |tail| {
+                if (tail == value) return;
                 @field(tail, next) = value;
             } else {
                 self.head = value;
@@ -89,6 +92,19 @@ pub fn DoublyLinkedDeque(comptime T: type, comptime next_field: anytype, comptim
             @field(head, next) = null;
             @field(head, prev) = null;
             return head;
+        }
+
+        pub fn pop(self: *Self) ?*T {
+            const tail = self.tail orelse return null;
+            if (@field(tail, prev)) |prev_value| {
+                @field(prev_value, next) = null;
+            } else {
+                self.head = null;
+            }
+            self.tail = @field(tail, prev);
+            @field(tail, next) = null;
+            @field(tail, prev) = null;
+            return tail;
         }
 
         pub fn remove(self: *Self, value: *T) bool {
@@ -134,13 +150,18 @@ pub fn SinglyLinkedDeque(comptime T: type, comptime next_field: meta.FieldEnum(T
         }
 
         pub fn prepend(self: *Self, value: *T) void {
-            if (self.head == null) self.tail = value;
-            @field(value, next_field_nnextame) = self.head;
+            if (self.head) |head| {
+                if (head == value) return;
+            } else {
+                self.tail = value;
+            }
+            @field(value, next_field) = self.head;
             self.head = value;
         }
 
         pub fn append(self: *Self, value: *T) void {
             if (self.tail) |tail| {
+                if (tail == value) return;
                 @field(tail, next) = value;
             } else {
                 self.head = value;
