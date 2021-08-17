@@ -17,6 +17,7 @@ const time = std.time;
 const testing = std.testing;
 
 const IPv4 = std.x.os.IPv4;
+const IPv6 = std.x.os.IPv6;
 const Context = runtime.Context;
 const Atomic = std.atomic.Atomic;
 const Blake3 = std.crypto.hash.Blake3;
@@ -208,6 +209,59 @@ pub fn sendTestCommand(ctx: *Context, node: *Node, client_address: ip.Address) !
 
     try writer.writeAll("hello world");
 }
+
+pub const ID = struct {
+    pub const header_size = @sizeOf([32]u8);
+
+    public_key: [32]u8,
+    address: ip.Address,
+
+    pub fn size(self: ID) usize {
+        return ID.header_size + @sizeOf(u8) + switch (self.address) {
+            .ipv4 => @sizeOf([4]u8),
+            .ipv6 => @sizeOf([16]u8) + @sizeOf(u32),
+        } + @sizeOf(u16);
+    }
+
+    pub fn write(self: ID, writer: anytype) !void {
+        try writer.writeAll(&self.public_key);
+        try writer.writeByte(@enumToInt(self.address));
+        switch (self.address) {
+            .ipv4 => |info| {
+                try writer.writeAll(&info.host.octets);
+                try writer.writeIntLittle(u16, info.port);
+            },
+            .ipv6 => |info| {
+                try writer.writeAll(&info.host.octets);
+                try writer.writeIntLittle(u32, info.host.scope_id);
+                try writer.writeIntLittle(u16, info.port);
+            },
+        }
+    }
+
+    pub fn read(reader: anytype) !ID {
+        var id: ID = undefined;
+        id.public_key = try reader.readBytesNoEof(32);
+
+        switch (try meta.intToEnum(meta.Tag(ip.Address), try reader.readByte())) {
+            .ipv4 => {
+                const host = IPv4{ .octets = try reader.readBytesNoEof(4) };
+                const port = try reader.readIntLittle(u16);
+                id.address = ip.Address.initIPv4(host, port);
+            },
+            .ipv6 => {
+                const host = IPv6{
+                    .octets = try reader.readBytesNoEof(16),
+                    .scope_id = try reader.readIntLittle(u32),
+                };
+                const port = try reader.readIntLittle(u16);
+                id.address = ip.Address.initIPv6(host, port);
+            },
+        }
+
+        return id;
+    }
+};
 
 pub const Block = struct {
     pub const header_size = @sizeOf(u64) + @sizeOf([32]u8) + @sizeOf(u16);
@@ -414,6 +468,48 @@ pub const Transaction = struct {
         return tx;
     }
 };
+
+test "id: serialize and deserialize" {
+    var seed: usize = 0;
+    while (seed < 128) : (seed += 1) {
+        var rng = std.rand.DefaultPrng.init(seed);
+
+        var public_key: [32]u8 = undefined;
+        rng.random.bytes(&public_key);
+
+        const address = address: {
+            switch (rng.random.boolean()) {
+                true => {
+                    var host_octets: [4]u8 = undefined;
+                    rng.random.bytes(&host_octets);
+
+                    const host = IPv4{ .octets = host_octets };
+                    const port = rng.random.int(u16);
+                    break :address ip.Address.initIPv4(host, port);
+                },
+                false => {
+                    var host_octets: [16]u8 = undefined;
+                    rng.random.bytes(&host_octets);
+
+                    const host = IPv6{ .octets = host_octets, .scope_id = rng.random.int(u32) };
+                    const port = rng.random.int(u16);
+                    break :address ip.Address.initIPv6(host, port);
+                },
+            }
+        };
+
+        const expected: ID = .{ .public_key = public_key, .address = address };
+
+        var data = std.ArrayList(u8).init(testing.allocator);
+        defer data.deinit();
+
+        try expected.write(data.writer());
+
+        const actual = try ID.read(io.fixedBufferStream(data.items).reader());
+
+        try testing.expectEqual(expected, actual);
+    }
+}
 
 test "block: create, serialize, and deserialize" {
     const expected = try Block.create(testing.allocator, .{
