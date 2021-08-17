@@ -36,7 +36,7 @@ pub fn main() !void {
     defer runtime.deinit();
 
     var frame = async run();
-    defer nosuspend await frame catch |err| log.crit("{}", .{err});
+    defer nosuspend await frame catch |err| log.warn("{}", .{err});
 
     try runtime.run();
 }
@@ -92,21 +92,14 @@ pub fn run() !void {
     var server_frame = async server.serve(&ctx, runtime.getAllocator(), listener);
     defer await server_frame catch |err| log.warn("server error: {}", .{err});
 
-    const client_address = ip.Address.initIPv4(IPv4.localhost, 9000);
+    var stats_frame = async reportStatistics(&ctx);
+    defer await stats_frame catch |err| log.warn("stats error: {}", .{err});
 
-    var benchmark_frame = async reportBenchmarkStats(&ctx);
-    defer await benchmark_frame catch |err| log.warn("benchmark stats error: {}", .{err});
-
-    var frames = try runtime.getAllocator().alloc(@Frame(runBenchmark), 4);
-    defer runtime.getAllocator().free(frames);
-
-    var frame_index: usize = 0;
-    defer for (frames[0..frame_index]) |*frame| {
-        await frame catch |err| log.warn("benchmark error: {}", .{err});
-    };
-
-    while (frame_index < frames.len) : (frame_index += 1) {
-        frames[frame_index] = async runBenchmark(&ctx, &node, client_address);
+    {
+        // TODO: remove this when peer bootstrapping is implemented
+        const client_address = ip.Address.initIPv4(IPv4.localhost, 9000);
+        const client = try node.getOrCreateClient(&ctx, runtime.getAllocator(), client_address);
+        try client.ensureConnectionAvailable(&ctx, runtime.getAllocator());
     }
 
     runtime.waitForSignal(&ctx, .{os.SIGINT}) catch {};
@@ -115,101 +108,22 @@ pub fn run() !void {
     ctx.cancel();
 }
 
-var benchmark_count: Atomic(u64) = .{ .value = 0 };
+var finalized_count: Atomic(u64) = .{ .value = 0 };
 var pusher_count: Atomic(u64) = .{ .value = 0 };
 var pusher_bytes: Atomic(u64) = .{ .value = 0 };
 
-pub fn reportBenchmarkStats(ctx: *Context) !void {
-    const log = std.log.scoped(.benchmark);
+pub fn reportStatistics(ctx: *Context) !void {
+    const log = std.log.scoped(.stats);
 
     while (true) {
         try runtime.timeout(ctx, .{ .nanoseconds = 1 * time.ns_per_s });
 
-        log.info("created(tx): {}, pushed(tx): {}, pushed(bytes(tx)): {}", .{
-            benchmark_count.swap(0, .Monotonic),
+        log.info("finalized(tx): {}, pushed(tx): {}, pushed(bytes(tx)): {}", .{
+            finalized_count.swap(0, .Monotonic),
             pusher_count.swap(0, .Monotonic),
             fmt.fmtIntSizeBin(pusher_bytes.swap(0, .Monotonic)),
         });
     }
-}
-
-pub fn runBenchmark(ctx: *Context, node: *Node, client_address: ip.Address) !void {
-    while (true) {
-        const nonce = benchmark_count.fetchAdd(1, .Monotonic);
-        const created_at = if (node.chain.blocks.latest()) |latest_block| latest_block.height else 0;
-
-        const tx = try tx: {
-            runtime.startCpuBoundOperation();
-            defer runtime.endCpuBoundOperation();
-
-            break :tx Transaction.create(runtime.getAllocator(), node.keys, .{
-                .sender_nonce = nonce,
-                .created_at = created_at,
-                .tag = .no_op,
-                .data = "hello world",
-            });
-        };
-        defer tx.deinit(runtime.getAllocator());
-
-        try await async sendTransactions(ctx, node, client_address, &[_]*Transaction{tx});
-    }
-}
-
-pub fn sendTransactions(ctx: *Context, node: *Node, client_address: ip.Address, transactions: []const *Transaction) !void {
-    var len: u32 = 0;
-    for (transactions) |tx| {
-        len += tx.size();
-    }
-
-    const writer = try node.acquireWriter(ctx, runtime.getAllocator(), client_address);
-    defer node.releaseWriter(client_address, writer);
-
-    try (net.Packet{
-        .len = len,
-        .nonce = 0,
-        .op = .command,
-        .tag = .push_transaction,
-    }).write(writer);
-
-    for (transactions) |tx| {
-        try tx.write(writer);
-    }
-}
-
-pub fn sendTestRequest(ctx: *Context, node: *Node, client_address: ip.Address) !void {
-    var entry: RPC.Entry = .{};
-    var nonce = try client.rpc.register(ctx, &entry);
-
-    {
-        const writer = try node.acquireWriter(ctx, runtime.getAllocator(), client_address);
-        defer node.releaseWriter(client_address, writer);
-
-        try (net.Packet{
-            .len = "hello world".len,
-            .nonce = nonce,
-            .op = .request,
-            .tag = .ping,
-        }).write(writer);
-
-        try writer.writeAll("hello world");
-    }
-
-    const response = try await entry.response;
-    defer response.deinit(runtime.getAllocator());
-}
-
-pub fn sendTestCommand(ctx: *Context, node: *Node, client_address: ip.Address) !void {
-    const writer = try node.acquireWriter(ctx, runtime.getAllocator(), client_address);
-    defer node.releaseWriter(client_address, writer);
-
-    try (net.Packet{
-        .len = "hello world".len,
-        .nonce = 0,
-        .op = .command,
-        .tag = .ping,
-    }).write(writer);
-
-    try writer.writeAll("hello world");
 }
 
 pub const ID = struct {
@@ -584,7 +498,39 @@ pub const Node = struct {
     pusher: TransactionPusher,
     puller: TransactionPuller,
     verifier: TransactionVerifier,
-    clients: std.AutoHashMapUnmanaged(ip.Address, *net.Client),
+    clients: std.HashMapUnmanaged(ip.Address, *net.Client, struct {
+        pub fn hash(_: @This(), address: ip.Address) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            switch (address) {
+                .ipv4 => |ipv4| {
+                    hasher.update(&ipv4.host.octets);
+                    hasher.update(mem.asBytes(&ipv4.port));
+                },
+                .ipv6 => |ipv6| {
+                    hasher.update(&ipv6.host.octets);
+                    hasher.update(mem.asBytes(&ipv6.host.scope_id));
+                    hasher.update(mem.asBytes(&ipv6.port));
+                },
+            }
+            return hasher.final();
+        }
+
+        pub fn eql(_: @This(), a: ip.Address, b: ip.Address) bool {
+            switch (a) {
+                .ipv4 => {
+                    if (b != .ipv4) return false;
+                    if (a.ipv4.port != b.ipv4.port) return false;
+                    if (!a.ipv4.host.eql(b.ipv4.host)) return false;
+                },
+                .ipv6 => {
+                    if (b != .ipv6) return false;
+                    if (a.ipv6.port != b.ipv6.port) return false;
+                    if (!a.ipv6.host.eql(b.ipv6.host)) return false;
+                },
+            }
+            return true;
+        }
+    }, std.hash_map.default_max_load_percentage),
     closed: bool = false,
 
     pub fn init(self: *Node, gpa: *mem.Allocator, keys: Ed25519.KeyPair, address: ip.Address) !void {
@@ -639,7 +585,7 @@ pub const Node = struct {
             errdefer gpa.destroy(result.value_ptr.*);
 
             result.value_ptr.*.* = try net.Client.init(gpa, address);
-            errdefer result.value_ptr.*.deinit(gpa, ctx);
+            errdefer result.value_ptr.*.deinit(gpa, ctx) catch {};
 
             try result.value_ptr.*.ensureConnectionAvailable(ctx, gpa);
 
@@ -969,7 +915,10 @@ pub const Chain = struct {
 
             // sample block proposals proposals and tally them
 
-            try self.pullBlockProposals(ctx, gpa, node, &block_proposals, preferred_block.height);
+            self.pullBlockProposals(ctx, gpa, node, &block_proposals, preferred_block.height) catch |err| switch (err) {
+                error.NoPeersAvailable => continue,
+                else => return err,
+            };
 
             // tally our own preferred block proposal
 
@@ -1013,6 +962,8 @@ pub const Chain = struct {
             if (self.blocks.push(finalized_block.ref())) |evicted_block| {
                 evicted_block.deinit(gpa);
             }
+
+            _ = finalized_count.fetchAdd(finalized_block.num_transaction_ids, .Monotonic);
 
             // log.info("finalized block {} (height {}, {} transaction(s))", .{
             //     fmt.fmtSliceHexLower(&finalized_block.id),
@@ -1074,7 +1025,7 @@ pub const Chain = struct {
         if (node.clients.count() == 0) {
             try runtime.timeout(ctx, .{ .nanoseconds = self.connected_delay });
             self.connected_delay = math.min(connected_delay_max, self.connected_delay + (connected_delay_max - connected_delay_min) / 10);
-            return;
+            return error.NoPeersAvailable;
         }
 
         self.connected_delay = connected_delay_min;
@@ -1377,10 +1328,12 @@ pub const TransactionPusher = struct {
             switch (a.address) {
                 .ipv4 => {
                     if (b.address != .ipv4) return false;
+                    if (a.address.ipv4.port != b.address.ipv4.port) return false;
                     if (!a.address.ipv4.host.eql(b.address.ipv4.host)) return false;
                 },
                 .ipv6 => {
                     if (b.address != .ipv6) return false;
+                    if (a.address.ipv6.port != b.address.ipv6.port) return false;
                     if (!a.address.ipv6.host.eql(b.address.ipv6.host)) return false;
                 },
             }
@@ -1517,9 +1470,8 @@ pub const TransactionPusher = struct {
                     .transaction_id = tx.id,
                 };
 
-                switch (self.cache.update(entry, {})) {
-                    .inserted, .evicted => {},
-                    .updated => continue,
+                if (self.cache.update(entry, {}) == .updated) {
+                    continue;
                 }
 
                 try filtered_transactions.append(gpa, tx);
@@ -1549,9 +1501,6 @@ pub const TransactionPusher = struct {
         wg.add(1);
         defer wg.sub(1);
 
-        _ = pusher_count.fetchAdd(transactions.len, .Monotonic);
-        _ = pusher_bytes.fetchAdd(transactions_len, .Monotonic);
-
         defer gpa.free(transactions);
 
         const writer = try self.node.acquireWriter(ctx, gpa, address);
@@ -1564,8 +1513,17 @@ pub const TransactionPusher = struct {
             .tag = .push_transaction,
         }).write(writer);
 
-        for (transactions) |tx| {
-            try tx.write(writer);
+        var transaction_bytes: usize = 0;
+        var transaction_index: usize = 0;
+        defer {
+            _ = pusher_bytes.fetchAdd(transaction_bytes, .Monotonic);
+            _ = pusher_count.fetchAdd(transaction_index, .Monotonic);
+        }
+
+        while (transaction_index < transactions.len) {
+            try transactions[transaction_index].write(writer);
+            transaction_bytes += transactions[transaction_index].size();
+            transaction_index += 1;
         }
     }
 };

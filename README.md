@@ -18,7 +18,8 @@ A blockchain written in [Zig](https://ziglang.org).
 
 ### database
 - sstables for on-disk storage format
-- memtable for keeping track of pending transactions (skiplist? rb-tree? b-tree? rax? trie?)
+- memtable for keeping track of blockchain state (robin hood hash table?)
+- robin-hood hash tables for keeping track of pending transactions
 - chain state represented as a sparse merkle trie of key-value pairs (akin to ethereum)
   - what's the most efficient way to maintain a sparse merkle trie over a sorted list of key-value pairs?
 - upon finality of a block, flush all state changes and finalized transactions to sstable
@@ -36,8 +37,16 @@ A blockchain written in [Zig](https://ziglang.org).
 
 ## getting started
 
+Run a node on port 9000:
+
 ```
-$ zig run main.zig --name rheia -lc
+$ zig run main.zig --name rheia -lc -O ReleaseFast
+```
+
+Run the benchmark tool to create, sign, and send transactions to 127.0.0.1:9000:
+
+```
+$ zig run bench.zig --name rheia_bench -lc -O ReleaseFast
 ```
 
 ## research

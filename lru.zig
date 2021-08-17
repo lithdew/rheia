@@ -446,6 +446,7 @@ pub fn IntrusiveHashMap(
                     }
                     mem.swap(Entry, &it, &self.entries[i]);
                 } else if (ctx.eql(self.entries[i].key, key)) {
+                    assert(inserted_at == null);
                     return .{
                         .entry = &self.entries[i],
                         .found_existing = true,
@@ -770,8 +771,6 @@ test "lru.IntrusiveHashMap: eviction on insert" {
     while (i < 4) : (i += 1) {
         try testing.expectEqual(Cache.UpdateResult.inserted, map.update(i, i));
     }
-
-    for (map.slice()) |*entry| std.debug.print("{}\n", .{entry});
 
     while (i < 8) : (i += 1) {
         const evicted = map.update(i, i).evicted;
