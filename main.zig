@@ -132,6 +132,22 @@ pub const ID = struct {
     public_key: [32]u8,
     address: ip.Address,
 
+    pub fn eql(self: ID, other: ID) bool {
+        switch (self.address) {
+            .ipv4 => {
+                if (other.address != .ipv4) return false;
+                if (self.address.ipv4.port != other.address.ipv4.port) return false;
+                if (!self.address.ipv4.host.eql(other.address.ipv4.host)) return false;
+            },
+            .ipv6 => {
+                if (other.address != .ipv6) return false;
+                if (self.address.ipv6.port != other.address.ipv6.port) return false;
+                if (!self.address.ipv6.host.eql(other.address.ipv6.host)) return false;
+            },
+        }
+        return mem.eql(u8, &self.public_key, &other.public_key);
+    }
+
     pub fn size(self: ID) u32 {
         return ID.header_size + @sizeOf(u8) + @as(u32, switch (self.address) {
             .ipv4 => @sizeOf([4]u8),
@@ -531,6 +547,7 @@ pub const Node = struct {
             return true;
         }
     }, std.hash_map.default_max_load_percentage),
+    table: RoutingTable,
     closed: bool = false,
 
     pub fn init(self: *Node, gpa: *mem.Allocator, keys: Ed25519.KeyPair, address: ip.Address) !void {
@@ -545,6 +562,7 @@ pub const Node = struct {
         self.verifier = TransactionVerifier.init(self);
 
         self.clients = .{};
+        self.table = .{ .public_key = keys.public_key };
     }
 
     pub fn deinit(self: *Node, ctx: *Context, gpa: *mem.Allocator) void {
@@ -612,7 +630,11 @@ pub const Node = struct {
             var body = io.fixedBufferStream(response.body);
 
             const peer_id = try ID.read(body.reader());
-            log.info("handshaked with {}", .{peer_id});
+            switch (self.table.put(peer_id)) {
+                .full => log.info("handshaked with {} (peer ignored)", .{peer_id}),
+                .updated => log.info("handshaked with {} (peer updated)", .{peer_id}),
+                .inserted => log.info("handshaked with {} (peer registered)", .{peer_id}),
+            }
         }
 
         return result.value_ptr.*;
@@ -682,7 +704,11 @@ pub const Node = struct {
                     },
                     .hello => {
                         const peer_id = try ID.read(frame.reader());
-                        log.info("incoming handshake from {}", .{peer_id});
+                        switch (self.table.put(peer_id)) {
+                            .full => log.info("incoming handshake from {} (peer ignored)", .{peer_id}),
+                            .updated => log.info("incoming handshake from {} (peer updated)", .{peer_id}),
+                            .inserted => log.info("incoming handshake from {} (peer registered)", .{peer_id}),
+                        }
 
                         try (net.Packet{
                             .len = self.id.size(),
@@ -832,7 +858,11 @@ pub const Chain = struct {
     pending: HashMap(*Transaction, 50),
     missing: lru.AutoIntrusiveHashMap([32]u8, u64, 50),
 
-    blocks: BlockRingBuffer = .{},
+    /// 'head' and 'tail' are set at 1 until genesis blocks are implemented. Genesis
+    /// blocks are blocks whose height is 0. Until they are implemented it is safe to
+    /// assume that the first block that is to be pushed into this ring buffer starts
+    /// at height 1.
+    blocks: RingBuffer(*Block, 32) = .{ .head = 1, .tail = 1 },
     block_proposal_cache: lru.AutoIntrusiveHashMap(ip.Address, *Block, 50),
 
     propose_delay: i64 = propose_delay_min,
@@ -877,7 +907,7 @@ pub const Chain = struct {
 
         self.missing.deinit(gpa);
 
-        while (self.blocks.pop()) |block| {
+        while (self.blocks.popOrNull()) |block| {
             block.deinit(gpa);
         }
 
@@ -959,7 +989,7 @@ pub const Chain = struct {
                 tx.deinit(gpa);
             }
 
-            if (self.blocks.push(finalized_block.ref())) |evicted_block| {
+            if (self.blocks.pushOrNull(finalized_block.ref())) |evicted_block| {
                 evicted_block.deinit(gpa);
             }
 
@@ -1071,7 +1101,9 @@ pub const Chain = struct {
         defer wg.sub(1);
 
         const client = try node.getOrCreateClient(ctx, gpa, address);
+
         const cached_block_proposal = if (self.block_proposal_cache.get(address)) |entry| entry.value.ref() else null;
+        defer if (cached_block_proposal) |block_proposal| block_proposal.deinit(gpa);
 
         var entry: net.Client.RPC.Entry = .{};
         var nonce = try client.rpc.register(ctx, &entry);
@@ -1112,7 +1144,7 @@ pub const Chain = struct {
             // been evicted by time we reach here, so an insertion may happen
             // yet again
 
-            switch (self.block_proposal_cache.update(address, block_proposal)) {
+            switch (self.block_proposal_cache.update(address, block_proposal.ref())) {
                 .inserted => {},
                 .updated => |old_block| old_block.deinit(gpa),
                 .evicted => |old_entry| old_entry.value.deinit(gpa),
@@ -1775,10 +1807,11 @@ pub const Sampler = struct {
             return null;
         }
 
-        // TODO: getEntry() can be added to allow for emplacement of value
+        const count_result = self.counts.getOrPutAssumeCapacity(majority_block.id);
+        if (!count_result.found_existing) count_result.value_ptr.* = 0;
+        count_result.value_ptr.* += 1;
 
-        const count = (self.counts.get(majority_block.id) orelse 0) + 1;
-        self.counts.putAssumeCapacity(majority_block.id, count);
+        const count = count_result.value_ptr.*;
 
         if (self.preferred) |preferred| {
             if (count > self.counts.get(preferred.id).?) {
@@ -1811,74 +1844,302 @@ pub const Sampler = struct {
     }
 };
 
-/// 'head' and 'tail' are set at 1 until genesis blocks are implemented. Genesis
-/// blocks are blocks whose height is 0. Until they are implemented it is safe to
-/// assume that the first block that is to be pushed into this ring buffer starts
-/// at height 1.
-pub const BlockRingBuffer = struct {
-    pub const capacity = 32;
+pub fn RingBuffer(comptime T: type, comptime capacity: usize) type {
+    assert(math.isPowerOfTwo(capacity));
 
-    comptime {
-        assert(math.isPowerOfTwo(capacity));
-    }
+    return struct {
+        const Self = @This();
 
-    const Self = @This();
+        head: u64 = 0,
+        tail: u64 = 0,
+        entries: [capacity]T = undefined,
 
-    head: u64 = 1,
-    tail: u64 = 1,
-    entries: [capacity]*Block = undefined,
+        /// This routine pushes an item, and optionally returns an evicted item should
+        /// the insertion of the provided item overflow the existing buffer.
+        pub fn pushOrNull(self: *Self, item: T) ?T {
+            const evicted = evicted: {
+                if (self.count() == capacity) {
+                    break :evicted self.pop();
+                }
+                break :evicted null;
+            };
 
-    /// This routine pushes a block, and optionally returns an evicted block should
-    /// the insertion of the provided block overflow the existing buffer.
-    ///
-    /// The block that is pushed in is assumed to have a height that is one larger
-    /// than the most recently buffered block.
-    pub fn push(self: *Self, item: *Block) ?*Block {
-        assert(item.height == self.head);
+            self.push(item);
 
-        const evicted = evicted: {
-            if (self.count() == capacity) {
-                const evicted = self.entries[self.tail & (capacity - 1)];
-                self.tail +%= 1;
-                break :evicted evicted;
+            return evicted;
+        }
+
+        pub fn push(self: *Self, item: T) void {
+            assert(self.count() < capacity);
+            self.entries[self.head & (capacity - 1)] = item;
+            self.head +%= 1;
+        }
+
+        pub fn prepend(self: *Self, item: T) void {
+            assert(self.count() < capacity);
+            self.entries[(self.tail -% 1) & (capacity - 1)] = item;
+            self.tail -%= 1;
+        }
+
+        /// This routine pops an item from the tail of the buffer and returns it provided
+        /// that the buffer is not empty.
+        ///
+        /// This routine is typically used in order to pop and de-initialize all items
+        /// stored in the buffer.
+        pub fn popOrNull(self: *Self) ?T {
+            if (self.count() == 0) return null;
+            return self.pop();
+        }
+
+        pub fn pop(self: *Self) T {
+            assert(self.count() > 0);
+            const evicted = self.entries[self.tail & (capacity - 1)];
+            self.tail +%= 1;
+            return evicted;
+        }
+
+        pub fn get(self: Self, i: u64) ?T {
+            if (i < self.tail or i >= self.head) return null;
+            return self.entries[i & (capacity - 1)];
+        }
+
+        pub fn count(self: Self) usize {
+            return self.head -% self.tail;
+        }
+
+        pub fn latest(self: Self) ?T {
+            if (self.count() == 0) return null;
+            return self.entries[(self.head -% 1) & (capacity - 1)];
+        }
+
+        pub fn oldest(self: *Self) ?T {
+            if (self.count() == 0) return null;
+            return self.entries[self.tail & (capacity - 1)];
+        }
+    };
+}
+
+pub const RoutingTable = struct {
+    pub const bucket_size = 16;
+
+    pub const Bucket = RingBuffer(ID, bucket_size);
+
+    public_key: [32]u8,
+    buckets: [256]Bucket = [_]Bucket{.{}} ** 256,
+    len: usize = 0,
+
+    fn clz(public_key: [32]u8) usize {
+        comptime var i = 0;
+        inline while (i < 32) : (i += 1) {
+            if (public_key[i] != 0) {
+                return i * 8 + @as(usize, @clz(u8, public_key[i]));
             }
-            break :evicted null;
-        };
-
-        self.entries[self.head & (capacity - 1)] = item;
-        self.head +%= 1;
-
-        return evicted;
+        }
+        return 256;
     }
 
-    /// This routine pops a block from the tail of the buffer and returns it provided
-    /// that the buffer is not empty.
-    ///
-    /// This routine is typically used in order to pop and de-initialize all blocks
-    /// stored in the buffer.
-    pub fn pop(self: *Self) ?*Block {
-        if (self.count() == 0) return null;
-        const evicted = self.entries[self.tail & (capacity - 1)];
-        self.tail +%= 1;
-        return evicted;
+    fn xor(a: [32]u8, b: [32]u8) [32]u8 {
+        return @as([32]u8, @as(meta.Vector(32, u8), a) ^ @as(meta.Vector(32, u8), b));
     }
 
-    pub fn get(self: Self, height: u64) ?*Block {
-        if (height < self.tail or height >= self.head) return null;
-        return self.entries[height & (capacity - 1)];
+    pub const PutResult = enum {
+        full,
+        updated,
+        inserted,
+    };
+
+    pub fn put(self: *RoutingTable, id: ID) PutResult {
+        if (mem.eql(u8, &self.public_key, &id.public_key)) {
+            return .full;
+        }
+
+        const bucket = &self.buckets[clz(xor(self.public_key, id.public_key))];
+
+        var i: usize = bucket.head;
+        var j: usize = bucket.head;
+        while (i != bucket.tail) : (i -%= 1) {
+            const it = bucket.entries[(i -% 1) & (bucket_size - 1)];
+            if (!it.eql(id)) {
+                bucket.entries[(j -% 1) & (bucket_size - 1)] = it;
+                j -%= 1;
+            }
+        }
+
+        if (i == j and bucket.count() == bucket_size) {
+            return .full;
+        }
+
+        bucket.entries[(j -% 1) & (bucket_size - 1)] = undefined;
+        bucket.tail = j;
+        bucket.push(id);
+
+        if (i != j) {
+            return .updated;
+        }
+
+        self.len += 1;
+        return .inserted;
     }
 
-    pub fn count(self: Self) usize {
-        return self.head -% self.tail;
+    pub fn delete(self: *RoutingTable, public_key: [32]u8) bool {
+        if (self.len == 0 or mem.eql(u8, &self.public_key, &public_key)) {
+            return false;
+        }
+
+        const bucket = &self.buckets[clz(xor(self.public_key, public_key))];
+
+        var i: usize = bucket.head;
+        var j: usize = bucket.head;
+        while (i != bucket.tail) : (i -%= 1) {
+            const it = bucket.entries[(i -% 1) & (bucket_size - 1)];
+            if (!mem.eql(u8, &it.public_key, &public_key)) {
+                bucket.entries[(j -% 1) & (bucket_size - 1)] = it;
+                j -%= 1;
+            }
+        }
+
+        if (i == j) {
+            return false;
+        }
+
+        bucket.entries[(j -% 1) & (bucket_size - 1)] = undefined;
+        bucket.tail = j;
+        self.len -= 1;
+        return true;
     }
 
-    pub fn latest(self: Self) ?*Block {
-        if (self.count() == 0) return null;
-        return self.entries[(self.head - 1) & (capacity - 1)];
+    pub fn closestTo(self: *const RoutingTable, dst: []ID, public_key: [32]u8) usize {
+        var count: usize = 0;
+
+        const bucket_index = clz(xor(self.public_key, public_key));
+        self.fillSort(dst, &count, public_key, bucket_index);
+
+        var index: usize = 1;
+        while (count < dst.len) : (index += 1) {
+            var stop = true;
+            if (bucket_index >= index) {
+                self.fillSort(dst, &count, public_key, bucket_index - index);
+                stop = false;
+            }
+            if (bucket_index + index < self.buckets.len) {
+                self.fillSort(dst, &count, public_key, bucket_index + index);
+                stop = false;
+            }
+            if (stop) {
+                break;
+            }
+        }
+
+        return count;
     }
 
-    pub fn oldest(self: *Self) ?*Block {
-        if (self.count() == 0) return null;
-        return self.entries[(self.tail - 1) & (capacity - 1)];
+    const BinarySearchResult = union(enum) {
+        found: usize,
+        not_found: usize,
+    };
+
+    fn binarySearch(self: *const RoutingTable, slice: []ID, public_key: [32]u8) BinarySearchResult {
+        var size: usize = slice.len;
+        var left: usize = 0;
+        var right: usize = slice.len;
+        while (left < right) {
+            const mid = left + size / 2;
+            switch (mem.order(
+                u8,
+                &xor(slice[mid].public_key, self.public_key),
+                &xor(public_key, self.public_key),
+            )) {
+                .lt => left = mid + 1,
+                .gt => right = mid,
+                .eq => return .{ .found = mid },
+            }
+            size = right - left;
+        }
+        return .{ .not_found = left };
+    }
+
+    fn fillSort(self: *const RoutingTable, dst: []ID, count: *usize, public_key: [32]u8, bucket_index: usize) void {
+        const bucket = &self.buckets[bucket_index];
+
+        var i: usize = bucket.head;
+        while (i != bucket.tail) : (i -%= 1) {
+            const it = bucket.entries[(i -% 1) & (bucket_size - 1)];
+            if (!mem.eql(u8, &it.public_key, &public_key)) {
+                const result = self.binarySearch(dst[0..count.*], it.public_key);
+                assert(result != .found);
+
+                const index = result.not_found;
+                if (count.* < dst.len) {
+                    count.* += 1;
+                } else if (index >= count.*) {
+                    continue;
+                }
+                var j: usize = count.* - 1;
+                while (j > index) : (j -= 1) {
+                    dst[j] = dst[j - 1];
+                }
+                dst[index] = it;
+            }
+        }
     }
 };
+
+test "RoutingTable" {
+    const public_key: [32]u8 = [_]u8{0xFF} ** 32;
+    const address = ip.Address.initIPv4(IPv4.unspecified, 9000);
+
+    var table: RoutingTable = .{ .public_key = public_key };
+
+    // put (free)
+
+    comptime var i: u8 = 1;
+    inline while (i <= 16) : (i += 1) {
+        try testing.expectEqual(RoutingTable.PutResult.inserted, table.put(ID{
+            .public_key = [_]u8{ 0, i } ++ [_]u8{0} ** 30,
+            .address = address,
+        }));
+    }
+
+    try testing.expectEqual([_]u8{ 0, 01 } ++ [_]u8{0} ** 30, table.buckets[0].oldest().?.public_key);
+    try testing.expectEqual([_]u8{ 0, 16 } ++ [_]u8{0} ** 30, table.buckets[0].latest().?.public_key);
+    try testing.expectEqual(@as(usize, 16), table.len);
+
+    // put (full)
+
+    try testing.expectEqual(RoutingTable.PutResult.full, table.put(ID{
+        .public_key = [_]u8{ 0, 17 } ++ [_]u8{0} ** 30,
+        .address = address,
+    }));
+    try testing.expectEqual(@as(usize, 16), table.len);
+
+    // put (update)
+
+    try testing.expectEqual(RoutingTable.PutResult.updated, table.put(ID{
+        .public_key = [_]u8{ 0, 01 } ++ [_]u8{0} ** 30,
+        .address = address,
+    }));
+    try testing.expectEqual([_]u8{ 0, 02 } ++ [_]u8{0} ** 30, table.buckets[0].oldest().?.public_key);
+    try testing.expectEqual([_]u8{ 0, 01 } ++ [_]u8{0} ** 30, table.buckets[0].latest().?.public_key);
+    try testing.expectEqual(@as(usize, 16), table.len);
+
+    // closest to
+
+    var ids: [15]ID = undefined;
+    try testing.expectEqual(@as(usize, 15), table.closestTo(&ids, [_]u8{ 0, 1 } ++ [_]u8{0} ** 30));
+
+    comptime var j: u8 = 0;
+    inline while (j < 15) : (j += 1) {
+        try testing.expectEqual(16 - j, ids[j].public_key[1]);
+    }
+
+    // delete
+
+    comptime var k: u8 = 1;
+    inline while (k <= 16) : (k += 1) {
+        try testing.expect(table.delete([_]u8{ 0, k } ++ [_]u8{0} ** 30));
+    }
+
+    try testing.expectEqual(@as(?ID, null), table.buckets[0].latest());
+    try testing.expectEqual(@as(?ID, null), table.buckets[0].oldest());
+    try testing.expectEqual(@as(usize, 0), table.len);
+}
