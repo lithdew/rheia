@@ -1,9 +1,11 @@
 const std = @import("std");
 const net = @import("net.zig");
 const lru = @import("lru.zig");
+const args = @import("args.zig");
 const sync = @import("sync.zig");
 const crypto = @import("crypto.zig");
 const runtime = @import("runtime.zig");
+const kademlia = @import("kademlia.zig");
 
 const io = std.io;
 const os = std.os;
@@ -22,12 +24,133 @@ const Context = runtime.Context;
 const Atomic = std.atomic.Atomic;
 const Blake3 = std.crypto.hash.Blake3;
 const Ed25519 = std.crypto.sign.Ed25519;
-const HashMap = @import("hash_map.zig").HashMap;
-const SinglyLinkedList = @import("intrusive.zig").SinglyLinkedList;
+const SortedHashMap = @import("hash_map.zig").SortedHashMap;
+const StaticRingBuffer = @import("ring_buffer.zig").StaticRingBuffer;
 
 const assert = std.debug.assert;
 
 pub const log_level = .debug;
+
+const usage = fmt.comptimePrint(
+    \\rheia
+    \\
+    \\Usage:
+    \\  rheia [options] [--] ([<host>][:]<port>)...
+    \\  rheia -h | --help
+    \\  rheia --version
+    \\
+    \\Arguments:
+    \\  ([<host>][:]<port>...)                    List of peer addresses to bootstrap with.
+    \\
+    \\Options:
+    \\  -h, --help                                Show this screen.
+    \\  -v, --version                             Show version.
+    \\  -l, --listen-address ([<host>][:]<port>)  Address to listen for peers on. [default: 127.0.0.1:9000]
+    \\  -b, --http-address ([<host>][:]<port>)    Address to handle HTTP requests on. [default: 127.0.0.1:8080]
+    \\
+    \\To spawn and bootstrap a three-node Rheia cluster:
+    \\  rheia -l 9000
+    \\  rheia -l 9001 127.0.0.1:9000
+    \\  rheia -l 9002 127.0.0.1:9000
+, .{});
+
+pub const Arguments = struct {
+    @"listen-address": []const u8 = "127.0.0.1:9000",
+    @"http-address": []const u8 = "127.0.0.1:8080",
+    help: bool = false,
+    version: bool = false,
+
+    pub const shorthands = .{
+        .l = "listen-address",
+        .b = "http-address",
+        .v = "version",
+        .h = "help",
+    };
+
+    pub fn parse(gpa: *mem.Allocator) !args.ParseArgsResult(Arguments) {
+        return args.parseForCurrentProcess(Arguments, gpa, .print);
+    }
+};
+
+pub const Options = struct {
+    listen_address: ip.Address,
+    http_address: ip.Address,
+    bootstrap_addresses: []const ip.Address,
+
+    pub fn parse(gpa: *mem.Allocator) !Options {
+        errdefer os.exit(0);
+
+        const arguments = try Arguments.parse(gpa);
+        defer arguments.deinit();
+
+        if (arguments.options.help) {
+            std.debug.print("{s}\n", .{usage});
+            return error.Cancelled;
+        }
+
+        if (arguments.options.version) {
+            std.debug.print("rheia v0.0.1", .{});
+            return error.Cancelled;
+        }
+
+        var listen_address = try net.parseIpAddress(arguments.options.@"listen-address");
+        switch (listen_address) {
+            .ipv4 => |*ipv4| {
+                if (ipv4.host.isUnspecified()) {
+                    ipv4.host = IPv4.localhost;
+                }
+            },
+            .ipv6 => |*ipv6| {
+                if (ipv6.host.isUnspecified()) {
+                    ipv6.host = IPv6.localhost;
+                }
+            },
+        }
+
+        var http_address = try net.parseIpAddress(arguments.options.@"http-address");
+        switch (http_address) {
+            .ipv4 => |*ipv4| {
+                if (ipv4.host.isUnspecified()) {
+                    ipv4.host = IPv4.localhost;
+                }
+            },
+            .ipv6 => |*ipv6| {
+                if (ipv6.host.isUnspecified()) {
+                    ipv6.host = IPv6.localhost;
+                }
+            },
+        }
+
+        const bootstrap_addresses = try gpa.alloc(ip.Address, arguments.positionals.len);
+        errdefer gpa.free(bootstrap_addresses);
+
+        for (arguments.positionals) |arg, i| {
+            bootstrap_addresses[i] = try net.parseIpAddress(arg);
+            switch (bootstrap_addresses[i]) {
+                .ipv4 => |*ipv4| {
+                    if (ipv4.host.isUnspecified()) {
+                        ipv4.host = IPv4.localhost;
+                    }
+                },
+                .ipv6 => |*ipv6| {
+                    if (ipv6.host.isUnspecified()) {
+                        ipv6.host = IPv6.localhost;
+                    }
+                },
+            }
+        }
+
+        return Options{
+            .listen_address = listen_address,
+            .http_address = http_address,
+            .bootstrap_addresses = bootstrap_addresses,
+        };
+    }
+
+    pub fn deinit(self: Options, gpa: *mem.Allocator) void {
+        gpa.free(self.bootstrap_addresses);
+    }
+};
 
 pub fn main() !void {
     const log = std.log.scoped(.main);
@@ -46,6 +169,9 @@ pub fn run() !void {
 
     defer runtime.shutdown();
 
+    const options = try Options.parse(runtime.getAllocator());
+    defer options.deinit(runtime.getAllocator());
+
     log.info("press ctrl+c to commence graceful shutdown", .{});
 
     var ctx: Context = .{};
@@ -58,7 +184,7 @@ pub fn run() !void {
     try listener.setReusePort(true);
     try listener.setFastOpen(true);
 
-    try listener.bind(ip.Address.initIPv4(IPv4.localhost, 9000));
+    try listener.bind(options.listen_address);
     try listener.listen(128);
 
     const keys = try Ed25519.KeyPair.create(null);
@@ -95,12 +221,24 @@ pub fn run() !void {
     var stats_frame = async reportStatistics(&ctx);
     defer await stats_frame catch |err| log.warn("stats error: {}", .{err});
 
-    {
-        // TODO: remove this when peer bootstrapping is implemented
-        const client_address = ip.Address.initIPv4(IPv4.localhost, 9000);
-        const client = try node.getOrCreateClient(&ctx, runtime.getAllocator(), client_address);
+    for (options.bootstrap_addresses) |bootstrap_address| {
+        const client = try node.getOrCreateClient(&ctx, runtime.getAllocator(), bootstrap_address);
         try client.ensureConnectionAvailable(&ctx, runtime.getAllocator());
     }
+
+    {
+        var finder = try kademlia.NodeFinder.init(runtime.getAllocator(), &node);
+        defer finder.deinit(&ctx, runtime.getAllocator());
+
+        var peer_ids: [16]kademlia.ID = undefined;
+        const num_peer_ids = try finder.find(&ctx, runtime.getAllocator(), &peer_ids, node.keys.public_key);
+
+        for (peer_ids[0..num_peer_ids]) |id| {
+            log.info("got peer id: {}", .{id});
+        }
+    }
+
+    log.info("total peers connected to: {}", .{node.table.len});
 
     runtime.waitForSignal(&ctx, .{os.SIGINT}) catch {};
     log.info("gracefully shutting down...", .{});
@@ -126,84 +264,9 @@ pub fn reportStatistics(ctx: *Context) !void {
     }
 }
 
-pub const ID = struct {
-    pub const header_size = @sizeOf([32]u8);
-
-    public_key: [32]u8,
-    address: ip.Address,
-
-    pub fn eql(self: ID, other: ID) bool {
-        switch (self.address) {
-            .ipv4 => {
-                if (other.address != .ipv4) return false;
-                if (self.address.ipv4.port != other.address.ipv4.port) return false;
-                if (!self.address.ipv4.host.eql(other.address.ipv4.host)) return false;
-            },
-            .ipv6 => {
-                if (other.address != .ipv6) return false;
-                if (self.address.ipv6.port != other.address.ipv6.port) return false;
-                if (!self.address.ipv6.host.eql(other.address.ipv6.host)) return false;
-            },
-        }
-        return mem.eql(u8, &self.public_key, &other.public_key);
-    }
-
-    pub fn size(self: ID) u32 {
-        return ID.header_size + @sizeOf(u8) + @as(u32, switch (self.address) {
-            .ipv4 => @sizeOf([4]u8),
-            .ipv6 => @sizeOf([16]u8) + @sizeOf(u32),
-        }) + @sizeOf(u16);
-    }
-
-    pub fn write(self: ID, writer: anytype) !void {
-        try writer.writeAll(&self.public_key);
-        try writer.writeByte(@enumToInt(self.address));
-        switch (self.address) {
-            .ipv4 => |info| {
-                try writer.writeAll(&info.host.octets);
-                try writer.writeIntLittle(u16, info.port);
-            },
-            .ipv6 => |info| {
-                try writer.writeAll(&info.host.octets);
-                try writer.writeIntLittle(u32, info.host.scope_id);
-                try writer.writeIntLittle(u16, info.port);
-            },
-        }
-    }
-
-    pub fn read(reader: anytype) !ID {
-        var id: ID = undefined;
-        id.public_key = try reader.readBytesNoEof(32);
-
-        switch (try meta.intToEnum(meta.Tag(ip.Address), try reader.readByte())) {
-            .ipv4 => {
-                const host = IPv4{ .octets = try reader.readBytesNoEof(4) };
-                const port = try reader.readIntLittle(u16);
-                id.address = ip.Address.initIPv4(host, port);
-            },
-            .ipv6 => {
-                const host = IPv6{
-                    .octets = try reader.readBytesNoEof(16),
-                    .scope_id = try reader.readIntLittle(u32),
-                };
-                const port = try reader.readIntLittle(u16);
-                id.address = ip.Address.initIPv6(host, port);
-            },
-        }
-
-        return id;
-    }
-
-    pub fn format(self: ID, comptime layout: []const u8, options: fmt.FormatOptions, writer: anytype) !void {
-        _ = layout;
-        _ = options;
-        try fmt.format(writer, "{}[{}]", .{ self.address, fmt.fmtSliceHexLower(&self.public_key) });
-    }
-};
-
 pub const Block = struct {
     pub const header_size = @sizeOf(u64) + @sizeOf([32]u8) + @sizeOf(u16);
-    pub const max_num_transaction_ids: u16 = math.maxInt(u16);
+    pub const max_num_transaction_ids: u16 = (net.Packet.max_size - net.Packet.size - Block.header_size) / @sizeOf([32]u8) / 2;
 
     pub const Params = struct {
         height: u64,
@@ -407,49 +470,7 @@ pub const Transaction = struct {
     }
 };
 
-test "id: serialize and deserialize" {
-    var seed: usize = 0;
-    while (seed < 128) : (seed += 1) {
-        var rng = std.rand.DefaultPrng.init(seed);
-
-        var public_key: [32]u8 = undefined;
-        rng.random.bytes(&public_key);
-
-        const address = address: {
-            switch (rng.random.boolean()) {
-                true => {
-                    var host_octets: [4]u8 = undefined;
-                    rng.random.bytes(&host_octets);
-
-                    const host = IPv4{ .octets = host_octets };
-                    const port = rng.random.int(u16);
-                    break :address ip.Address.initIPv4(host, port);
-                },
-                false => {
-                    var host_octets: [16]u8 = undefined;
-                    rng.random.bytes(&host_octets);
-
-                    const host = IPv6{ .octets = host_octets, .scope_id = rng.random.int(u32) };
-                    const port = rng.random.int(u16);
-                    break :address ip.Address.initIPv6(host, port);
-                },
-            }
-        };
-
-        const expected: ID = .{ .public_key = public_key, .address = address };
-
-        var data = std.ArrayList(u8).init(testing.allocator);
-        defer data.deinit();
-
-        try expected.write(data.writer());
-
-        const actual = try ID.read(io.fixedBufferStream(data.items).reader());
-
-        try testing.expectEqual(expected, actual);
-    }
-}
-
-test "block: create, serialize, and deserialize" {
+test "Block: create, serialize, and deserialize" {
     const expected = try Block.create(testing.allocator, .{
         .height = 123,
         .merkle_root = [_]u8{1} ** 32,
@@ -476,7 +497,7 @@ test "block: create, serialize, and deserialize" {
     );
 }
 
-test "transaction: create, serialize, and deserialize" {
+test "Transaction: create, serialize, and deserialize" {
     const keys = try Ed25519.KeyPair.create(null);
 
     const expected = try Transaction.create(testing.allocator, keys, .{
@@ -507,7 +528,7 @@ test "transaction: create, serialize, and deserialize" {
 pub const Node = struct {
     const log = std.log.scoped(.node);
 
-    id: ID,
+    id: kademlia.ID,
     keys: Ed25519.KeyPair,
 
     chain: Chain,
@@ -516,43 +537,19 @@ pub const Node = struct {
     verifier: TransactionVerifier,
     clients: std.HashMapUnmanaged(ip.Address, *net.Client, struct {
         pub fn hash(_: @This(), address: ip.Address) u64 {
-            var hasher = std.hash.Wyhash.init(0);
-            switch (address) {
-                .ipv4 => |ipv4| {
-                    hasher.update(&ipv4.host.octets);
-                    hasher.update(mem.asBytes(&ipv4.port));
-                },
-                .ipv6 => |ipv6| {
-                    hasher.update(&ipv6.host.octets);
-                    hasher.update(mem.asBytes(&ipv6.host.scope_id));
-                    hasher.update(mem.asBytes(&ipv6.port));
-                },
-            }
-            return hasher.final();
+            return net.hashIpAddress(address);
         }
 
         pub fn eql(_: @This(), a: ip.Address, b: ip.Address) bool {
-            switch (a) {
-                .ipv4 => {
-                    if (b != .ipv4) return false;
-                    if (a.ipv4.port != b.ipv4.port) return false;
-                    if (!a.ipv4.host.eql(b.ipv4.host)) return false;
-                },
-                .ipv6 => {
-                    if (b != .ipv6) return false;
-                    if (a.ipv6.port != b.ipv6.port) return false;
-                    if (!a.ipv6.host.eql(b.ipv6.host)) return false;
-                },
-            }
-            return true;
+            return net.eqlIpAddress(a, b);
         }
     }, std.hash_map.default_max_load_percentage),
-    table: RoutingTable,
+    table: kademlia.RoutingTable,
     closed: bool = false,
 
     pub fn init(self: *Node, gpa: *mem.Allocator, keys: Ed25519.KeyPair, address: ip.Address) !void {
         self.keys = keys;
-        self.id = ID{ .public_key = keys.public_key, .address = address };
+        self.id = .{ .public_key = keys.public_key, .address = address };
 
         self.chain = try Chain.init(gpa);
         errdefer self.chain.deinit(gpa);
@@ -605,6 +602,8 @@ pub const Node = struct {
             result.value_ptr.*.* = try net.Client.init(gpa, address);
             errdefer result.value_ptr.*.deinit(gpa, ctx) catch {};
 
+            const signature = try crypto.sign(self.id, self.keys);
+
             try result.value_ptr.*.ensureConnectionAvailable(ctx, gpa);
 
             var entry: net.Client.RPC.Entry = .{};
@@ -615,13 +614,14 @@ pub const Node = struct {
                 defer result.value_ptr.*.releaseWriter(writer);
 
                 try (net.Packet{
-                    .len = self.id.size(),
+                    .len = self.id.size() + @sizeOf([64]u8),
                     .nonce = nonce,
                     .op = .request,
                     .tag = .hello,
                 }).write(writer);
 
                 try self.id.write(writer);
+                try writer.writeAll(&signature);
             }
 
             const response = try await entry.response;
@@ -629,7 +629,7 @@ pub const Node = struct {
 
             var body = io.fixedBufferStream(response.body);
 
-            const peer_id = try ID.read(body.reader());
+            const peer_id = try kademlia.ID.read(body.reader());
             switch (self.table.put(peer_id)) {
                 .full => log.info("handshaked with {} (peer ignored)", .{peer_id}),
                 .updated => log.info("handshaked with {} (peer updated)", .{peer_id}),
@@ -665,6 +665,10 @@ pub const Node = struct {
     }
 
     pub fn addTransaction(self: *Node, ctx: *Context, gpa: *mem.Allocator, tx: *Transaction) !void {
+        if (self.chain.finalized.get(tx.id) != null) {
+            return error.AlreadyExists;
+        }
+
         const result = self.chain.pending.getOrPutAssumeCapacity(tx.id);
         if (result.found_existing) {
             return error.AlreadyExists;
@@ -703,7 +707,10 @@ pub const Node = struct {
                         conn.writer_parker.notify({});
                     },
                     .hello => {
-                        const peer_id = try ID.read(frame.reader());
+                        const peer_id = try kademlia.ID.read(frame.reader());
+                        const signature = try frame.reader().readBytesNoEof(64);
+                        try crypto.verify(signature, peer_id, peer_id.public_key);
+
                         switch (self.table.put(peer_id)) {
                             .full => log.info("incoming handshake from {} (peer ignored)", .{peer_id}),
                             .updated => log.info("incoming handshake from {} (peer updated)", .{peer_id}),
@@ -718,6 +725,30 @@ pub const Node = struct {
                         }).write(conn.buffer.writer());
 
                         try self.id.write(conn.buffer.writer());
+
+                        conn.writer_parker.notify({});
+                    },
+                    .find_node => {
+                        const public_key = try frame.reader().readBytesNoEof(32);
+
+                        var ids: [16]kademlia.ID = undefined;
+                        const num_ids = self.table.closestTo(&ids, public_key);
+
+                        var len: u32 = 0;
+                        for (ids[0..num_ids]) |id| {
+                            len += id.size();
+                        }
+
+                        try (net.Packet{
+                            .len = len,
+                            .nonce = packet.nonce,
+                            .op = .response,
+                            .tag = .find_node,
+                        }).write(conn.buffer.writer());
+
+                        for (ids[0..num_ids]) |id| {
+                            try id.write(conn.buffer.writer());
+                        }
 
                         conn.writer_parker.notify({});
                     },
@@ -855,14 +886,15 @@ pub const Chain = struct {
     pub const connected_delay_max: i64 = 500 * time.ns_per_ms;
 
     sampler: Sampler,
-    pending: HashMap(*Transaction, 50),
+    pending: SortedHashMap(*Transaction, 50),
     missing: lru.AutoIntrusiveHashMap([32]u8, u64, 50),
+    finalized: lru.AutoIntrusiveHashMap([32]u8, void, 50),
 
     /// 'head' and 'tail' are set at 1 until genesis blocks are implemented. Genesis
     /// blocks are blocks whose height is 0. Until they are implemented it is safe to
     /// assume that the first block that is to be pushed into this ring buffer starts
     /// at height 1.
-    blocks: RingBuffer(*Block, 32) = .{ .head = 1, .tail = 1 },
+    blocks: StaticRingBuffer(*Block, u64, 32) = .{ .head = 1, .tail = 1 },
     block_proposal_cache: lru.AutoIntrusiveHashMap(ip.Address, *Block, 50),
 
     propose_delay: i64 = propose_delay_min,
@@ -872,11 +904,14 @@ pub const Chain = struct {
         var sampler = try Sampler.init(gpa);
         errdefer sampler.deinit(gpa);
 
-        var pending = try HashMap(*Transaction, 50).init(gpa);
+        var pending = try SortedHashMap(*Transaction, 50).init(gpa);
         errdefer pending.deinit(gpa);
 
-        var missing = try lru.AutoIntrusiveHashMap([32]u8, u64, 50).initCapacity(gpa, 1024);
+        var missing = try lru.AutoIntrusiveHashMap([32]u8, u64, 50).initCapacity(gpa, 1 << 16);
         errdefer missing.deinit(gpa);
+
+        var finalized = try lru.AutoIntrusiveHashMap([32]u8, void, 50).initCapacity(gpa, 1 << 20);
+        errdefer finalized.deinit(gpa);
 
         var block_proposal_cache = try lru.AutoIntrusiveHashMap(ip.Address, *Block, 50).initCapacity(gpa, 128);
         errdefer block_proposal_cache.deinit(gpa);
@@ -885,6 +920,7 @@ pub const Chain = struct {
             .sampler = sampler,
             .pending = pending,
             .missing = missing,
+            .finalized = finalized,
             .block_proposal_cache = block_proposal_cache,
         };
     }
@@ -907,6 +943,8 @@ pub const Chain = struct {
 
         self.missing.deinit(gpa);
 
+        self.finalized.deinit(gpa);
+
         while (self.blocks.popOrNull()) |block| {
             block.deinit(gpa);
         }
@@ -917,38 +955,69 @@ pub const Chain = struct {
     }
 
     pub fn run(self: *Chain, ctx: *Context, gpa: *mem.Allocator, node: *Node) !void {
+        // TODO: cleanup error handling in this function
+
         var transaction_ids: std.ArrayListUnmanaged([32]u8) = .{};
         defer transaction_ids.deinit(gpa);
 
         var block_proposals: BlockProposalMap = .{};
         defer block_proposals.deinit(gpa);
 
-        var votes: std.ArrayListUnmanaged(Sampler.Vote) = .{};
-        defer votes.deinit(gpa);
+        try transaction_ids.ensureTotalCapacity(gpa, Block.max_num_transaction_ids);
+        try block_proposals.ensureTotalCapacity(gpa, 32);
+
+        // TODO: randomly sample peer ids from routing table instead
+        var peer_ids: [16]kademlia.ID = undefined;
 
         while (true) {
+            const num_peers = node.table.closestTo(&peer_ids, node.id.public_key);
+            if (num_peers == 0) {
+                try runtime.timeout(ctx, .{ .nanoseconds = self.connected_delay });
+                self.connected_delay = math.min(connected_delay_max, self.connected_delay + (connected_delay_max - connected_delay_min) / 10);
+                continue;
+            }
+
+            self.connected_delay = connected_delay_min;
+
             const preferred_block = self.sampler.preferred orelse {
                 try self.proposeBlock(ctx, gpa, &transaction_ids);
                 continue;
             };
 
-            // ensure sufficient memory is available for tallying block proposals and for
-            // grouping block proposals together into votes
-
-            try votes.ensureTotalCapacity(gpa, node.clients.count() + 1);
-            try block_proposals.ensureTotalCapacity(gpa, node.clients.count() + 1);
-
-            defer {
-                block_proposals.clearRetainingCapacity();
-                votes.clearRetainingCapacity();
-            }
+            defer block_proposals.clearRetainingCapacity();
 
             // sample block proposals proposals and tally them
 
-            self.pullBlockProposals(ctx, gpa, node, &block_proposals, preferred_block.height) catch |err| switch (err) {
-                error.NoPeersAvailable => continue,
-                else => return err,
-            };
+            try self.pullBlockProposals(ctx, gpa, node, &block_proposals, peer_ids[0..num_peers], preferred_block.height);
+
+            // steal a valid block proposal to be our preferred block proposal if there are any valid ones that seem promising
+
+            var max_block_proposal: ?*Block = null;
+            var block_proposals_it = block_proposals.keyIterator();
+            while (block_proposals_it.next()) |block_ptr| {
+                const block: *Block = block_ptr.* orelse continue;
+                if (max_block_proposal == null or block.num_transaction_ids > max_block_proposal.?.num_transaction_ids) {
+                    max_block_proposal = block;
+                }
+            }
+
+            if (max_block_proposal) |block_proposal| {
+                if (!mem.eql(u8, &preferred_block.id, &block_proposal.id) and (self.sampler.stalled >= Sampler.default_beta or block_proposal.num_transaction_ids >= preferred_block.num_transaction_ids)) {
+                    log.debug("moved from block {} (height: {}, {} transaction(s)) to block {} (height: {}, {} transaction(s))", .{
+                        fmt.fmtSliceHexLower(&preferred_block.id),
+                        preferred_block.height,
+                        preferred_block.num_transaction_ids,
+                        fmt.fmtSliceHexLower(&block_proposal.id),
+                        block_proposal.height,
+                        block_proposal.num_transaction_ids,
+                    });
+
+                    self.sampler.reset(gpa);
+                    self.sampler.prefer(gpa, block_proposal.ref());
+
+                    continue;
+                }
+            }
 
             // tally our own preferred block proposal
 
@@ -960,11 +1029,14 @@ pub const Chain = struct {
 
             // group block proposal tallies together by block id
 
+            var votes: [16]Sampler.Vote = undefined;
+            var num_votes: usize = 0;
+
             var blocks_it = block_proposals.iterator();
-            while (blocks_it.next()) |entry| {
+            while (blocks_it.next()) |entry| : (num_votes += 1) {
                 const count = @intToFloat(f64, entry.value_ptr.*);
-                const total = @intToFloat(f64, node.clients.count() + 1);
-                votes.appendAssumeCapacity(.{ .block = entry.key_ptr.*, .tally = @divTrunc(count, total) });
+                const total = @intToFloat(f64, num_peers + 1);
+                votes[num_votes] = .{ .block = entry.key_ptr.*, .tally = count / total };
             }
 
             // update the block sampler
@@ -973,7 +1045,7 @@ pub const Chain = struct {
             // the block by their id to have been finalized, store the block on-disk, and reset the
             // block sampler
 
-            const finalized_block = (try self.sampler.update(gpa, votes.items)) orelse continue;
+            const finalized_block = (try self.sampler.update(gpa, &votes)) orelse continue;
             defer {
                 var it = self.block_proposal_cache.head;
                 while (it) |entry| : (it = entry.next) {
@@ -985,6 +1057,7 @@ pub const Chain = struct {
             }
 
             for (finalized_block.transaction_ids[0..finalized_block.num_transaction_ids]) |tx_id| {
+                _ = node.chain.finalized.update(tx_id, {});
                 const tx = self.pending.delete(tx_id) orelse unreachable;
                 tx.deinit(gpa);
             }
@@ -995,11 +1068,22 @@ pub const Chain = struct {
 
             _ = finalized_count.fetchAdd(finalized_block.num_transaction_ids, .Monotonic);
 
-            // log.info("finalized block {} (height {}, {} transaction(s))", .{
-            //     fmt.fmtSliceHexLower(&finalized_block.id),
-            //     finalized_block.height,
-            //     finalized_block.num_transaction_ids,
-            // });
+            // var debug_it = block_proposals.iterator();
+            // while (debug_it.next()) |entry| {
+            //     log.debug("block proposal {}: {}", .{
+            //         fmt.fmtSliceHexLower(if (entry.key_ptr.*) |block| &block.id else &([_]u8{0} ** 32)),
+            //         entry.value_ptr.*,
+            //     });
+            // }
+            // for (votes[0..num_votes]) |vote, i| {
+            //     log.debug("vote {}: {}", .{ i, vote });
+            // }
+
+            log.info("finalized block {} (height {}, {} transaction(s))", .{
+                fmt.fmtSliceHexLower(&finalized_block.id),
+                finalized_block.height,
+                finalized_block.num_transaction_ids,
+            });
         }
     }
 
@@ -1017,7 +1101,6 @@ pub const Chain = struct {
 
         self.propose_delay = propose_delay_min;
 
-        try transaction_ids.ensureTotalCapacity(gpa, math.min(Block.max_num_transaction_ids, self.pending.len));
         defer transaction_ids.clearRetainingCapacity();
 
         for (self.pending.slice()) |entry| {
@@ -1037,11 +1120,11 @@ pub const Chain = struct {
 
         self.sampler.prefer(gpa, block);
 
-        // log.debug("proposed block {} (height {}, {} transaction(s))", .{
-        //     fmt.fmtSliceHexLower(&block.id),
-        //     block.height,
-        //     block.num_transaction_ids,
-        // });
+        log.debug("proposed block {} (height {}, {} transaction(s))", .{
+            fmt.fmtSliceHexLower(&block.id),
+            block.height,
+            block.num_transaction_ids,
+        });
     }
 
     fn pullBlockProposals(
@@ -1050,17 +1133,10 @@ pub const Chain = struct {
         gpa: *mem.Allocator,
         node: *Node,
         block_proposals: *BlockProposalMap,
+        peer_ids: []const kademlia.ID,
         block_proposal_height: u64,
     ) !void {
-        if (node.clients.count() == 0) {
-            try runtime.timeout(ctx, .{ .nanoseconds = self.connected_delay });
-            self.connected_delay = math.min(connected_delay_max, self.connected_delay + (connected_delay_max - connected_delay_min) / 10);
-            return error.NoPeersAvailable;
-        }
-
-        self.connected_delay = connected_delay_min;
-
-        const frames = try gpa.alloc(@Frame(pullBlock), node.clients.count());
+        const frames = try gpa.alloc(@Frame(pullBlock), peer_ids.len);
         defer gpa.free(frames);
 
         var wg: sync.WaitGroup = .{};
@@ -1070,9 +1146,8 @@ pub const Chain = struct {
             _ = await frame catch continue;
         };
 
-        var client_it = node.clients.keyIterator();
-        while (client_it.next()) |address_ptr| : (frame_index += 1) {
-            frames[frame_index] = async self.pullBlock(ctx, gpa, &wg, node, address_ptr.*, block_proposal_height);
+        while (frame_index < peer_ids.len) : (frame_index += 1) {
+            frames[frame_index] = async self.pullBlock(ctx, gpa, &wg, node, peer_ids[frame_index].address, block_proposal_height);
         }
 
         try wg.wait(ctx);
@@ -1086,6 +1161,11 @@ pub const Chain = struct {
             }
             result.value_ptr.* += 1;
         }
+    }
+
+    fn debugTimeout(ctx: *Context, comptime layout: []const u8, client: *net.Client) void {
+        runtime.timeout(ctx, .{ .seconds = 3 }) catch return;
+        log.warn(layout, .{client.address});
     }
 
     fn pullBlock(
@@ -1107,6 +1187,13 @@ pub const Chain = struct {
 
         var entry: net.Client.RPC.Entry = .{};
         var nonce = try client.rpc.register(ctx, &entry);
+
+        var debug_ctx: Context = .{};
+        var debug_frame = async debugTimeout(&debug_ctx, "peer {} did not send a response after 3 seconds", client);
+        defer {
+            debug_ctx.cancel();
+            await debug_frame;
+        }
 
         {
             const writer = try client.acquireWriter(ctx, gpa);
@@ -1192,8 +1279,8 @@ pub const TransactionPuller = struct {
 
     pub const max_num_bytes_per_batch = net.Packet.max_size - net.Packet.size;
 
-    pub const collect_delay_min: i64 = 100 * time.ns_per_ms;
-    pub const collect_delay_max: i64 = 500 * time.ns_per_ms;
+    pub const collect_delay_min: i64 = 500 * time.ns_per_ms;
+    pub const collect_delay_max: i64 = 1000 * time.ns_per_ms;
 
     pub const connected_delay_min: i64 = 0 * time.ns_per_ms;
     pub const connected_delay_max: i64 = 500 * time.ns_per_ms;
@@ -1214,6 +1301,8 @@ pub const TransactionPuller = struct {
     }
 
     pub fn run(self: *TransactionPuller, ctx: *Context, gpa: *mem.Allocator) !void {
+        var peer_ids: [16]kademlia.ID = undefined;
+
         while (true) {
             while (self.node.chain.missing.len == 0) {
                 try runtime.timeout(ctx, .{ .nanoseconds = self.collect_delay });
@@ -1223,7 +1312,9 @@ pub const TransactionPuller = struct {
 
             self.collect_delay = collect_delay_min;
 
-            while (self.node.clients.count() == 0) {
+            // TODO: randomly sample peers from routing table instead
+            const num_peers = self.node.table.closestTo(&peer_ids, self.node.id.public_key);
+            while (num_peers == 0) {
                 try runtime.timeout(ctx, .{ .nanoseconds = self.connected_delay });
                 self.connected_delay = math.min(connected_delay_max, self.connected_delay + (connected_delay_max - connected_delay_min) / 10);
                 continue;
@@ -1231,12 +1322,16 @@ pub const TransactionPuller = struct {
 
             self.connected_delay = connected_delay_min;
 
-            self.pullMissingTransactions(ctx, gpa) catch |err| log.warn("error while pulling: {}", .{err});
+            self.pullMissingTransactions(ctx, gpa, peer_ids[0..num_peers]) catch |err| switch (err) {
+                error.Cancelled => return,
+                else => log.warn("error while pulling: {}", .{err}),
+            };
         }
     }
 
-    pub fn pullMissingTransactions(self: *TransactionPuller, ctx: *Context, gpa: *mem.Allocator) !void {
+    pub fn pullMissingTransactions(self: *TransactionPuller, ctx: *Context, gpa: *mem.Allocator, peer_ids: []const kademlia.ID) !void {
         assert(self.node.chain.missing.len > 0);
+        assert(peer_ids.len > 0);
 
         const ids = ids: {
             const total_num_ids = math.min(self.node.chain.missing.len, max_num_bytes_per_batch / @sizeOf([32]u8));
@@ -1245,10 +1340,10 @@ pub const TransactionPuller = struct {
             errdefer ids.deinit(gpa);
 
             var it = self.node.chain.missing.tail;
-            while (it) |entry| : (it = entry.prev) {
+            while (it) |entry| : (it = self.node.chain.missing.tail) {
                 ids.appendAssumeCapacity(entry.key);
                 self.node.chain.missing.moveToFront(entry);
-                if (ids.items.len == ids.capacity) {
+                if (ids.items.len == total_num_ids) {
                     break;
                 }
             }
@@ -1257,29 +1352,44 @@ pub const TransactionPuller = struct {
         };
         defer gpa.free(ids);
 
-        const frames = try gpa.alloc(@Frame(pullTransactionsFromPeer), self.node.clients.count());
+        const frames = try gpa.alloc(@Frame(pullTransactionsFromPeer), peer_ids.len);
         defer gpa.free(frames);
+
+        var num_pulled_transactions: usize = 0;
+        defer if (num_pulled_transactions >= 0) {
+            log.info("pulled {}/{} missing transactions", .{
+                num_pulled_transactions,
+                num_pulled_transactions + self.node.chain.missing.len,
+            });
+        };
 
         var frame_index: usize = 0;
         defer for (frames[0..frame_index]) |*frame| {
             const transactions = await frame catch continue;
             defer gpa.free(transactions);
 
+            self.node.chain.pending.ensureUnusedCapacity(gpa, transactions.len) catch {
+                for (transactions) |tx| {
+                    tx.deinit(gpa);
+                }
+                continue;
+            };
+
             for (transactions) |tx| {
                 self.node.addTransaction(ctx, gpa, tx) catch {
                     tx.deinit(gpa);
                     continue;
                 };
+
+                num_pulled_transactions += 1;
             }
         };
 
         var wg: sync.WaitGroup = .{};
-        defer wg.wait(ctx) catch {};
-
-        var it = self.node.clients.keyIterator();
-        while (it.next()) |address_ptr| : (frame_index += 1) {
-            frames[frame_index] = async self.pullTransactionsFromPeer(ctx, gpa, &wg, address_ptr.*, ids);
+        while (frame_index < peer_ids.len) : (frame_index += 1) {
+            frames[frame_index] = async self.pullTransactionsFromPeer(ctx, gpa, &wg, peer_ids[frame_index].address, ids);
         }
+        try wg.wait(ctx);
     }
 
     pub fn pullTransactionsFromPeer(
@@ -1306,7 +1416,7 @@ pub const TransactionPuller = struct {
                 .len = @intCast(u32, @sizeOf([32]u8) * ids.len),
                 .nonce = nonce,
                 .op = .request,
-                .tag = .pull_block,
+                .tag = .pull_transaction,
             }).write(writer);
 
             for (ids) |id| {
@@ -1357,19 +1467,7 @@ pub const TransactionPusher = struct {
         }
 
         pub fn eql(_: @This(), a: Entry, b: Entry) bool {
-            switch (a.address) {
-                .ipv4 => {
-                    if (b.address != .ipv4) return false;
-                    if (a.address.ipv4.port != b.address.ipv4.port) return false;
-                    if (!a.address.ipv4.host.eql(b.address.ipv4.host)) return false;
-                },
-                .ipv6 => {
-                    if (b.address != .ipv6) return false;
-                    if (a.address.ipv6.port != b.address.ipv6.port) return false;
-                    if (!a.address.ipv6.host.eql(b.address.ipv6.host)) return false;
-                },
-            }
-            return mem.eql(u8, &a.transaction_id, &b.transaction_id);
+            return net.eqlIpAddress(a.address, b.address) and mem.eql(u8, &a.transaction_id, &b.transaction_id);
         }
     });
 
@@ -1393,12 +1491,12 @@ pub const TransactionPusher = struct {
     flush_delay: i64 = flush_delay_min,
     connected_delay: i64 = connected_delay_min,
 
-    wg: sync.WaitGroup = .{},
-    pending: std.ArrayListUnmanaged(*Transaction) = .{},
     num_bytes_pending: usize = 0,
+    pending: std.ArrayListUnmanaged(*Transaction) = .{},
+    pool: sync.BoundedTaskPool(gossipTransactions) = .{ .capacity = 256 },
 
     pub fn init(gpa: *mem.Allocator, node: *Node) !TransactionPusher {
-        var cache = try Cache.initCapacity(gpa, 1 << 16);
+        var cache = try Cache.initCapacity(gpa, 1 << 20);
         errdefer cache.deinit(gpa);
 
         return TransactionPusher{ .node = node, .cache = cache };
@@ -1407,7 +1505,7 @@ pub const TransactionPusher = struct {
     pub fn deinit(self: *TransactionPusher, ctx: *Context, gpa: *mem.Allocator) void {
         log.info("shutting down...", .{});
 
-        self.wg.wait(ctx) catch |err| log.warn("reported an error while shutting down: {}", .{err});
+        self.pool.deinit(ctx, gpa) catch |err| log.warn("error while shutting down: {}", .{err});
 
         self.cache.deinit(gpa);
 
@@ -1447,30 +1545,21 @@ pub const TransactionPusher = struct {
     }
 
     pub fn flush(self: *TransactionPusher, ctx: *Context, gpa: *mem.Allocator) !void {
-        while (self.node.clients.count() == 0) {
+        // TODO: randomly sample peer ids from routing table instead
+        var peer_ids: [16]kademlia.ID = undefined;
+
+        const num_peers = self.node.table.closestTo(&peer_ids, self.node.id.public_key);
+        while (num_peers == 0) {
             try runtime.timeout(ctx, .{ .nanoseconds = self.connected_delay });
             self.connected_delay = math.min(connected_delay_max, self.connected_delay + (connected_delay_max - connected_delay_min) / 10);
         }
 
         self.connected_delay = connected_delay_min;
 
-        const task = try gpa.create(@Frame(gossipTransactions));
-        task.* = async self.gossipTransactions(ctx, gpa);
+        try self.pool.spawn(ctx, gpa, .{ self, ctx, gpa, peer_ids[0..num_peers] });
     }
 
-    fn destroyGossipTransactionsFrame(self: *TransactionPusher, gpa: *mem.Allocator, frame: *@Frame(gossipTransactions)) void {
-        gpa.destroy(frame);
-        self.wg.sub(1);
-    }
-
-    fn gossipTransactions(self: *TransactionPusher, ctx: *Context, gpa: *mem.Allocator) !void {
-        self.wg.add(1);
-        defer {
-            suspend {
-                self.destroyGossipTransactionsFrame(gpa, @frame());
-            }
-        }
-
+    fn gossipTransactions(self: *TransactionPusher, ctx: *Context, gpa: *mem.Allocator, peer_ids: []const kademlia.ID) !void {
         const transactions = self.pending.toOwnedSlice(gpa);
         defer {
             for (transactions) |tx| {
@@ -1481,7 +1570,7 @@ pub const TransactionPusher = struct {
 
         self.num_bytes_pending = 0;
 
-        const frames = try gpa.alloc(@Frame(pushTransactions), self.node.clients.count());
+        const frames = try gpa.alloc(@Frame(pushTransactions), peer_ids.len);
         defer gpa.free(frames);
 
         var frame_index: usize = 0;
@@ -1490,15 +1579,14 @@ pub const TransactionPusher = struct {
         var wg: sync.WaitGroup = .{};
         defer wg.wait(ctx) catch {};
 
-        var it = self.node.clients.keyIterator();
-        while (it.next()) |address_ptr| : (frame_index += 1) {
+        while (frame_index < peer_ids.len) : (frame_index += 1) {
             var filtered_transactions: std.ArrayListUnmanaged(*Transaction) = .{};
             defer filtered_transactions.deinit(gpa);
 
             var filtered_transactions_len: u32 = 0;
             for (transactions) |tx| {
                 const entry: Entry = .{
-                    .address = address_ptr.*,
+                    .address = peer_ids[frame_index].address,
                     .transaction_id = tx.id,
                 };
 
@@ -1514,7 +1602,7 @@ pub const TransactionPusher = struct {
                 ctx,
                 gpa,
                 &wg,
-                address_ptr.*,
+                peer_ids[frame_index].address,
                 filtered_transactions.toOwnedSlice(gpa),
                 filtered_transactions_len,
             );
@@ -1569,16 +1657,9 @@ pub const TransactionVerifier = struct {
     pub const flush_delay_min: i64 = 100 * time.ns_per_ms;
     pub const flush_delay_max: i64 = 500 * time.ns_per_ms;
 
-    pub const Task = extern struct {
-        next: ?*TransactionVerifier.Task = null,
-    };
-
     node: *Node,
 
-    pool_wg: sync.WaitGroup = .{},
-    pool_parker: sync.Parker(void) = .{},
-    pool: SinglyLinkedList(TransactionVerifier.Task, .next) = .{},
-
+    pool: sync.BoundedTaskPool(verifyTransactions) = .{ .capacity = max_num_allowed_parallel_tasks },
     entries: std.ArrayListUnmanaged(*Transaction) = .{},
     last_flush_time: i64 = 0,
 
@@ -1589,25 +1670,17 @@ pub const TransactionVerifier = struct {
     pub fn deinit(self: *TransactionVerifier, ctx: *Context, gpa: *mem.Allocator) void {
         log.info("shutting down...", .{});
 
-        self.pool_wg.wait(ctx) catch |err| log.warn("error while shutting down: {}", .{err});
+        self.pool.deinit(ctx, gpa) catch |err| log.warn("error while shutting down: {}", .{err});
 
         for (self.entries.items) |tx| {
             tx.deinit(gpa);
         }
         self.entries.deinit(gpa);
 
-        while (self.pool.popFirst()) |task| {
-            gpa.free(@ptrCast([*]u8, task)[0 .. @sizeOf(TransactionVerifier.Task) + @frameSize(TransactionVerifier.runTask)]);
-        }
-
         log.info("successfully shut down", .{});
     }
 
     pub fn push(self: *TransactionVerifier, ctx: *Context, gpa: *mem.Allocator, tx: *Transaction) !void {
-        while (self.pool_wg.len == max_num_allowed_parallel_tasks) {
-            try self.pool_parker.park(ctx);
-        }
-
         try self.entries.append(gpa, tx);
 
         if (self.entries.items.len == max_signature_batch_size) {
@@ -1619,10 +1692,6 @@ pub const TransactionVerifier = struct {
         var flush_delay: i64 = flush_delay_min;
 
         while (true) {
-            while (self.pool_wg.len == max_num_allowed_parallel_tasks) {
-                try self.pool_parker.park(ctx);
-            }
-
             if (self.entries.items.len == 0 or time.milliTimestamp() - self.last_flush_time < flush_delay_min / time.ns_per_ms) {
                 try runtime.timeout(ctx, .{ .nanoseconds = flush_delay });
                 flush_delay = math.min(flush_delay_max, flush_delay * 2);
@@ -1636,84 +1705,64 @@ pub const TransactionVerifier = struct {
     }
 
     fn flush(self: *TransactionVerifier, ctx: *Context, gpa: *mem.Allocator) !void {
-        const task = task: {
-            if (self.pool.popFirst()) |task| {
-                break :task task;
-            }
-            const task_align = @alignOf(@Frame(TransactionVerifier.runTask));
-            const task_length = @sizeOf(TransactionVerifier.Task) + @frameSize(TransactionVerifier.runTask);
-            const task_bytes = try gpa.alignedAlloc(u8, task_align, task_length);
-            break :task @ptrCast(*TransactionVerifier.Task, task_bytes);
-        };
-
-        const task_frame = @ptrCast(*@Frame(TransactionVerifier.runTask), @ptrCast([*]u8, task) + @sizeOf(TransactionVerifier.Task));
-
-        task.* = .{};
-        task_frame.* = async self.runTask(ctx, task, gpa, self.entries.toOwnedSlice(gpa));
-
+        try self.pool.spawn(ctx, gpa, .{ self, ctx, gpa, self.entries.toOwnedSlice(gpa) });
         self.last_flush_time = time.milliTimestamp();
     }
 
-    fn runTask(self: *TransactionVerifier, ctx: *Context, task: *TransactionVerifier.Task, gpa: *mem.Allocator, entries: []*Transaction) void {
-        self.pool_wg.add(1);
-        defer self.pool_wg.sub(1);
+    fn verifyTransactionBatch(gpa: *mem.Allocator, entries: []*Transaction) usize {
+        runtime.startCpuBoundOperation();
+        defer runtime.endCpuBoundOperation();
 
-        defer {
-            self.pool.prepend(task);
-            self.pool_parker.notify({});
+        var num_valid: usize = 0;
+        var num: usize = 0;
+        while (entries.len - num >= max_signature_batch_size) : (num += max_signature_batch_size) {
+            crypto.verifyBatch(entries[num..][0..max_signature_batch_size]) catch |batch_err| {
+                log.warn("bad transaction batch: {}", .{batch_err});
+
+                for (entries[num..][0..max_signature_batch_size]) |tx| {
+                    crypto.verify(tx.signature, tx, tx.sender) catch |err| {
+                        log.warn("bad transaction {}: {}", .{ fmt.fmtSliceHexLower(&tx.id), err });
+                        tx.deinit(gpa);
+                        continue;
+                    };
+
+                    entries[num_valid] = tx;
+                    num_valid += 1;
+                }
+
+                continue;
+            };
+
+            mem.copy(*Transaction, entries[num_valid..], entries[num..][0..max_signature_batch_size]);
+            num_valid += max_signature_batch_size;
         }
 
-        var index: usize = 0;
+        for (entries[num..]) |tx| {
+            crypto.verify(tx.signature, tx, tx.sender) catch |err| {
+                log.warn("bad transaction {}: {}", .{ fmt.fmtSliceHexLower(&tx.id), err });
+                tx.deinit(gpa);
+                continue;
+            };
 
-        {
-            runtime.startCpuBoundOperation();
-            defer runtime.endCpuBoundOperation();
-
-            var num: usize = 0;
-            while (entries.len - num >= max_signature_batch_size) : (num += max_signature_batch_size) {
-                crypto.verifyBatch(entries[num..][0..max_signature_batch_size]) catch |batch_err| {
-                    log.warn("bad transaction batch: {}", .{batch_err});
-
-                    for (entries[num..][0..max_signature_batch_size]) |tx| {
-                        crypto.verify(tx.signature, tx, tx.sender) catch |err| {
-                            log.warn("bad transaction {}: {}", .{ fmt.fmtSliceHexLower(&tx.id), err });
-                            tx.deinit(gpa);
-                            continue;
-                        };
-
-                        entries[index] = tx;
-                        index += 1;
-                    }
-
-                    continue;
-                };
-
-                mem.copy(*Transaction, entries[index..], entries[num..][0..max_signature_batch_size]);
-                index += max_signature_batch_size;
-            }
-
-            for (entries[num..]) |tx| {
-                crypto.verify(tx.signature, tx, tx.sender) catch |err| {
-                    log.warn("bad transaction {}: {}", .{ fmt.fmtSliceHexLower(&tx.id), err });
-                    tx.deinit(gpa);
-                    continue;
-                };
-
-                entries[index] = tx;
-                index += 1;
-            }
+            entries[num_valid] = tx;
+            num_valid += 1;
         }
 
+        return num_valid;
+    }
+
+    fn verifyTransactions(self: *TransactionVerifier, ctx: *Context, gpa: *mem.Allocator, entries: []*Transaction) void {
+        const num_valid = verifyTransactionBatch(gpa, entries);
         defer gpa.free(entries);
 
-        self.node.chain.pending.ensureUnusedCapacity(gpa, index) catch {
-            for (entries[0..index]) |tx| {
+        self.node.chain.pending.ensureUnusedCapacity(gpa, num_valid) catch {
+            for (entries[0..num_valid]) |tx| {
                 tx.deinit(gpa);
             }
             return;
         };
 
-        for (entries[0..index]) |tx| {
+        for (entries[0..num_valid]) |tx| {
             self.node.addTransaction(ctx, gpa, tx) catch {
                 tx.deinit(gpa);
                 continue;
@@ -1723,22 +1772,33 @@ pub const TransactionVerifier = struct {
 };
 
 pub const Sampler = struct {
-    pub const default_alpha = 0.80;
-    pub const default_beta = 150;
+    const log = std.log.scoped(.sampler);
+
+    pub const default_alpha = 0.8;
+    pub const default_beta = 20;
 
     pub const Vote = struct {
         block: ?*Block,
         tally: f64,
+
+        pub fn format(self: Vote, comptime layout: []const u8, options: fmt.FormatOptions, writer: anytype) !void {
+            _ = layout;
+            _ = options;
+            try fmt.format(writer, "(block: {}, tally: {})", .{
+                fmt.fmtSliceHexLower(if (self.block) |block| &block.id else &([_]u8{0} ** 32)),
+                self.tally,
+            });
+        }
     };
 
-    counts: HashMap(usize, 50),
+    counts: SortedHashMap(usize, 50),
     count: usize = 0,
     stalled: usize = 0,
     preferred: ?*Block = null,
     last: ?*Block = null,
 
     pub fn init(gpa: *mem.Allocator) !Sampler {
-        var counts = try HashMap(usize, 50).init(gpa);
+        var counts = try SortedHashMap(usize, 50).init(gpa);
         errdefer counts.deinit(gpa);
 
         return Sampler{ .counts = counts };
@@ -1795,17 +1855,12 @@ pub const Sampler = struct {
         };
 
         if (majority_vote.tally < default_alpha) {
-            self.stalled += 1;
-            if (self.stalled >= default_beta) {
-                if (self.preferred) |preferred| {
-                    preferred.deinit(gpa);
-                }
-                self.preferred = null;
-                self.stalled = 0;
-            }
+            self.stalled = math.add(usize, self.stalled, 1) catch self.stalled;
             self.count = 0;
             return null;
         }
+
+        self.stalled = 0;
 
         const count_result = self.counts.getOrPutAssumeCapacity(majority_block.id);
         if (!count_result.found_existing) count_result.value_ptr.* = 0;
@@ -1814,7 +1869,7 @@ pub const Sampler = struct {
         const count = count_result.value_ptr.*;
 
         if (self.preferred) |preferred| {
-            if (count > self.counts.get(preferred.id).?) {
+            if (count > self.counts.get(preferred.id) orelse 0) {
                 self.preferred = majority_block.ref();
                 preferred.deinit(gpa);
             }
@@ -1843,303 +1898,3 @@ pub const Sampler = struct {
         return null;
     }
 };
-
-pub fn RingBuffer(comptime T: type, comptime capacity: usize) type {
-    assert(math.isPowerOfTwo(capacity));
-
-    return struct {
-        const Self = @This();
-
-        head: u64 = 0,
-        tail: u64 = 0,
-        entries: [capacity]T = undefined,
-
-        /// This routine pushes an item, and optionally returns an evicted item should
-        /// the insertion of the provided item overflow the existing buffer.
-        pub fn pushOrNull(self: *Self, item: T) ?T {
-            const evicted = evicted: {
-                if (self.count() == capacity) {
-                    break :evicted self.pop();
-                }
-                break :evicted null;
-            };
-
-            self.push(item);
-
-            return evicted;
-        }
-
-        pub fn push(self: *Self, item: T) void {
-            assert(self.count() < capacity);
-            self.entries[self.head & (capacity - 1)] = item;
-            self.head +%= 1;
-        }
-
-        pub fn prepend(self: *Self, item: T) void {
-            assert(self.count() < capacity);
-            self.entries[(self.tail -% 1) & (capacity - 1)] = item;
-            self.tail -%= 1;
-        }
-
-        /// This routine pops an item from the tail of the buffer and returns it provided
-        /// that the buffer is not empty.
-        ///
-        /// This routine is typically used in order to pop and de-initialize all items
-        /// stored in the buffer.
-        pub fn popOrNull(self: *Self) ?T {
-            if (self.count() == 0) return null;
-            return self.pop();
-        }
-
-        pub fn pop(self: *Self) T {
-            assert(self.count() > 0);
-            const evicted = self.entries[self.tail & (capacity - 1)];
-            self.tail +%= 1;
-            return evicted;
-        }
-
-        pub fn get(self: Self, i: u64) ?T {
-            if (i < self.tail or i >= self.head) return null;
-            return self.entries[i & (capacity - 1)];
-        }
-
-        pub fn count(self: Self) usize {
-            return self.head -% self.tail;
-        }
-
-        pub fn latest(self: Self) ?T {
-            if (self.count() == 0) return null;
-            return self.entries[(self.head -% 1) & (capacity - 1)];
-        }
-
-        pub fn oldest(self: *Self) ?T {
-            if (self.count() == 0) return null;
-            return self.entries[self.tail & (capacity - 1)];
-        }
-    };
-}
-
-pub const RoutingTable = struct {
-    pub const bucket_size = 16;
-
-    pub const Bucket = RingBuffer(ID, bucket_size);
-
-    public_key: [32]u8,
-    buckets: [256]Bucket = [_]Bucket{.{}} ** 256,
-    len: usize = 0,
-
-    fn clz(public_key: [32]u8) usize {
-        comptime var i = 0;
-        inline while (i < 32) : (i += 1) {
-            if (public_key[i] != 0) {
-                return i * 8 + @as(usize, @clz(u8, public_key[i]));
-            }
-        }
-        return 256;
-    }
-
-    fn xor(a: [32]u8, b: [32]u8) [32]u8 {
-        return @as([32]u8, @as(meta.Vector(32, u8), a) ^ @as(meta.Vector(32, u8), b));
-    }
-
-    pub const PutResult = enum {
-        full,
-        updated,
-        inserted,
-    };
-
-    pub fn put(self: *RoutingTable, id: ID) PutResult {
-        if (mem.eql(u8, &self.public_key, &id.public_key)) {
-            return .full;
-        }
-
-        const bucket = &self.buckets[clz(xor(self.public_key, id.public_key))];
-
-        var i: usize = bucket.head;
-        var j: usize = bucket.head;
-        while (i != bucket.tail) : (i -%= 1) {
-            const it = bucket.entries[(i -% 1) & (bucket_size - 1)];
-            if (!it.eql(id)) {
-                bucket.entries[(j -% 1) & (bucket_size - 1)] = it;
-                j -%= 1;
-            }
-        }
-
-        if (i == j and bucket.count() == bucket_size) {
-            return .full;
-        }
-
-        bucket.entries[(j -% 1) & (bucket_size - 1)] = undefined;
-        bucket.tail = j;
-        bucket.push(id);
-
-        if (i != j) {
-            return .updated;
-        }
-
-        self.len += 1;
-        return .inserted;
-    }
-
-    pub fn delete(self: *RoutingTable, public_key: [32]u8) bool {
-        if (self.len == 0 or mem.eql(u8, &self.public_key, &public_key)) {
-            return false;
-        }
-
-        const bucket = &self.buckets[clz(xor(self.public_key, public_key))];
-
-        var i: usize = bucket.head;
-        var j: usize = bucket.head;
-        while (i != bucket.tail) : (i -%= 1) {
-            const it = bucket.entries[(i -% 1) & (bucket_size - 1)];
-            if (!mem.eql(u8, &it.public_key, &public_key)) {
-                bucket.entries[(j -% 1) & (bucket_size - 1)] = it;
-                j -%= 1;
-            }
-        }
-
-        if (i == j) {
-            return false;
-        }
-
-        bucket.entries[(j -% 1) & (bucket_size - 1)] = undefined;
-        bucket.tail = j;
-        self.len -= 1;
-        return true;
-    }
-
-    pub fn closestTo(self: *const RoutingTable, dst: []ID, public_key: [32]u8) usize {
-        var count: usize = 0;
-
-        const bucket_index = clz(xor(self.public_key, public_key));
-        self.fillSort(dst, &count, public_key, bucket_index);
-
-        var index: usize = 1;
-        while (count < dst.len) : (index += 1) {
-            var stop = true;
-            if (bucket_index >= index) {
-                self.fillSort(dst, &count, public_key, bucket_index - index);
-                stop = false;
-            }
-            if (bucket_index + index < self.buckets.len) {
-                self.fillSort(dst, &count, public_key, bucket_index + index);
-                stop = false;
-            }
-            if (stop) {
-                break;
-            }
-        }
-
-        return count;
-    }
-
-    const BinarySearchResult = union(enum) {
-        found: usize,
-        not_found: usize,
-    };
-
-    fn binarySearch(self: *const RoutingTable, slice: []ID, public_key: [32]u8) BinarySearchResult {
-        var size: usize = slice.len;
-        var left: usize = 0;
-        var right: usize = slice.len;
-        while (left < right) {
-            const mid = left + size / 2;
-            switch (mem.order(
-                u8,
-                &xor(slice[mid].public_key, self.public_key),
-                &xor(public_key, self.public_key),
-            )) {
-                .lt => left = mid + 1,
-                .gt => right = mid,
-                .eq => return .{ .found = mid },
-            }
-            size = right - left;
-        }
-        return .{ .not_found = left };
-    }
-
-    fn fillSort(self: *const RoutingTable, dst: []ID, count: *usize, public_key: [32]u8, bucket_index: usize) void {
-        const bucket = &self.buckets[bucket_index];
-
-        var i: usize = bucket.head;
-        while (i != bucket.tail) : (i -%= 1) {
-            const it = bucket.entries[(i -% 1) & (bucket_size - 1)];
-            if (!mem.eql(u8, &it.public_key, &public_key)) {
-                const result = self.binarySearch(dst[0..count.*], it.public_key);
-                assert(result != .found);
-
-                const index = result.not_found;
-                if (count.* < dst.len) {
-                    count.* += 1;
-                } else if (index >= count.*) {
-                    continue;
-                }
-                var j: usize = count.* - 1;
-                while (j > index) : (j -= 1) {
-                    dst[j] = dst[j - 1];
-                }
-                dst[index] = it;
-            }
-        }
-    }
-};
-
-test "RoutingTable" {
-    const public_key: [32]u8 = [_]u8{0xFF} ** 32;
-    const address = ip.Address.initIPv4(IPv4.unspecified, 9000);
-
-    var table: RoutingTable = .{ .public_key = public_key };
-
-    // put (free)
-
-    comptime var i: u8 = 1;
-    inline while (i <= 16) : (i += 1) {
-        try testing.expectEqual(RoutingTable.PutResult.inserted, table.put(ID{
-            .public_key = [_]u8{ 0, i } ++ [_]u8{0} ** 30,
-            .address = address,
-        }));
-    }
-
-    try testing.expectEqual([_]u8{ 0, 01 } ++ [_]u8{0} ** 30, table.buckets[0].oldest().?.public_key);
-    try testing.expectEqual([_]u8{ 0, 16 } ++ [_]u8{0} ** 30, table.buckets[0].latest().?.public_key);
-    try testing.expectEqual(@as(usize, 16), table.len);
-
-    // put (full)
-
-    try testing.expectEqual(RoutingTable.PutResult.full, table.put(ID{
-        .public_key = [_]u8{ 0, 17 } ++ [_]u8{0} ** 30,
-        .address = address,
-    }));
-    try testing.expectEqual(@as(usize, 16), table.len);
-
-    // put (update)
-
-    try testing.expectEqual(RoutingTable.PutResult.updated, table.put(ID{
-        .public_key = [_]u8{ 0, 01 } ++ [_]u8{0} ** 30,
-        .address = address,
-    }));
-    try testing.expectEqual([_]u8{ 0, 02 } ++ [_]u8{0} ** 30, table.buckets[0].oldest().?.public_key);
-    try testing.expectEqual([_]u8{ 0, 01 } ++ [_]u8{0} ** 30, table.buckets[0].latest().?.public_key);
-    try testing.expectEqual(@as(usize, 16), table.len);
-
-    // closest to
-
-    var ids: [15]ID = undefined;
-    try testing.expectEqual(@as(usize, 15), table.closestTo(&ids, [_]u8{ 0, 1 } ++ [_]u8{0} ** 30));
-
-    comptime var j: u8 = 0;
-    inline while (j < 15) : (j += 1) {
-        try testing.expectEqual(16 - j, ids[j].public_key[1]);
-    }
-
-    // delete
-
-    comptime var k: u8 = 1;
-    inline while (k <= 16) : (k += 1) {
-        try testing.expect(table.delete([_]u8{ 0, k } ++ [_]u8{0} ** 30));
-    }
-
-    try testing.expectEqual(@as(?ID, null), table.buckets[0].latest());
-    try testing.expectEqual(@as(?ID, null), table.buckets[0].oldest());
-    try testing.expectEqual(@as(usize, 0), table.len);
-}

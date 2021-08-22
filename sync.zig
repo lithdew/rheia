@@ -1,12 +1,102 @@
 const std = @import("std");
-
 const runtime = @import("runtime.zig");
+
+const mem = std.mem;
+const meta = std.meta;
+const math = std.math;
 
 const assert = std.debug.assert;
 
 const Task = runtime.Task;
 const Context = runtime.Context;
+const SinglyLinkedList = @import("intrusive.zig").SinglyLinkedList;
 const DoublyLinkedDeque = @import("intrusive.zig").DoublyLinkedDeque;
+const DynamicRingBuffer = @import("ring_buffer.zig").DynamicRingBuffer;
+
+const sync = @This();
+
+pub fn BoundedTaskPool(comptime F: anytype) type {
+    return struct {
+        const Self = @This();
+
+        pub const Metadata = struct {
+            next: ?*Metadata = null,
+
+            pub fn create(gpa: *mem.Allocator) !*Metadata {
+                const bytes = try gpa.alignedAlloc(
+                    u8,
+                    math.max(@alignOf(Metadata), @alignOf(anyframe)),
+                    @sizeOf(Metadata) + @frameSize(Self.run),
+                );
+
+                return @ptrCast(*Metadata, bytes.ptr);
+            }
+
+            pub fn deinit(self: *Metadata, gpa: *mem.Allocator) void {
+                const bytes = @ptrCast([*]u8, self)[0 .. @sizeOf(Metadata) + @frameSize(Self.run)];
+                gpa.free(bytes);
+            }
+
+            pub fn getFrame(self: *Metadata) *@Frame(Self.run) {
+                const ptr = @ptrCast([*]u8, self) + @sizeOf(Metadata);
+                const frame = @ptrCast(*@Frame(Self.run), ptr);
+                return frame;
+            }
+        };
+
+        capacity: usize,
+
+        wg: sync.WaitGroup = .{},
+        parker: Parker(void) = .{},
+        free_list: SinglyLinkedList(Metadata, .next) = .{},
+
+        pub fn deinit(self: *Self, ctx: *Context, gpa: *mem.Allocator) !void {
+            const result = self.wg.wait(ctx);
+            while (self.free_list.popFirst()) |metadata| {
+                metadata.deinit(gpa);
+            }
+            return result;
+        }
+
+        pub const SpawnError = mem.Allocator.Error || error{
+            Cancelled,
+        };
+
+        pub fn spawn(self: *Self, ctx: *Context, gpa: *mem.Allocator, args: meta.ArgsTuple(@TypeOf(F))) SpawnError!void {
+            _ = ctx;
+
+            // while (self.wg.len == self.capacity) {
+            //     try self.parker.park(ctx);
+            // }
+
+            const metadata = metadata: {
+                if (self.free_list.popFirst()) |metadata| {
+                    break :metadata metadata;
+                }
+                break :metadata try Metadata.create(gpa);
+            };
+
+            metadata.* = .{};
+            metadata.getFrame().* = async self.run(metadata, args);
+        }
+
+        fn run(self: *Self, metadata: *Metadata, args: meta.ArgsTuple(@TypeOf(F))) callconv(.Async) void {
+            self.wg.add(1);
+            defer self.wg.sub(1);
+
+            defer {
+                self.free_list.prepend(metadata);
+                self.parker.notify({});
+            }
+
+            if (@typeInfo(@typeInfo(@TypeOf(F)).Fn.return_type.?) == .ErrorUnion) {
+                @call(.{}, F, args) catch {};
+            } else {
+                @call(.{}, F, args);
+            }
+        }
+    };
+}
 
 pub fn Parker(comptime T: type) type {
     return struct {

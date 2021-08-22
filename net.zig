@@ -4,6 +4,7 @@ const runtime = @import("runtime.zig");
 
 const io = std.io;
 const ip = std.x.net.ip;
+const fmt = std.fmt;
 const mem = std.mem;
 const tcp = std.x.net.tcp;
 const math = std.math;
@@ -11,8 +12,106 @@ const time = std.time;
 
 const assert = std.debug.assert;
 
+const IPv4 = std.x.os.IPv4;
+const IPv6 = std.x.os.IPv6;
 const Context = runtime.Context;
 const DoublyLinkedDeque = @import("intrusive.zig").DoublyLinkedDeque;
+const DynamicRingBuffer = @import("ring_buffer.zig").DynamicRingBuffer;
+
+pub fn parseIpAddress(address: []const u8) !ip.Address {
+    const parsed = splitHostPort(address) catch |err| return switch (err) {
+        error.DelimiterNotFound => ip.Address.initIPv4(IPv4.unspecified, try fmt.parseUnsigned(u16, address, 10)),
+        else => err,
+    };
+    const parsed_host = parsed.host;
+    const parsed_port = try fmt.parseUnsigned(u16, parsed.port, 10);
+    if (parsed_host.len == 0) return ip.Address.initIPv4(IPv4.unspecified, parsed_port);
+
+    for (parsed_host) |c| {
+        switch (c) {
+            '.' => return ip.Address{ .ipv4 = .{ .host = try IPv4.parse(parsed_host), .port = parsed_port } },
+            ':' => return ip.Address{ .ipv6 = .{ .host = try IPv6.parse(parsed_host), .port = parsed_port } },
+            else => {},
+        }
+    }
+
+    return error.UnknownAddressProtocol;
+}
+
+pub const HostPort = struct {
+    host: []const u8,
+    port: []const u8,
+};
+
+pub fn splitHostPort(address: []const u8) !HostPort {
+    var j: usize = 0;
+    var k: usize = 0;
+
+    const i = mem.lastIndexOfScalar(u8, address, ':') orelse return error.DelimiterNotFound;
+
+    const host = parse: {
+        if (address[0] == '[') {
+            const end = mem.indexOfScalar(u8, address, ']') orelse return error.MissingEndBracket;
+            if (end + 1 == i) {} else if (end + 1 == address.len) {
+                return error.MissingRightBracket;
+            } else {
+                return error.MissingPort;
+            }
+
+            j = 1;
+            k = end + 1;
+            break :parse address[1..end];
+        }
+
+        if (mem.indexOfScalar(u8, address[0..i], ':') != null) {
+            return error.TooManyColons;
+        }
+        break :parse address[0..i];
+    };
+
+    if (mem.indexOfScalar(u8, address[j..], '[') != null) {
+        return error.UnexpectedLeftBracket;
+    }
+    if (mem.indexOfScalar(u8, address[k..], ']') != null) {
+        return error.UnexpectedRightBracket;
+    }
+
+    const port = address[i + 1 ..];
+
+    return HostPort{ .host = host, .port = port };
+}
+
+pub fn hashIpAddress(address: ip.Address) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    switch (address) {
+        .ipv4 => |ipv4| {
+            hasher.update(&ipv4.host.octets);
+            hasher.update(mem.asBytes(&ipv4.port));
+        },
+        .ipv6 => |ipv6| {
+            hasher.update(&ipv6.host.octets);
+            hasher.update(mem.asBytes(&ipv6.host.scope_id));
+            hasher.update(mem.asBytes(&ipv6.port));
+        },
+    }
+    return hasher.final();
+}
+
+pub fn eqlIpAddress(a: ip.Address, b: ip.Address) bool {
+    switch (a) {
+        .ipv4 => {
+            if (b != .ipv4) return false;
+            if (a.ipv4.port != b.ipv4.port) return false;
+            if (!a.ipv4.host.eql(b.ipv4.host)) return false;
+        },
+        .ipv6 => {
+            if (b != .ipv6) return false;
+            if (a.ipv6.port != b.ipv6.port) return false;
+            if (!a.ipv6.host.eql(b.ipv6.host)) return false;
+        },
+    }
+    return true;
+}
 
 pub const Packet = struct {
     pub const max_size = 1 * 1024 * 1024;
@@ -27,6 +126,7 @@ pub const Packet = struct {
     pub const Tag = enum(u8) {
         ping,
         hello,
+        find_node,
         push_transaction,
         pull_transaction,
         pull_block,
@@ -136,32 +236,28 @@ pub const Client = struct {
             response: @Frame(sync.Parker(RPC.Response).park) = undefined,
         };
 
-        head: u32 = 0,
-        tail: u32 = 0,
-        entries: []?*RPC.Entry,
+        pending: DynamicRingBuffer(?*RPC.Entry, u32),
         request_parker: sync.Parker(void) = .{},
 
         pub fn init(gpa: *mem.Allocator, capacity: usize) !RPC {
-            assert(math.isPowerOfTwo(capacity));
-            const entries = try gpa.alloc(?*RPC.Entry, capacity);
-            mem.set(?*RPC.Entry, entries, null);
-            return RPC{ .entries = entries };
+            const pending = try DynamicRingBuffer(?*RPC.Entry, u32).initCapacity(gpa, capacity);
+            mem.set(?*RPC.Entry, pending.entries, null);
+            return RPC{ .pending = pending };
         }
 
         pub fn deinit(self: *RPC, gpa: *mem.Allocator) void {
-            gpa.free(self.entries);
+            self.pending.deinit(gpa);
         }
 
         pub fn register(self: *RPC, ctx: *Context, entry: *RPC.Entry) !u32 {
             const nonce = nonce: {
-                while (self.head -% self.tail == self.entries.len) {
+                while (self.pending.count() == self.pending.entries.len) {
                     try self.request_parker.park(ctx);
                 }
-                break :nonce self.head;
+                break :nonce self.pending.head;
             };
 
-            self.entries[nonce & (self.entries.len - 1)] = entry;
-            self.head +%= 1;
+            self.pending.push(entry);
 
             var callback: struct {
                 state: Context.Callback = .{ .run = @This().run },
@@ -170,11 +266,8 @@ pub const Client = struct {
 
                 pub fn run(state: *Context.Callback) void {
                     const callback = @fieldParentPtr(@This(), "state", state);
-                    callback.self.entries[callback.nonce & (callback.self.entries.len - 1)] = null;
-                    if (callback.nonce -% callback.self.tail == 0) {
-                        callback.self.tail +%= 1;
-                        callback.self.request_parker.notify({});
-                    }
+                    callback.self.pending.entries[callback.nonce & (callback.self.pending.entries.len - 1)] = null;
+                    callback.self.shiftForwards();
                 }
             } = .{ .self = self, .nonce = nonce };
 
@@ -187,21 +280,24 @@ pub const Client = struct {
         }
 
         pub fn push(self: *RPC, response: RPC.Response) bool {
-            const distance = response.header.nonce -% self.tail;
-            if (distance >= self.entries.len) return false;
+            const distance = response.header.nonce -% self.pending.tail;
+            if (distance >= self.pending.entries.len) return false;
 
-            const index = response.header.nonce & (self.entries.len - 1);
-            const entry = self.entries[index] orelse return false;
-            self.entries[index] = null;
-
-            if (distance == 0) {
-                self.tail +%= 1;
-                self.request_parker.notify({});
-            }
+            const index = response.header.nonce & (self.pending.entries.len - 1);
+            const entry = self.pending.entries[index] orelse return false;
+            self.pending.entries[index] = null;
+            self.shiftForwards();
 
             entry.parker.notify(response);
 
             return true;
+        }
+
+        fn shiftForwards(self: *RPC) void {
+            while (self.pending.tail != self.pending.head and self.pending.entries[self.pending.tail & (self.pending.entries.len - 1)] == null) {
+                self.pending.tail +%= 1;
+                self.request_parker.notify({});
+            }
         }
     };
 

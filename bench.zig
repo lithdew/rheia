@@ -95,7 +95,6 @@ pub fn reportBenchmarkStats(ctx: *Context) !void {
 pub fn runBenchmark(ctx: *Context, keys: Ed25519.KeyPair, client: *net.Client) !void {
     while (true) {
         const nonce = nonce_count.fetchAdd(1, .Monotonic);
-        _ = benchmark_count.fetchAdd(1, .Monotonic);
 
         const tx = try tx: {
             runtime.startCpuBoundOperation();
@@ -111,6 +110,8 @@ pub fn runBenchmark(ctx: *Context, keys: Ed25519.KeyPair, client: *net.Client) !
         defer tx.deinit(runtime.getAllocator());
 
         try await async sendTransactions(ctx, client, &[_]*rheia.Transaction{tx});
+
+        _ = benchmark_count.fetchAdd(1, .Monotonic);
     }
 }
 

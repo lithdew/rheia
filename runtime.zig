@@ -217,7 +217,7 @@ pub const Runtime = struct {
     outgoing_tasks: Pool.Batch,
 
     pub fn init(self: *Runtime) !void {
-        defer log.debug("runtime started", .{});
+        // defer log.debug("runtime started", .{});
 
         self.gpa_instance = .{};
         if (builtin.link_libc) {
@@ -246,7 +246,7 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
-        defer log.debug("runtime freed", .{});
+        // defer log.debug("runtime freed", .{});
 
         self.ring.deinit();
         os.close(self.event);

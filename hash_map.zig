@@ -6,39 +6,293 @@ const testing = std.testing;
 
 const assert = std.debug.assert;
 
-/// The following routine has its branches optimized against inputs that are cryptographic hashes by
-/// assuming that if the first 64 bits of 'a' and 'b' are equivalent, then 'a' and 'b' are most likely
-/// equivalent.
-fn cmp(a: [32]u8, b: [32]u8) math.Order {
-    const msa = @bitCast(u64, a[0..8].*);
-    const msb = @bitCast(u64, b[0..8].*);
-    if (msa != msb) {
-        return if (mem.bigToNative(u64, msa) < mem.bigToNative(u64, msb)) .lt else .gt;
-    } else if (@reduce(.And, @as(std.meta.Vector(32, u8), a) == @as(std.meta.Vector(32, u8), b))) {
-        return .eq;
-    } else {
-        switch (math.order(mem.readIntBig(u64, a[8..16]), mem.readIntBig(u64, b[8..16]))) {
-            .eq => {},
-            .lt => return .lt,
-            .gt => return .gt,
-        }
-        switch (math.order(mem.readIntBig(u64, a[16..24]), mem.readIntBig(u64, b[16..24]))) {
-            .eq => {},
-            .lt => return .lt,
-            .gt => return .gt,
-        }
-        return math.order(mem.readIntBig(u64, a[24..32]), mem.readIntBig(u64, b[24..32]));
-    }
+pub fn AutoHashMap(comptime K: type, comptime V: type, comptime max_load_percentage: comptime_int) type {
+    return HashMap(K, V, std.hash_map.AutoContext(K), max_load_percentage);
 }
 
-/// In release-fast mode, LLVM will optimize this routine to utilize 109 cycles. This routine scatters
-/// hash values across a table into buckets which are lexicographically ordered from one another in
-/// ascending order. 
-fn idx(a: [32]u8, shift: u6) usize {
-    return @intCast(usize, mem.readIntBig(u64, a[0..8]) >> shift);
+pub fn AutoStaticHashMap(comptime K: type, comptime V: type, comptime capacity: comptime_int) type {
+    return StaticHashMap(K, V, std.hash_map.AutoContext(K), capacity);
 }
 
-pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) type {
+pub fn StaticHashMap(comptime K: type, comptime V: type, comptime Context: type, comptime capacity: usize) type {
+    assert(math.isPowerOfTwo(capacity));
+
+    const shift = 63 - math.log2_int(u64, capacity) + 1;
+    const overflow = capacity / 10 + (63 - @as(u64, shift) + 1) << 1;
+
+    return struct {
+        const empty_hash = math.maxInt(u64);
+
+        pub const Entry = struct {
+            hash: u64 = empty_hash,
+            key: K = undefined,
+            value: V = undefined,
+
+            pub fn isEmpty(self: Entry) bool {
+                return self.hash == empty_hash;
+            }
+
+            pub fn format(self: Entry, comptime layout: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+                _ = layout;
+                _ = options;
+                try std.fmt.format(writer, "(hash: {}, key: {}, value: {})", .{ self.hash, self.key, self.value });
+            }
+        };
+
+        pub const GetOrPutResult = struct {
+            value_ptr: *V,
+            found_existing: bool,
+        };
+
+        const Self = @This();
+
+        entries: [capacity + overflow]Entry = [_]Entry{.{}} ** (capacity + overflow),
+        len: usize = 0,
+        shift: u6 = shift,
+
+        put_probe_count: usize = 0,
+        get_probe_count: usize = 0,
+        del_probe_count: usize = 0,
+
+        pub usingnamespace HashMapMixin(Self, K, V, Context);
+    };
+}
+
+pub fn HashMap(comptime K: type, comptime V: type, comptime Context: type, comptime max_load_percentage: comptime_int) type {
+    return struct {
+        const empty_hash = math.maxInt(u64);
+
+        pub const Entry = struct {
+            hash: u64 = empty_hash,
+            key: K = undefined,
+            value: V = undefined,
+
+            pub fn isEmpty(self: Entry) bool {
+                return self.hash == empty_hash;
+            }
+
+            pub fn format(self: Entry, comptime layout: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+                _ = layout;
+                _ = options;
+                try std.fmt.format(writer, "(hash: {}, key: {}, value: {})", .{ self.hash, self.key, self.value });
+            }
+        };
+
+        pub const GetOrPutResult = struct {
+            value_ptr: *V,
+            found_existing: bool,
+        };
+
+        const Self = @This();
+
+        entries: [*]Entry,
+        len: usize = 0,
+        shift: u6,
+
+        put_probe_count: usize = 0,
+        get_probe_count: usize = 0,
+        del_probe_count: usize = 0,
+
+        pub usingnamespace HashMapMixin(Self, K, V, Context);
+
+        pub fn initCapacity(gpa: *mem.Allocator, capacity: u64) !Self {
+            assert(math.isPowerOfTwo(capacity));
+
+            const shift = 63 - math.log2_int(u64, capacity) + 1;
+            const overflow = capacity / 10 + (63 - @as(u64, shift) + 1) << 1;
+
+            const entries = try gpa.alloc(Entry, @intCast(usize, capacity + overflow));
+            mem.set(Entry, entries, .{});
+
+            return Self{
+                .entries = entries.ptr,
+                .shift = shift,
+            };
+        }
+
+        pub fn deinit(self: *Self, gpa: *mem.Allocator) void {
+            gpa.free(self.slice());
+        }
+
+        pub fn ensureUnusedCapacity(self: *Self, gpa: *mem.Allocator, count: usize) !void {
+            try self.ensureTotalCapacity(gpa, self.len + count);
+        }
+
+        pub fn ensureTotalCapacity(self: *Self, gpa: *mem.Allocator, count: usize) !void {
+            while (true) {
+                const capacity = @as(u64, 1) << (63 - self.shift + 1);
+                if (count <= capacity * max_load_percentage / 100) {
+                    break;
+                }
+                try self.grow(gpa);
+            }
+        }
+
+        fn grow(self: *Self, gpa: *mem.Allocator) !void {
+            const capacity = @as(u64, 1) << (63 - self.shift + 1);
+            const overflow = capacity / 10 + (63 - @as(usize, self.shift) + 1) << 1;
+            const end = self.entries + @intCast(usize, capacity + overflow);
+
+            var map = try Self.initCapacity(gpa, @intCast(usize, capacity * 2));
+            var src = self.entries;
+            var dst = map.entries;
+
+            while (src != end) {
+                const entry = src[0];
+
+                const i = if (!entry.isEmpty()) entry.hash >> map.shift else 0;
+                const p = map.entries + i;
+
+                dst = if (@ptrToInt(p) >= @ptrToInt(dst)) p else dst;
+                dst[0] = entry;
+
+                src += 1;
+                dst += 1;
+            }
+
+            self.deinit(gpa);
+            self.entries = map.entries;
+            self.shift = map.shift;
+        }
+
+        pub fn put(self: *Self, gpa: *mem.Allocator, key: K, value: V) !void {
+            try self.putContext(gpa, key, value, undefined);
+        }
+
+        pub fn putContext(self: *Self, gpa: *mem.Allocator, key: K, value: V, ctx: Context) !void {
+            try self.ensureUnusedCapacity(gpa, 1);
+            self.putAssumeCapacityContext(key, value, ctx);
+        }
+
+        pub fn getOrPut(self: *Self, gpa: *mem.Allocator, key: K) !GetOrPutResult {
+            return try self.getOrPutContext(gpa, key, undefined);
+        }
+
+        pub fn getOrPutContext(self: *Self, gpa: *mem.Allocator, key: K, ctx: Context) !GetOrPutResult {
+            try self.ensureUnusedCapacity(gpa, 1);
+            return self.getOrPutAssumeCapacityContext(key, ctx);
+        }
+    };
+}
+
+fn HashMapMixin(
+    comptime Self: type,
+    comptime K: type,
+    comptime V: type,
+    comptime Context: type,
+) type {
+    return struct {
+        pub fn clearRetainingCapacity(self: *Self) void {
+            mem.set(Entry, self.slice(), .{});
+            self.len = 0;
+        }
+
+        pub fn slice(self: *Self) []Self.Entry {
+            const capacity = @as(u64, 1) << (63 - self.shift + 1);
+            const overflow = capacity / 10 + (63 - @as(usize, self.shift) + 1) << 1;
+            return self.entries[0..@intCast(usize, capacity + overflow)];
+        }
+
+        pub fn putAssumeCapacity(self: *Self, key: K, value: V) void {
+            self.putAssumeCapacityContext(key, value, undefined);
+        }
+
+        pub fn putAssumeCapacityContext(self: *Self, key: K, value: V, ctx: Context) void {
+            const result = self.getOrPutAssumeCapacityContext(key, ctx);
+            if (!result.found_existing) result.value_ptr.* = value;
+        }
+
+        pub fn getOrPutAssumeCapacity(self: *Self, key: K) Self.GetOrPutResult {
+            return self.getOrPutAssumeCapacityContext(key, undefined);
+        }
+
+        pub fn getOrPutAssumeCapacityContext(self: *Self, key: K, ctx: Context) Self.GetOrPutResult {
+            var it: Self.Entry = .{ .hash = ctx.hash(key), .key = key, .value = undefined };
+            var i = it.hash >> self.shift;
+
+            assert(it.hash != Self.empty_hash);
+
+            var inserted_at: ?usize = null;
+            while (true) : (i += 1) {
+                const entry = self.entries[i];
+                if (entry.hash >= it.hash) {
+                    if (ctx.eql(entry.key, key)) {
+                        return .{ .found_existing = true, .value_ptr = &self.entries[i].value };
+                    }
+                    self.entries[i] = it;
+                    if (entry.isEmpty()) {
+                        self.len += 1;
+                        return .{ .found_existing = false, .value_ptr = &self.entries[inserted_at orelse i].value };
+                    }
+                    if (inserted_at == null) {
+                        inserted_at = i;
+                    }
+                    it = entry;
+                }
+                self.put_probe_count += 1;
+            }
+        }
+
+        pub fn get(self: *Self, key: K) ?V {
+            return self.getContext(key, undefined);
+        }
+
+        pub fn getContext(self: *Self, key: K, ctx: Context) ?V {
+            const hash = ctx.hash(key);
+            assert(hash != Self.empty_hash);
+
+            var i = hash >> self.shift;
+            while (true) : (i += 1) {
+                const entry = self.entries[i];
+                if (entry.hash >= hash) {
+                    if (!ctx.eql(entry.key, key)) {
+                        return null;
+                    }
+                    return entry.value;
+                }
+                self.get_probe_count += 1;
+            }
+        }
+
+        pub fn delete(self: *Self, key: K) ?V {
+            return self.deleteContext(key, undefined);
+        }
+
+        pub fn deleteContext(self: *Self, key: K, ctx: Context) ?V {
+            const hash = ctx.hash(key);
+            assert(hash != Self.empty_hash);
+
+            var i = hash >> self.shift;
+            while (true) : (i += 1) {
+                const entry = self.entries[i];
+                if (entry.hash >= hash) {
+                    if (!ctx.eql(entry.key, key)) {
+                        return null;
+                    }
+                    break;
+                }
+                self.del_probe_count += 1;
+            }
+
+            const value = self.entries[i].value;
+
+            while (true) : (i += 1) {
+                const j = self.entries[i + 1].hash >> self.shift;
+                if (i < j or self.entries[i + 1].isEmpty()) {
+                    break;
+                }
+                self.entries[i] = self.entries[i + 1];
+                self.del_probe_count += 1;
+            }
+            self.entries[i] = .{};
+            self.len -= 1;
+
+            return value;
+        }
+    };
+}
+
+pub fn SortedHashMap(comptime V: type, comptime max_load_percentage: comptime_int) type {
     return struct {
         const empty_hash: [32]u8 = [_]u8{0xFF} ** 32;
 
@@ -90,6 +344,38 @@ pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) typ
             gpa.free(self.slice());
         }
 
+        /// The following routine has its branches optimized against inputs that are cryptographic hashes by
+        /// assuming that if the first 64 bits of 'a' and 'b' are equivalent, then 'a' and 'b' are most likely
+        /// equivalent.
+        fn cmp(a: [32]u8, b: [32]u8) math.Order {
+            const msa = @bitCast(u64, a[0..8].*);
+            const msb = @bitCast(u64, b[0..8].*);
+            if (msa != msb) {
+                return if (mem.bigToNative(u64, msa) < mem.bigToNative(u64, msb)) .lt else .gt;
+            } else if (@reduce(.And, @as(std.meta.Vector(32, u8), a) == @as(std.meta.Vector(32, u8), b))) {
+                return .eq;
+            } else {
+                switch (math.order(mem.readIntBig(u64, a[8..16]), mem.readIntBig(u64, b[8..16]))) {
+                    .eq => {},
+                    .lt => return .lt,
+                    .gt => return .gt,
+                }
+                switch (math.order(mem.readIntBig(u64, a[16..24]), mem.readIntBig(u64, b[16..24]))) {
+                    .eq => {},
+                    .lt => return .lt,
+                    .gt => return .gt,
+                }
+                return math.order(mem.readIntBig(u64, a[24..32]), mem.readIntBig(u64, b[24..32]));
+            }
+        }
+
+        /// In release-fast mode, LLVM will optimize this routine to utilize 109 cycles. This routine scatters
+        /// hash values across a table into buckets which are lexicographically ordered from one another in
+        /// ascending order.
+        fn idx(a: [32]u8, shift: u6) usize {
+            return @intCast(usize, mem.readIntBig(u64, a[0..8]) >> shift);
+        }
+
         pub fn clearRetainingCapacity(self: *Self) void {
             mem.set(Entry, self.slice(), .{});
             self.len = 0;
@@ -115,7 +401,7 @@ pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) typ
             }
         }
 
-        pub fn grow(self: *Self, gpa: *mem.Allocator) !void {
+        fn grow(self: *Self, gpa: *mem.Allocator) !void {
             const capacity = @as(u64, 1) << (63 - self.shift + 1);
             const overflow = capacity / 10 + (63 - @as(usize, self.shift) + 1) << 1;
             const end = self.entries + @intCast(usize, capacity + overflow);
@@ -157,12 +443,13 @@ pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) typ
             found_existing: bool,
         };
 
-        pub fn getOrPut(self: *Self, gpa: *mem.Allocator, key: [32]u8) GetOrPutResult {
+        pub fn getOrPut(self: *Self, gpa: *mem.Allocator, key: [32]u8) !GetOrPutResult {
             try self.ensureUnusedCapacity(gpa, 1);
             return self.getOrPutAssumeCapacity(key);
         }
 
         pub fn getOrPutAssumeCapacity(self: *Self, key: [32]u8) GetOrPutResult {
+            assert(self.len < (@as(u64, 1) << (63 - self.shift + 1)));
             assert(cmp(key, empty_hash) != .eq);
 
             var it: Entry = .{ .hash = key, .value = undefined };
@@ -238,20 +525,87 @@ pub fn HashMap(comptime V: type, comptime max_load_percentage: comptime_int) typ
     };
 }
 
-test "hash map: cmp" {
+test "StaticHashMap: put, get, delete, grow" {
+    var map: AutoStaticHashMap(usize, usize, 512) = .{};
+
+    var seed: usize = 0;
+    while (seed < 128) : (seed += 1) {
+        var rng = std.rand.DefaultPrng.init(seed);
+
+        const keys = try testing.allocator.alloc(usize, 512);
+        defer testing.allocator.free(keys);
+
+        for (keys) |*key| key.* = rng.random.int(usize);
+
+        try testing.expectEqual(@as(u6, 55), map.shift);
+
+        for (keys) |key, i| map.putAssumeCapacity(key, i);
+        try testing.expectEqual(keys.len, map.len);
+
+        var it: usize = 0;
+        for (map.slice()) |entry| {
+            if (!entry.isEmpty()) {
+                if (it > entry.hash) {
+                    return error.Unsorted;
+                }
+                it = entry.hash;
+            }
+        }
+
+        for (keys) |key, i| try testing.expectEqual(i, map.get(key).?);
+        for (keys) |key, i| try testing.expectEqual(i, map.delete(key).?);
+    }
+}
+
+test "HashMap: put, get, delete, grow" {
+    var seed: usize = 0;
+    while (seed < 128) : (seed += 1) {
+        var rng = std.rand.DefaultPrng.init(seed);
+
+        const keys = try testing.allocator.alloc(usize, 512);
+        defer testing.allocator.free(keys);
+
+        for (keys) |*key| key.* = rng.random.int(usize);
+
+        var map = try AutoHashMap(usize, usize, 50).initCapacity(testing.allocator, 16);
+        defer map.deinit(testing.allocator);
+
+        try testing.expectEqual(@as(u6, 60), map.shift);
+
+        for (keys) |key, i| try map.put(testing.allocator, key, i);
+
+        try testing.expectEqual(@as(u6, 54), map.shift);
+        try testing.expectEqual(keys.len, map.len);
+
+        var it: usize = 0;
+        for (map.slice()) |entry| {
+            if (!entry.isEmpty()) {
+                if (it > entry.hash) {
+                    return error.Unsorted;
+                }
+                it = entry.hash;
+            }
+        }
+
+        for (keys) |key, i| try testing.expectEqual(i, map.get(key).?);
+        for (keys) |key, i| try testing.expectEqual(i, map.delete(key).?);
+    }
+}
+
+test "SortedHashMap: cmp" {
     const prefix = [_]u8{'0'} ** 8 ++ [_]u8{'1'} ** 23;
     const a = prefix ++ [_]u8{0};
     const b = prefix ++ [_]u8{1};
 
-    try testing.expect(cmp(a, b) == .lt);
-    try testing.expect(cmp(b, a) == .gt);
-    try testing.expect(cmp(a, a) == .eq);
-    try testing.expect(cmp(b, b) == .eq);
-    try testing.expect(cmp([_]u8{'i'} ++ [_]u8{'0'} ** 31, [_]u8{'o'} ++ [_]u8{'0'} ** 31) == .lt);
-    try testing.expect(cmp([_]u8{ 'h', 'i' } ++ [_]u8{'0'} ** 30, [_]u8{ 'h', 'o' } ++ [_]u8{'0'} ** 30) == .lt);
+    try testing.expect(SortedHashMap(void, 100).cmp(a, b) == .lt);
+    try testing.expect(SortedHashMap(void, 100).cmp(b, a) == .gt);
+    try testing.expect(SortedHashMap(void, 100).cmp(a, a) == .eq);
+    try testing.expect(SortedHashMap(void, 100).cmp(b, b) == .eq);
+    try testing.expect(SortedHashMap(void, 100).cmp([_]u8{'i'} ++ [_]u8{'0'} ** 31, [_]u8{'o'} ++ [_]u8{'0'} ** 31) == .lt);
+    try testing.expect(SortedHashMap(void, 100).cmp([_]u8{ 'h', 'i' } ++ [_]u8{'0'} ** 30, [_]u8{ 'h', 'o' } ++ [_]u8{'0'} ** 30) == .lt);
 }
 
-test "hash map: put, get, delete, grow" {
+test "SortedHashMap: put, get, delete, grow" {
     var seed: usize = 0;
     while (seed < 128) : (seed += 1) {
         var rng = std.rand.DefaultPrng.init(seed);
@@ -261,7 +615,7 @@ test "hash map: put, get, delete, grow" {
 
         for (keys) |*key| rng.random.bytes(key);
 
-        var map = try HashMap(usize, 50).initCapacity(testing.allocator, 16);
+        var map = try SortedHashMap(usize, 50).initCapacity(testing.allocator, 16);
         defer map.deinit(testing.allocator);
 
         try testing.expectEqual(@as(u6, 60), map.shift);
@@ -286,10 +640,10 @@ test "hash map: put, get, delete, grow" {
     }
 }
 
-test "hash map: collision test" {
+test "SortedHashMap: collision test" {
     const prefix = [_]u8{22} ** 8 ++ [_]u8{1} ** 23;
 
-    var map = try HashMap(usize, 100).initCapacity(testing.allocator, 4);
+    var map = try SortedHashMap(usize, 100).initCapacity(testing.allocator, 4);
     defer map.deinit(testing.allocator);
 
     try map.put(testing.allocator, prefix ++ [_]u8{0}, 0);
