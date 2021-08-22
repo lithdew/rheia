@@ -58,12 +58,12 @@ pub fn run() !void {
     const client_address = ip.Address.initIPv4(IPv4.localhost, 9000);
     log.info("sending transactions to {}...", .{client_address});
 
-    var client = try net.Client.init(runtime.getAllocator(), client_address);
+    var client = try rheia.Client.init(runtime.getAllocator(), client_address);
     defer {
         var shutdown_ctx: Context = .{};
         defer shutdown_ctx.cancel();
 
-        if (client.deinit(runtime.getAllocator(), &shutdown_ctx)) |_| {
+        if (client.deinit(&shutdown_ctx, runtime.getAllocator())) |_| {
             log.info("client successfully shut down", .{});
         } else |err| {
             log.warn("client reported an error while shutting down: {}", .{err});
@@ -92,7 +92,7 @@ pub fn reportBenchmarkStats(ctx: *Context) !void {
     }
 }
 
-pub fn runBenchmark(ctx: *Context, keys: Ed25519.KeyPair, client: *net.Client) !void {
+pub fn runBenchmark(ctx: *Context, keys: Ed25519.KeyPair, client: *rheia.Client) !void {
     while (true) {
         const nonce = nonce_count.fetchAdd(1, .Monotonic);
 
@@ -115,7 +115,7 @@ pub fn runBenchmark(ctx: *Context, keys: Ed25519.KeyPair, client: *net.Client) !
     }
 }
 
-pub fn sendTransactions(ctx: *Context, client: *net.Client, transactions: []const *rheia.Transaction) !void {
+pub fn sendTransactions(ctx: *Context, client: *rheia.Client, transactions: []const *rheia.Transaction) !void {
     var len: u32 = 0;
     for (transactions) |tx| {
         len += tx.size();

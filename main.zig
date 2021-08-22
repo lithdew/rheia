@@ -525,6 +525,99 @@ test "Transaction: create, serialize, and deserialize" {
     try testing.expectEqualStrings(expected.data[0..expected.data_len], actual.data[0..expected.data_len]);
 }
 
+pub const Client = struct {
+    const log = std.log.scoped(.client);
+
+    base: net.Client(Client),
+    rpc: net.RPC,
+
+    pub fn init(gpa: *mem.Allocator, address: ip.Address) !Client {
+        var rpc = try net.RPC.init(gpa, 65536);
+        errdefer rpc.deinit(gpa);
+
+        return Client{ .base = try net.Client(Client).init(gpa, address), .rpc = rpc };
+    }
+
+    pub fn deinit(self: *Client, ctx: *Context, gpa: *mem.Allocator) !void {
+        const result = self.base.deinit(ctx);
+        self.rpc.deinit(gpa);
+        return result;
+    }
+
+    pub fn acquireWriter(self: *Client, ctx: *Context, gpa: *mem.Allocator) !std.ArrayList(u8).Writer {
+        return self.base.acquireWriter(ctx, gpa);
+    }
+
+    pub fn releaseWriter(self: *Client, writer: std.ArrayList(u8).Writer) void {
+        return self.base.releaseWriter(writer);
+    }
+
+    pub fn ensureConnectionAvailable(self: *Client, ctx: *Context, gpa: *mem.Allocator) !void {
+        return self.base.ensureConnectionAvailable(ctx, gpa);
+    }
+
+    pub fn runWriteLoop(self: *Client, ctx: *Context, gpa: *mem.Allocator, client: tcp.Client) !void {
+        var stream: runtime.Stream = .{ .socket = client.socket, .context = ctx };
+        var writer = stream.writer();
+
+        while (true) {
+            while (self.base.buffer.items.len == 0) {
+                try self.base.writer_parker.park(ctx);
+            }
+
+            const buffer = self.base.buffer.toOwnedSlice();
+            defer gpa.free(buffer);
+
+            try writer.writeAll(buffer);
+            self.base.write_parker.notify({});
+        }
+    }
+
+    pub fn runReadLoop(self: *Client, ctx: *Context, gpa: *mem.Allocator, conn_id: usize, client: tcp.Client) !void {
+        var stream: runtime.Stream = .{ .socket = client.socket, .context = ctx };
+        var reader = stream.reader();
+
+        var buffer = std.fifo.LinearFifo(u8, .Dynamic).init(gpa);
+        defer buffer.deinit();
+
+        while (true) {
+            while (buffer.count < net.Packet.size) {
+                const num_bytes = try reader.read(try buffer.writableWithSize(65536));
+                if (num_bytes == 0) return;
+                buffer.update(num_bytes);
+            }
+
+            const packet = try net.Packet.read(buffer.reader());
+
+            while (buffer.count < packet.len) {
+                const num_bytes = try reader.read(try buffer.writableWithSize(65536));
+                if (num_bytes == 0) return;
+                buffer.update(num_bytes);
+            }
+
+            const frame = try gpa.alloc(u8, packet.len);
+            errdefer gpa.free(frame);
+
+            try buffer.reader().readNoEof(frame);
+
+            if (packet.op == .response) {
+                if (!self.rpc.push(.{ .header = packet, .body = frame })) {
+                    log.warn("{} [{}]: got an unexpected response (tag: {}, nonce: {})", .{
+                        self.base.address,
+                        conn_id,
+                        packet.tag,
+                        packet.nonce,
+                    });
+                    gpa.free(frame);
+                }
+                continue;
+            }
+
+            gpa.free(frame);
+        }
+    }
+};
+
 pub const Node = struct {
     const log = std.log.scoped(.node);
 
@@ -535,7 +628,7 @@ pub const Node = struct {
     pusher: TransactionPusher,
     puller: TransactionPuller,
     verifier: TransactionVerifier,
-    clients: std.HashMapUnmanaged(ip.Address, *net.Client, struct {
+    clients: std.HashMapUnmanaged(ip.Address, *Client, struct {
         pub fn hash(_: @This(), address: ip.Address) u64 {
             return net.hashIpAddress(address);
         }
@@ -569,12 +662,12 @@ pub const Node = struct {
 
         var client_it = self.clients.valueIterator();
         while (client_it.next()) |client_ptr| {
-            log.info("shutting down client {}...", .{client_ptr.*.address});
+            log.info("shutting down client {}...", .{client_ptr.*.base.address});
 
-            if (client_ptr.*.deinit(gpa, ctx)) |_| {
-                log.info("client {} successfully shut down", .{client_ptr.*.address});
+            if (client_ptr.*.deinit(ctx, gpa)) |_| {
+                log.info("client {} successfully shut down", .{client_ptr.*.base.address});
             } else |err| {
-                log.warn("client {} reported an error while shutting down: {}", .{ client_ptr.*.address, err });
+                log.warn("client {} reported an error while shutting down: {}", .{ client_ptr.*.base.address, err });
             }
 
             gpa.destroy(client_ptr.*);
@@ -589,24 +682,24 @@ pub const Node = struct {
         log.info("successfully shut down", .{});
     }
 
-    pub fn getOrCreateClient(self: *Node, ctx: *Context, gpa: *mem.Allocator, address: ip.Address) !*net.Client {
+    pub fn getOrCreateClient(self: *Node, ctx: *Context, gpa: *mem.Allocator, address: ip.Address) !*Client {
         if (self.closed) return error.Closed;
 
         const result = try self.clients.getOrPut(gpa, address);
         if (!result.found_existing) {
             errdefer assert(self.clients.remove(address));
 
-            result.value_ptr.* = try gpa.create(net.Client);
+            result.value_ptr.* = try gpa.create(Client);
             errdefer gpa.destroy(result.value_ptr.*);
 
-            result.value_ptr.*.* = try net.Client.init(gpa, address);
-            errdefer result.value_ptr.*.deinit(gpa, ctx) catch {};
+            result.value_ptr.*.* = try Client.init(gpa, address);
+            errdefer result.value_ptr.*.deinit(ctx, gpa) catch {};
 
             const signature = try crypto.sign(self.id, self.keys);
 
             try result.value_ptr.*.ensureConnectionAvailable(ctx, gpa);
 
-            var entry: net.Client.RPC.Entry = .{};
+            var entry: net.RPC.Entry = .{};
             var nonce = try result.value_ptr.*.rpc.register(ctx, &entry);
 
             {
@@ -683,7 +776,59 @@ pub const Node = struct {
         };
     }
 
-    pub fn handleServerPacket(
+    pub fn runReadLoop(self: *Node, ctx: *Context, gpa: *mem.Allocator, conn: *net.Server(Node).Connection) !void {
+        var stream: runtime.Stream = .{ .socket = conn.client.socket, .context = ctx };
+        var reader = stream.reader();
+
+        var buffer = std.fifo.LinearFifo(u8, .Dynamic).init(gpa);
+        defer buffer.deinit();
+
+        while (true) {
+            while (buffer.count < net.Packet.size) {
+                const num_bytes = try reader.read(try buffer.writableWithSize(65536));
+                if (num_bytes == 0) return;
+                buffer.update(num_bytes);
+            }
+
+            const packet = try net.Packet.read(buffer.reader());
+
+            while (buffer.count < packet.len) {
+                const num_bytes = try reader.read(try buffer.writableWithSize(65536));
+                if (num_bytes == 0) return;
+                buffer.update(num_bytes);
+            }
+
+            var frame = io.limitedReader(buffer.reader(), packet.len);
+
+            while (conn.buffer.items.len > 65536) {
+                try conn.write_parker.park(ctx);
+            }
+
+            try self.handleServerPacket(ctx, gpa, conn, packet, &frame);
+        }
+    }
+
+    pub fn runWriteLoop(self: *Node, ctx: *Context, gpa: *mem.Allocator, conn: *net.Server(Node).Connection) !void {
+        _ = self;
+        _ = gpa;
+
+        var stream: runtime.Stream = .{ .socket = conn.client.socket, .context = ctx };
+        var writer = stream.writer();
+
+        while (true) {
+            while (conn.buffer.items.len == 0) {
+                try conn.writer_parker.park(ctx);
+            }
+
+            const buffer = conn.buffer.toOwnedSlice();
+            defer gpa.free(buffer);
+
+            try writer.writeAll(buffer);
+            conn.write_parker.notify({});
+        }
+    }
+
+    fn handleServerPacket(
         self: *Node,
         ctx: *Context,
         gpa: *mem.Allocator,
@@ -1185,7 +1330,7 @@ pub const Chain = struct {
         const cached_block_proposal = if (self.block_proposal_cache.get(address)) |entry| entry.value.ref() else null;
         defer if (cached_block_proposal) |block_proposal| block_proposal.deinit(gpa);
 
-        var entry: net.Client.RPC.Entry = .{};
+        var entry: net.RPC.Entry = .{};
         var nonce = try client.rpc.register(ctx, &entry);
 
         {
@@ -1398,7 +1543,7 @@ pub const TransactionPuller = struct {
 
         const client = try self.node.getOrCreateClient(ctx, gpa, address);
 
-        var entry: net.Client.RPC.Entry = .{};
+        var entry: net.RPC.Entry = .{};
         var nonce = try client.rpc.register(ctx, &entry);
 
         {

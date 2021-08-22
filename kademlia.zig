@@ -145,7 +145,7 @@ pub const NodeFinder = struct {
 
         const client = try self.node.getOrCreateClient(ctx, gpa, id.address);
 
-        var entry: net.Client.RPC.Entry = .{};
+        var entry: net.RPC.Entry = .{};
         var nonce = try client.rpc.register(ctx, &entry);
 
         {
