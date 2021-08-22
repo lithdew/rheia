@@ -4,6 +4,7 @@ const runtime = @import("runtime.zig");
 const mem = std.mem;
 const meta = std.meta;
 const math = std.math;
+const builtin = std.builtin;
 
 const assert = std.debug.assert;
 
@@ -107,6 +108,7 @@ pub fn Parker(comptime T: type) type {
             result: ?T = null,
         };
 
+        result: ?T = null,
         waiters: Task.Deque = .{},
 
         pub fn isEmpty(self: *const Self) bool {
@@ -124,6 +126,10 @@ pub fn Parker(comptime T: type) type {
                 pub fn run(state: *Context.Callback) void {
                     const callback = @fieldParentPtr(@This(), "state", state);
                     if (callback.self.waiters.remove(callback.waiter)) {
+                        if (builtin.is_test) {
+                            resume callback.waiter.frame;
+                            return;
+                        }
                         runtime.schedule(callback.waiter);
                     }
                 }
@@ -132,14 +138,28 @@ pub fn Parker(comptime T: type) type {
             try ctx.register(&callback.state);
             defer ctx.deregister(&callback.state);
 
+            if (self.result) |result| {
+                self.result = null;
+                return result;
+            }
+
             suspend self.waiters.append(&waiter.task);
             return waiter.result orelse return error.Cancelled;
         }
 
         pub fn notify(self: *Self, result: ?T) void {
-            const task = self.waiters.popFirst() orelse return;
+            const task = self.waiters.popFirst() orelse {
+                if (self.result == null) {
+                    self.result = result;
+                }
+                return;
+            };
             const waiter = @fieldParentPtr(Self.Waiter, "task", task);
             waiter.result = result;
+            if (builtin.is_test) {
+                resume task.frame;
+                return;
+            }
             runtime.schedule(task);
         }
 
@@ -147,6 +167,10 @@ pub fn Parker(comptime T: type) type {
             while (self.waiters.popFirst()) |task| {
                 const waiter = @fieldParentPtr(Self.Waiter, "task", task);
                 waiter.result = result;
+                if (builtin.is_test) {
+                    resume task.frame;
+                    continue;
+                }
                 runtime.schedule(task);
             }
         }
@@ -168,6 +192,10 @@ pub const Mutex = struct {
             pub fn run(state: *Context.Callback) void {
                 const callback = @fieldParentPtr(@This(), "state", state);
                 if (callback.self.waiters.remove(callback.waiter)) {
+                    if (builtin.is_test) {
+                        resume callback.waiter.frame;
+                        return;
+                    }
                     runtime.schedule(callback.waiter);
                 }
             }
@@ -194,6 +222,10 @@ pub const Mutex = struct {
             return;
         };
 
+        if (builtin.is_test) {
+            resume waiter.frame;
+            return;
+        }
         runtime.schedule(waiter);
     }
 };
@@ -213,6 +245,10 @@ pub const WaitGroup = struct {
             pub fn run(state: *Context.Callback) void {
                 const callback = @fieldParentPtr(@This(), "state", state);
                 if (callback.self.waiters.remove(callback.waiter)) {
+                    if (builtin.is_test) {
+                        resume callback.waiter.frame;
+                        return;
+                    }
                     runtime.schedule(callback.waiter);
                 }
             }
@@ -235,6 +271,10 @@ pub const WaitGroup = struct {
         self.len -= delta;
         if (self.len > 0) return;
         while (self.waiters.popFirst()) |waiter| {
+            if (builtin.is_test) {
+                resume waiter.frame;
+                continue;
+            }
             runtime.schedule(waiter);
         }
     }

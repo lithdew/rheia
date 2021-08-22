@@ -9,6 +9,7 @@ const mem = std.mem;
 const tcp = std.x.net.tcp;
 const math = std.math;
 const time = std.time;
+const testing = std.testing;
 
 const assert = std.debug.assert;
 
@@ -267,7 +268,6 @@ pub const Client = struct {
                 pub fn run(state: *Context.Callback) void {
                     const callback = @fieldParentPtr(@This(), "state", state);
                     callback.self.pending.entries[callback.nonce & (callback.self.pending.entries.len - 1)] = null;
-                    callback.self.shiftForwards();
                 }
             } = .{ .self = self, .nonce = nonce };
 
@@ -280,13 +280,16 @@ pub const Client = struct {
         }
 
         pub fn push(self: *RPC, response: RPC.Response) bool {
+            defer self.shiftForwards();
+
             const distance = response.header.nonce -% self.pending.tail;
-            if (distance >= self.pending.entries.len) return false;
+            if (distance >= self.pending.entries.len) {
+                return false;
+            }
 
             const index = response.header.nonce & (self.pending.entries.len - 1);
             const entry = self.pending.entries[index] orelse return false;
             self.pending.entries[index] = null;
-            self.shiftForwards();
 
             entry.parker.notify(response);
 
@@ -294,7 +297,10 @@ pub const Client = struct {
         }
 
         fn shiftForwards(self: *RPC) void {
-            while (self.pending.tail != self.pending.head and self.pending.entries[self.pending.tail & (self.pending.entries.len - 1)] == null) {
+            while (self.pending.tail != self.pending.head) {
+                if (self.pending.entries[self.pending.tail & (self.pending.entries.len - 1)] != null) {
+                    break;
+                }
                 self.pending.tail +%= 1;
                 self.request_parker.notify({});
             }
@@ -418,7 +424,7 @@ pub const Client = struct {
 
             var ctx: Context = .{};
             var writer_frame = async self.runWriteLoop(&ctx, gpa, client);
-            var reader_frame = async self.runReadLoop(&ctx, gpa, client);
+            var reader_frame = async self.runReadLoop(&ctx, gpa, conn, client);
 
             await reader_frame catch {};
             ctx.cancel();
@@ -449,7 +455,7 @@ pub const Client = struct {
         }
     }
 
-    fn runReadLoop(self: *Client, ctx: *Context, gpa: *mem.Allocator, client: tcp.Client) !void {
+    fn runReadLoop(self: *Client, ctx: *Context, gpa: *mem.Allocator, conn: *Client.Connection, client: tcp.Client) !void {
         var stream: runtime.Stream = .{ .socket = client.socket, .context = ctx };
         var reader = stream.reader();
 
@@ -478,7 +484,13 @@ pub const Client = struct {
 
             if (packet.op == .response) {
                 if (!self.rpc.push(.{ .header = packet, .body = frame })) {
-                    return error.UnexpectedResponse;
+                    log.warn("{} [{}]: got an unexpected response (tag: {}, nonce: {})", .{
+                        self.address,
+                        conn.id,
+                        packet.tag,
+                        packet.nonce,
+                    });
+                    gpa.free(frame);
                 }
                 continue;
             }
@@ -692,10 +704,49 @@ pub fn Server(comptime Node: type) type {
                     try conn.writer_parker.park(ctx);
                 }
 
-                try writer.writeAll(conn.buffer.items);
-                conn.buffer.clearRetainingCapacity();
+                const buffer = conn.buffer.toOwnedSlice();
+                defer gpa.free(buffer);
+
+                try writer.writeAll(buffer);
                 conn.write_parker.notify({});
             }
         }
     };
+}
+
+test "RPC: rollover with 3 requests at a time given a ring buffer capacity of 4" {
+    var rpc = try Client.RPC.init(testing.allocator, 4);
+    defer rpc.deinit(testing.allocator);
+
+    var ctx: Context = .{};
+    defer nosuspend ctx.cancel();
+
+    comptime var i = 0;
+    inline while (i < 16) : (i += 1) {
+        var a: Client.RPC.Entry = .{};
+        const na = try nosuspend rpc.register(&ctx, &a);
+
+        var b: Client.RPC.Entry = .{};
+        const nb = try nosuspend rpc.register(&ctx, &b);
+
+        var c: Client.RPC.Entry = .{};
+        const nc = try nosuspend rpc.register(&ctx, &c);
+
+        try testing.expect(rpc.push(Client.RPC.Response{ .header = Packet{ .nonce = nb, .len = undefined, .op = undefined, .tag = undefined }, .body = "b" }));
+        try testing.expectEqual(@as(usize, (i + 1) * 3), rpc.pending.head);
+        try testing.expectEqual(@as(usize, i * 3), rpc.pending.tail);
+        try testing.expect(rpc.push(Client.RPC.Response{ .header = Packet{ .nonce = nc, .len = undefined, .op = undefined, .tag = undefined }, .body = "c" }));
+        try testing.expectEqual(@as(usize, (i + 1) * 3), rpc.pending.head);
+        try testing.expectEqual(@as(usize, i * 3), rpc.pending.tail);
+        try testing.expect(rpc.push(Client.RPC.Response{ .header = Packet{ .nonce = na, .len = undefined, .op = undefined, .tag = undefined }, .body = "a" }));
+        try testing.expectEqual(@as(usize, (i + 1) * 3), rpc.pending.head);
+        try testing.expectEqual(@as(usize, (i + 1) * 3), rpc.pending.tail);
+
+        try testing.expectEqualStrings("a", (try nosuspend await a.response).body);
+        try testing.expectEqualStrings("b", (try nosuspend await b.response).body);
+        try testing.expectEqualStrings("c", (try nosuspend await c.response).body);
+        try testing.expectEqual(@as(usize, (i + 1) * 3), rpc.pending.head);
+        try testing.expectEqual(@as(usize, (i + 1) * 3), rpc.pending.tail);
+        try testing.expectEqual(@as(usize, 0), rpc.pending.count());
+    }
 }

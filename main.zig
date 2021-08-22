@@ -284,7 +284,7 @@ pub const Block = struct {
 
     pub fn create(gpa: *mem.Allocator, params: Block.Params) !*Block {
         const bytes_len = @sizeOf(Block) + params.transaction_ids.len * @sizeOf([32]u8);
-        const bytes = try gpa.alignedAlloc(u8, @alignOf(Block), bytes_len);
+        const bytes = try gpa.alignedAlloc(u8, math.max(@alignOf(Block), @alignOf([32]u8)), bytes_len);
         errdefer gpa.free(bytes);
 
         const block = @ptrCast(*Block, bytes.ptr);
@@ -383,7 +383,7 @@ pub const Transaction = struct {
     data: [*]u8,
 
     pub fn create(gpa: *mem.Allocator, keys: Ed25519.KeyPair, params: Transaction.Params) !*Transaction {
-        const bytes = try gpa.alignedAlloc(u8, @alignOf(Transaction), @sizeOf(Transaction) + params.data.len);
+        const bytes = try gpa.alignedAlloc(u8, math.max(@alignOf(Transaction), @alignOf(u8)), @sizeOf(Transaction) + params.data.len);
         errdefer gpa.free(bytes);
 
         const tx = @ptrCast(*Transaction, bytes.ptr);
@@ -783,6 +783,7 @@ pub const Node = struct {
                     },
                     .pull_block => {
                         const requested_height = try frame.reader().readIntLittle(u64);
+                        const requested_cache_id = frame.reader().readBytesNoEof(32) catch null;
                         const latest_height = if (self.chain.blocks.latest()) |latest_block| latest_block.height else 0;
 
                         const requested_block = block: {
@@ -796,16 +797,20 @@ pub const Node = struct {
                         };
 
                         const cache_hit = cache_hit: {
-                            const cache_id = frame.reader().readBytesNoEof(32) catch break :cache_hit false;
+                            const cache_id = requested_cache_id orelse break :cache_hit false;
                             const block = requested_block orelse break :cache_hit false;
-                            if (!mem.eql(u8, &block.id, &cache_id)) {
-                                break :cache_hit false;
-                            }
-                            break :cache_hit true;
+                            break :cache_hit mem.eql(u8, &block.id, &cache_id);
                         };
 
+                        var len: u32 = 1;
+                        if (requested_block) |block| {
+                            if (!cache_hit) {
+                                len += block.size();
+                            }
+                        }
+
                         try (net.Packet{
-                            .len = 1 + (if (requested_block) |block| if (!cache_hit) block.size() else 0 else 0),
+                            .len = len,
                             .nonce = packet.nonce,
                             .op = .response,
                             .tag = .pull_block,
@@ -1163,11 +1168,6 @@ pub const Chain = struct {
         }
     }
 
-    fn debugTimeout(ctx: *Context, comptime layout: []const u8, client: *net.Client) void {
-        runtime.timeout(ctx, .{ .seconds = 3 }) catch return;
-        log.warn(layout, .{client.address});
-    }
-
     fn pullBlock(
         self: *Chain,
         ctx: *Context,
@@ -1187,13 +1187,6 @@ pub const Chain = struct {
 
         var entry: net.Client.RPC.Entry = .{};
         var nonce = try client.rpc.register(ctx, &entry);
-
-        var debug_ctx: Context = .{};
-        var debug_frame = async debugTimeout(&debug_ctx, "peer {} did not send a response after 3 seconds", client);
-        defer {
-            debug_ctx.cancel();
-            await debug_frame;
-        }
 
         {
             const writer = try client.acquireWriter(ctx, gpa);
@@ -1775,7 +1768,7 @@ pub const Sampler = struct {
     const log = std.log.scoped(.sampler);
 
     pub const default_alpha = 0.8;
-    pub const default_beta = 20;
+    pub const default_beta = 150;
 
     pub const Vote = struct {
         block: ?*Block,
