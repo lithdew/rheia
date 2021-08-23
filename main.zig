@@ -1,6 +1,7 @@
 const std = @import("std");
 const net = @import("net.zig");
 const lru = @import("lru.zig");
+const http = @import("http.zig");
 const args = @import("args.zig");
 const sync = @import("sync.zig");
 const crypto = @import("crypto.zig");
@@ -94,50 +95,13 @@ pub const Options = struct {
         }
 
         var listen_address = try net.parseIpAddress(arguments.options.@"listen-address");
-        switch (listen_address) {
-            .ipv4 => |*ipv4| {
-                if (ipv4.host.isUnspecified()) {
-                    ipv4.host = IPv4.localhost;
-                }
-            },
-            .ipv6 => |*ipv6| {
-                if (ipv6.host.isUnspecified()) {
-                    ipv6.host = IPv6.localhost;
-                }
-            },
-        }
-
         var http_address = try net.parseIpAddress(arguments.options.@"http-address");
-        switch (http_address) {
-            .ipv4 => |*ipv4| {
-                if (ipv4.host.isUnspecified()) {
-                    ipv4.host = IPv4.localhost;
-                }
-            },
-            .ipv6 => |*ipv6| {
-                if (ipv6.host.isUnspecified()) {
-                    ipv6.host = IPv6.localhost;
-                }
-            },
-        }
 
         const bootstrap_addresses = try gpa.alloc(ip.Address, arguments.positionals.len);
         errdefer gpa.free(bootstrap_addresses);
 
         for (arguments.positionals) |arg, i| {
             bootstrap_addresses[i] = try net.parseIpAddress(arg);
-            switch (bootstrap_addresses[i]) {
-                .ipv4 => |*ipv4| {
-                    if (ipv4.host.isUnspecified()) {
-                        ipv4.host = IPv4.localhost;
-                    }
-                },
-                .ipv6 => |*ipv6| {
-                    if (ipv6.host.isUnspecified()) {
-                        ipv6.host = IPv6.localhost;
-                    }
-                },
-            }
         }
 
         return Options{
@@ -172,27 +136,17 @@ pub fn run() !void {
     const options = try Options.parse(runtime.getAllocator());
     defer options.deinit(runtime.getAllocator());
 
+    const keys = try Ed25519.KeyPair.create(null);
+    log.debug("public key: {}", .{fmt.fmtSliceHexLower(&keys.public_key)});
+    log.debug("secret key: {}", .{fmt.fmtSliceHexLower(keys.secret_key[0..Ed25519.seed_length])});
+
     log.info("press ctrl+c to commence graceful shutdown", .{});
 
     var ctx: Context = .{};
     defer ctx.cancel();
 
-    var listener = try tcp.Listener.init(.ip, .{ .close_on_exec = true });
-    defer listener.deinit();
-
-    try listener.setReuseAddress(true);
-    try listener.setReusePort(true);
-    try listener.setFastOpen(true);
-
-    try listener.bind(options.listen_address);
-    try listener.listen(128);
-
-    const keys = try Ed25519.KeyPair.create(null);
-    log.debug("public key: {}", .{fmt.fmtSliceHexLower(&keys.public_key)});
-    log.debug("secret key: {}", .{fmt.fmtSliceHexLower(keys.secret_key[0..Ed25519.seed_length])});
-
     var node: Node = undefined;
-    try node.init(runtime.getAllocator(), keys, try listener.getLocalAddress());
+    try node.init(runtime.getAllocator(), keys, options.listen_address);
     defer {
         var shutdown_ctx: Context = .{};
         defer shutdown_ctx.cancel();
@@ -203,20 +157,11 @@ pub fn run() !void {
     var node_frame = async node.run(&ctx, runtime.getAllocator());
     defer await node_frame catch |err| log.warn("node error: {}", .{err});
 
-    var server = net.Server(Node).init(&node);
-    defer {
-        var shutdown_ctx: Context = .{};
-        defer shutdown_ctx.cancel();
+    var node_listener_frame = async startNodeListener(&ctx, options, &node);
+    defer await node_listener_frame catch |err| log.warn("node listener error: {}", .{err});
 
-        if (server.deinit(&shutdown_ctx)) |_| {
-            log.info("server successfully shut down", .{});
-        } else |err| {
-            log.warn("server reported an error while shutting down: {}", .{err});
-        }
-    }
-
-    var server_frame = async server.serve(&ctx, runtime.getAllocator(), listener);
-    defer await server_frame catch |err| log.warn("server error: {}", .{err});
+    var http_listener_frame = async startHttpListener(&ctx, options, &node);
+    defer await http_listener_frame catch |err| log.warn("http listener error: {}", .{err});
 
     var stats_frame = async reportStatistics(&ctx);
     defer await stats_frame catch |err| log.warn("stats error: {}", .{err});
@@ -226,24 +171,87 @@ pub fn run() !void {
         try client.ensureConnectionAvailable(&ctx, runtime.getAllocator());
     }
 
-    {
-        var finder = try kademlia.NodeFinder.init(runtime.getAllocator(), &node);
-        defer finder.deinit(&ctx, runtime.getAllocator());
-
-        var peer_ids: [16]kademlia.ID = undefined;
-        const num_peer_ids = try finder.find(&ctx, runtime.getAllocator(), &peer_ids, node.keys.public_key);
-
-        for (peer_ids[0..num_peer_ids]) |id| {
-            log.info("got peer id: {}", .{id});
-        }
-    }
-
-    log.info("total peers connected to: {}", .{node.table.len});
+    try bootstrapNodeWithPeers(&ctx, &node);
 
     runtime.waitForSignal(&ctx, .{os.SIGINT}) catch {};
     log.info("gracefully shutting down...", .{});
 
     ctx.cancel();
+}
+
+pub fn startNodeListener(ctx: *Context, options: Options, node: *Node) !void {
+    const log = std.log.scoped(.main);
+    defer ctx.cancel();
+
+    var tcp_listener = try tcp.Listener.init(.ip, .{ .close_on_exec = true });
+    defer tcp_listener.deinit();
+
+    try tcp_listener.setReuseAddress(true);
+    try tcp_listener.setReusePort(true);
+    try tcp_listener.setFastOpen(true);
+
+    try tcp_listener.bind(options.listen_address);
+    try tcp_listener.listen(128);
+
+    var node_listener = net.Listener(Node).init(node);
+    defer {
+        var shutdown_ctx: Context = .{};
+        defer shutdown_ctx.cancel();
+
+        if (node_listener.deinit(&shutdown_ctx)) |_| {
+            log.info("node listener successfully shut down", .{});
+        } else |err| {
+            log.warn("node listener reported an error while shutting down: {}", .{err});
+        }
+    }
+
+    return node.serve(ctx, runtime.getAllocator(), &node_listener, tcp_listener);
+}
+
+pub fn startHttpListener(ctx: *Context, options: Options, node: *Node) !void {
+    const log = std.log.scoped(.main);
+    defer ctx.cancel();
+
+    var tcp_listener = try tcp.Listener.init(.ip, .{ .close_on_exec = true });
+    defer tcp_listener.deinit();
+
+    try tcp_listener.setReuseAddress(true);
+    try tcp_listener.setReusePort(true);
+    try tcp_listener.setFastOpen(true);
+
+    try tcp_listener.bind(options.http_address);
+    try tcp_listener.listen(128);
+
+    var http_server = http.Server(Node).init(node);
+    var http_listener = net.Listener(http.Server(Node)).init(&http_server);
+    defer {
+        var shutdown_ctx: Context = .{};
+        defer shutdown_ctx.cancel();
+
+        if (http_listener.deinit(&shutdown_ctx)) |_| {
+            log.info("http listener successfully shut down", .{});
+        } else |err| {
+            log.warn("http listener reported an error while shutting down: {}", .{err});
+        }
+    }
+
+    return http_server.serve(ctx, runtime.getAllocator(), &http_listener, tcp_listener);
+}
+
+fn bootstrapNodeWithPeers(ctx: *Context, node: *Node) !void {
+    const log = std.log.scoped(.main);
+
+    var finder = try kademlia.NodeFinder.init(runtime.getAllocator(), node);
+    defer finder.deinit(ctx, runtime.getAllocator());
+
+    var peer_ids: [16]kademlia.ID = undefined;
+    const num_peer_ids = try finder.find(ctx, runtime.getAllocator(), &peer_ids, node.keys.public_key);
+
+    for (peer_ids[0..num_peer_ids]) |id| {
+        log.info("got peer id: {}", .{id});
+    }
+
+    log.info("total peers connected to: {}", .{node.table.len});
 }
 
 var finalized_count: Atomic(u64) = .{ .value = 0 };
@@ -682,6 +690,15 @@ pub const Node = struct {
         log.info("successfully shut down", .{});
     }
 
+    pub fn serve(_: *Node, ctx: *Context, gpa: *mem.Allocator, net_listener: *net.Listener(Node), listener: tcp.Listener) !void {
+        const bind_address = try listener.getLocalAddress();
+
+        log.info("listening for peers: {}", .{bind_address});
+        defer log.info("stopped listening for peers: {}", .{bind_address});
+
+        return net_listener.serve(ctx, gpa, listener);
+    }
+
     pub fn getOrCreateClient(self: *Node, ctx: *Context, gpa: *mem.Allocator, address: ip.Address) !*Client {
         if (self.closed) return error.Closed;
 
@@ -776,7 +793,7 @@ pub const Node = struct {
         };
     }
 
-    pub fn runReadLoop(self: *Node, ctx: *Context, gpa: *mem.Allocator, conn: *net.Server(Node).Connection) !void {
+    pub fn runReadLoop(self: *Node, ctx: *Context, gpa: *mem.Allocator, conn: *net.Listener(Node).Connection) !void {
         var stream: runtime.Stream = .{ .socket = conn.client.socket, .context = ctx };
         var reader = stream.reader();
 
@@ -808,7 +825,7 @@ pub const Node = struct {
         }
     }
 
-    pub fn runWriteLoop(self: *Node, ctx: *Context, gpa: *mem.Allocator, conn: *net.Server(Node).Connection) !void {
+    pub fn runWriteLoop(self: *Node, ctx: *Context, gpa: *mem.Allocator, conn: *net.Listener(Node).Connection) !void {
         _ = self;
         _ = gpa;
 
@@ -828,11 +845,44 @@ pub const Node = struct {
         }
     }
 
+    pub fn handleHttpRequest(
+        self: *Node,
+        ctx: *Context,
+        request: http.Request,
+        reader: anytype,
+        writer: anytype,
+    ) !void {
+        _ = self;
+        _ = ctx;
+        _ = request;
+        _ = reader;
+
+        const response: http.Response = .{
+            .minor_version = 1,
+            .status_code = 200,
+            .message = "OK",
+            .headers = &[_]http.Header{
+                .{
+                    .name = "Content-Type",
+                    .value = "text/html",
+                },
+                .{
+                    .name = "Content-Length",
+                    .value = fmt.comptimePrint("{d}", .{"hello world".len}),
+                },
+            },
+            .num_headers = 2,
+        };
+
+        try writer.print("{}", .{response});
+        try writer.print("hello world", .{});
+    }
+
     fn handleServerPacket(
         self: *Node,
         ctx: *Context,
         gpa: *mem.Allocator,
-        conn: *net.Server(Node).Connection,
+        conn: *net.Listener(Node).Connection,
         packet: net.Packet,
         frame: anytype,
     ) !void {

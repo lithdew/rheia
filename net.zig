@@ -21,7 +21,7 @@ const DynamicRingBuffer = @import("ring_buffer.zig").DynamicRingBuffer;
 
 pub fn parseIpAddress(address: []const u8) !ip.Address {
     const parsed = splitHostPort(address) catch |err| return switch (err) {
-        error.DelimiterNotFound => ip.Address.initIPv4(IPv4.unspecified, try fmt.parseUnsigned(u16, address, 10)),
+        error.DelimiterNotFound => ip.Address.initIPv4(IPv4.localhost, try fmt.parseUnsigned(u16, address, 10)),
         else => err,
     };
     const parsed_host = parsed.host;
@@ -486,9 +486,9 @@ pub fn Client(comptime Protocol: type) type {
     };
 }
 
-pub fn Server(comptime Protocol: type) type {
+pub fn Listener(comptime Protocol: type) type {
     return struct {
-        const log = std.log.scoped(.server);
+        const log = std.log.scoped(.listener);
 
         const Self = @This();
 
@@ -511,11 +511,6 @@ pub fn Server(comptime Protocol: type) type {
         }
 
         pub fn serve(self: *Self, ctx: *Context, gpa: *mem.Allocator, listener: tcp.Listener) !void {
-            const bind_address = try listener.getLocalAddress();
-
-            log.info("listening for peers: {}", .{bind_address});
-            defer log.info("stopped listening for peers: {}", .{bind_address});
-
             var callback: struct {
                 state: Context.Callback = .{ .run = @This().run },
                 listener: tcp.Listener,
@@ -567,8 +562,8 @@ pub fn Server(comptime Protocol: type) type {
                 suspend self.closeConnection(gpa, @frame());
             }
 
-            log.info("new peer connected: {}", .{conn.address});
-            defer log.info("peer disconnected: {}", .{conn.address});
+            log.info("connected: {}", .{conn.address});
+            defer log.info("disconnected: {}", .{conn.address});
 
             var callback = struct {
                 state: Context.Callback = .{ .run = @This().run },
@@ -583,15 +578,15 @@ pub fn Server(comptime Protocol: type) type {
             try ctx.register(&callback.state);
             defer ctx.deregister(&callback.state);
 
-            var server_conn: Self.Connection = .{
+            var listener_conn: Self.Connection = .{
                 .client = conn.client,
                 .buffer = std.ArrayList(u8).init(gpa),
             };
-            defer server_conn.buffer.deinit();
+            defer listener_conn.buffer.deinit();
 
             var child_ctx: Context = .{};
-            var writer_frame = async self.protocol.runWriteLoop(&child_ctx, gpa, &server_conn);
-            var reader_frame = async self.protocol.runReadLoop(&child_ctx, gpa, &server_conn);
+            var writer_frame = async self.protocol.runWriteLoop(&child_ctx, gpa, &listener_conn);
+            var reader_frame = async self.protocol.runReadLoop(&child_ctx, gpa, &listener_conn);
 
             await reader_frame catch {};
             child_ctx.cancel();
