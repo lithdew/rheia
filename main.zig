@@ -19,6 +19,7 @@ const meta = std.meta;
 const time = std.time;
 const testing = std.testing;
 
+const Uri = @import("uri.zig").Uri;
 const IPv4 = std.x.os.IPv4;
 const IPv6 = std.x.os.IPv6;
 const Context = runtime.Context;
@@ -854,8 +855,10 @@ pub const Node = struct {
     ) !void {
         _ = self;
         _ = ctx;
-        _ = request;
         _ = reader;
+
+        const uri = try Uri.parse(request.path, true);
+        std.debug.print("request uri: {s}\n", .{uri.path});
 
         const response: http.Response = .{
             .minor_version = 1,
