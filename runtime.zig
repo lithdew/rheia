@@ -222,9 +222,11 @@ pub const Runtime = struct {
         self.gpa_instance = .{};
         if (builtin.link_libc) {
             self.gpa_instance.backing_allocator = std.heap.c_allocator;
-            self.gpa = std.heap.c_allocator;
-        } else {
+        }
+        if (builtin.mode != .Debug) {
             self.gpa = &self.gpa_instance.allocator;
+        } else {
+            self.gpa = std.heap.c_allocator;
         }
 
         self.pool = Pool.init(.{ .max_threads = 7 });

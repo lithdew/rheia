@@ -19,7 +19,6 @@ const meta = std.meta;
 const time = std.time;
 const testing = std.testing;
 
-const Uri = @import("uri.zig").Uri;
 const IPv4 = std.x.os.IPv4;
 const IPv6 = std.x.os.IPv6;
 const Context = runtime.Context;
@@ -47,6 +46,7 @@ const usage = fmt.comptimePrint(
     \\Options:
     \\  -h, --help                                Show this screen.
     \\  -v, --version                             Show version.
+    \\  -d, --database-path                       File path for storing all state and data.
     \\  -l, --listen-address ([<host>][:]<port>)  Address to listen for peers on. [default: 127.0.0.1:9000]
     \\  -b, --http-address ([<host>][:]<port>)    Address to handle HTTP requests on. [default: 127.0.0.1:8080]
     \\
@@ -59,14 +59,16 @@ const usage = fmt.comptimePrint(
 pub const Arguments = struct {
     @"listen-address": []const u8 = "127.0.0.1:9000",
     @"http-address": []const u8 = "127.0.0.1:8080",
+    @"database-path": ?[]const u8 = null,
     help: bool = false,
     version: bool = false,
 
     pub const shorthands = .{
+        .h = "help",
+        .v = "version",
+        .d = "database-path",
         .l = "listen-address",
         .b = "http-address",
-        .v = "version",
-        .h = "help",
     };
 
     pub fn parse(gpa: *mem.Allocator) !args.ParseArgsResult(Arguments) {
@@ -77,6 +79,7 @@ pub const Arguments = struct {
 pub const Options = struct {
     listen_address: ip.Address,
     http_address: ip.Address,
+    database_path: ?[]const u8,
     bootstrap_addresses: []const ip.Address,
 
     pub fn parse(gpa: *mem.Allocator) !Options {
@@ -98,6 +101,9 @@ pub const Options = struct {
         var listen_address = try net.parseIpAddress(arguments.options.@"listen-address");
         var http_address = try net.parseIpAddress(arguments.options.@"http-address");
 
+        const database_path = if (arguments.options.@"database-path") |text| try gpa.dupe(u8, text) else null;
+        errdefer if (database_path) |text| gpa.free(text);
+
         const bootstrap_addresses = try gpa.alloc(ip.Address, arguments.positionals.len);
         errdefer gpa.free(bootstrap_addresses);
 
@@ -108,11 +114,15 @@ pub const Options = struct {
         return Options{
             .listen_address = listen_address,
             .http_address = http_address,
+            .database_path = database_path,
             .bootstrap_addresses = bootstrap_addresses,
         };
     }
 
     pub fn deinit(self: Options, gpa: *mem.Allocator) void {
+        if (self.database_path) |text| {
+            gpa.free(text);
+        }
         gpa.free(self.bootstrap_addresses);
     }
 };
@@ -146,8 +156,11 @@ pub fn run() !void {
     var ctx: Context = .{};
     defer ctx.cancel();
 
+    var store = try Store.init(runtime.getAllocator(), options.database_path);
+    defer store.deinit();
+
     var node: Node = undefined;
-    try node.init(runtime.getAllocator(), keys, options.listen_address);
+    try node.init(runtime.getAllocator(), &store, keys, options.listen_address);
     defer {
         var shutdown_ctx: Context = .{};
         defer shutdown_ctx.cancel();
@@ -277,6 +290,42 @@ pub const Block = struct {
     pub const header_size = @sizeOf(u64) + @sizeOf([32]u8) + @sizeOf(u16);
     pub const max_num_transaction_ids: u16 = (net.Packet.max_size - net.Packet.size - Block.header_size) / @sizeOf([32]u8) / 2;
 
+    pub const Summary = struct {
+        id: [32]u8,
+        height: u64,
+        merkle_root: [32]u8,
+        num_transaction_ids: u16,
+
+        pub fn jsonStringify(self: Block.Summary, options: std.json.StringifyOptions, writer: anytype) !void {
+            _ = options;
+
+            var stream = std.json.writeStream(writer, 4);
+            var buf: [64]u8 = undefined;
+
+            try stream.beginObject();
+
+            try stream.objectField("id");
+            try stream.emitString(fmt.bufPrint(&buf, "{}", .{fmt.fmtSliceHexLower(&self.id)}) catch unreachable);
+
+            try stream.objectField("height");
+            try stream.emitNumber(self.height);
+
+            try stream.objectField("merkle_root");
+            try stream.emitString(fmt.bufPrint(&buf, "{}", .{fmt.fmtSliceHexLower(&self.merkle_root)}) catch unreachable);
+
+            try stream.objectField("num_transaction_ids");
+            try stream.emitNumber(self.num_transaction_ids);
+            try stream.endObject();
+        }
+    };
+
+    pub const Data = struct {
+        id: [32]u8,
+        height: u64,
+        merkle_root: [32]u8,
+        transaction_ids: []const [32]u8,
+    };
+
     pub const Params = struct {
         height: u64,
         merkle_root: [32]u8,
@@ -311,6 +360,26 @@ pub const Block = struct {
         var hash = crypto.HashWriter(Blake3).wrap(Blake3.init(.{}));
         try block.write(hash.writer());
         block.id = hash.digest(32);
+
+        return block;
+    }
+
+    pub fn from(gpa: *mem.Allocator, format: Block.Data) !*Block {
+        const bytes_len = @sizeOf(Block) + format.transaction_ids.len * @sizeOf([32]u8);
+        const bytes = try gpa.alignedAlloc(u8, math.max(@alignOf(Block), @alignOf([32]u8)), bytes_len);
+        errdefer gpa.free(bytes);
+
+        const block = @ptrCast(*Block, bytes.ptr);
+
+        block.refs = 1;
+        block.height = format.height;
+        block.merkle_root = format.merkle_root;
+        block.num_transaction_ids = @intCast(u16, format.transaction_ids.len);
+
+        block.transaction_ids = @ptrCast([*][32]u8, bytes.ptr + @sizeOf(Block));
+        mem.copy([32]u8, block.transaction_ids[0..block.num_transaction_ids], format.transaction_ids);
+
+        block.id = format.id;
 
         return block;
     }
@@ -363,13 +432,54 @@ pub const Block = struct {
 
         return block;
     }
+
+    pub fn jsonStringify(self: Block, options: std.json.StringifyOptions, writer: anytype) !void {
+        _ = options;
+
+        var stream = std.json.writeStream(writer, 4);
+        var buf: [64]u8 = undefined;
+
+        try stream.beginObject();
+
+        try stream.objectField("id");
+        try stream.emitString(fmt.bufPrint(&buf, "{}", .{fmt.fmtSliceHexLower(&self.id)}) catch unreachable);
+
+        try stream.objectField("height");
+        try stream.emitNumber(self.height);
+
+        try stream.objectField("merkle_root");
+        try stream.emitString(fmt.bufPrint(&buf, "{}", .{fmt.fmtSliceHexLower(&self.merkle_root)}) catch unreachable);
+
+        try stream.objectField("transaction_ids");
+        try stream.beginArray();
+        for (self.transaction_ids[0..self.num_transaction_ids]) |transaction_id| {
+            try stream.arrayElem();
+            try stream.emitString(fmt.bufPrint(&buf, "{}", .{fmt.fmtSliceHexLower(&transaction_id)}) catch unreachable);
+        }
+        try stream.endArray();
+
+        try stream.endObject();
+    }
 };
 
 pub const Transaction = struct {
     pub const header_size = @sizeOf([32]u8) + @sizeOf([64]u8) + @sizeOf(u32) + @sizeOf(u64) + @sizeOf(u64) + @sizeOf(Transaction.Tag);
 
     pub const Tag = enum(u8) {
+        pub const BaseType = []const u8;
+
         no_op,
+        stmt,
+    };
+
+    pub const Data = struct {
+        id: [32]u8,
+        sender: [32]u8,
+        signature: [64]u8,
+        sender_nonce: u64,
+        created_at: u64,
+        tag: Tag,
+        data: []const u8,
     };
 
     pub const Params = struct {
@@ -417,6 +527,29 @@ pub const Transaction = struct {
         var hash = crypto.HashWriter(Blake3).wrap(Blake3.init(.{}));
         try tx.write(hash.writer());
         tx.id = hash.digest(32);
+
+        return tx;
+    }
+
+    pub fn from(gpa: *mem.Allocator, format: Transaction.Data) !*Transaction {
+        const bytes = try gpa.alignedAlloc(u8, math.max(@alignOf(Transaction), @alignOf(u8)), @sizeOf(Transaction) + format.data.len);
+        errdefer gpa.free(bytes);
+
+        const tx = @ptrCast(*Transaction, bytes.ptr);
+
+        tx.refs = 1;
+        tx.sender = format.sender;
+        tx.data_len = @intCast(u32, format.data.len);
+
+        tx.sender_nonce = format.sender_nonce;
+        tx.created_at = format.created_at;
+        tx.tag = format.tag;
+
+        tx.data = bytes.ptr + @sizeOf(Transaction);
+        mem.copy(u8, tx.data[0..tx.data_len], format.data);
+
+        tx.signature = format.signature;
+        tx.id = format.id;
 
         return tx;
     }
@@ -476,6 +609,38 @@ pub const Transaction = struct {
         tx.refs = 1;
 
         return tx;
+    }
+
+    pub fn jsonStringify(self: Transaction, options: std.json.StringifyOptions, writer: anytype) !void {
+        _ = options;
+
+        var stream = std.json.writeStream(writer, 4);
+        var buf: [128]u8 = undefined;
+
+        try stream.beginObject();
+
+        try stream.objectField("id");
+        try stream.emitString(fmt.bufPrint(&buf, "{}", .{fmt.fmtSliceHexLower(&self.id)}) catch unreachable);
+
+        try stream.objectField("sender");
+        try stream.emitString(fmt.bufPrint(&buf, "{}", .{fmt.fmtSliceHexLower(&self.sender)}) catch unreachable);
+
+        try stream.objectField("signature");
+        try stream.emitString(fmt.bufPrint(&buf, "{}", .{fmt.fmtSliceHexLower(&self.signature)}) catch unreachable);
+
+        try stream.objectField("sender_nonce");
+        try stream.emitNumber(self.sender_nonce);
+
+        try stream.objectField("created_at");
+        try stream.emitNumber(self.created_at);
+
+        try stream.objectField("tag");
+        try stream.emitString(@tagName(self.tag));
+
+        try stream.objectField("data");
+        try stream.emitString(self.data[0..self.data_len]);
+
+        try stream.endObject();
     }
 };
 
@@ -649,11 +814,11 @@ pub const Node = struct {
     table: kademlia.RoutingTable,
     closed: bool = false,
 
-    pub fn init(self: *Node, gpa: *mem.Allocator, keys: Ed25519.KeyPair, address: ip.Address) !void {
+    pub fn init(self: *Node, gpa: *mem.Allocator, store: *Store, keys: Ed25519.KeyPair, address: ip.Address) !void {
         self.keys = keys;
         self.id = .{ .public_key = keys.public_key, .address = address };
 
-        self.chain = try Chain.init(gpa);
+        self.chain = try Chain.init(gpa, store);
         errdefer self.chain.deinit(gpa);
 
         self.pusher = try TransactionPusher.init(gpa, self);
@@ -776,11 +941,14 @@ pub const Node = struct {
     }
 
     pub fn addTransaction(self: *Node, ctx: *Context, gpa: *mem.Allocator, tx: *Transaction) !void {
-        if (self.chain.finalized.get(tx.id) != null) {
+        var conn = try self.chain.store.acquireConnection();
+        defer self.chain.store.releaseConnection(&conn);
+
+        if (self.chain.store.isTransactionFinalized(&conn, tx.id)) {
             return error.AlreadyExists;
         }
 
-        const result = self.chain.pending.getOrPutAssumeCapacity(tx.id);
+        const result = try self.chain.pending.getOrPut(gpa, tx.id);
         if (result.found_existing) {
             return error.AlreadyExists;
         }
@@ -846,39 +1014,450 @@ pub const Node = struct {
         }
     }
 
-    pub fn handleHttpRequest(
+    pub usingnamespace http.router.build(*Node, .{
+        http.router.get("/", Node.httpIndex),
+        http.router.get("/blocks", Node.httpGetBlocks),
+        http.router.get("/transactions", Node.httpGetTransactions),
+        http.router.get("/database/:query", Node.httpQueryDatabase),
+
+        http.router.post("/transactions", Node.httpSubmitTransaction),
+    });
+
+    pub fn httpIndex(
         self: *Node,
         ctx: *Context,
+        gpa: *mem.Allocator,
         request: http.Request,
         reader: anytype,
         writer: anytype,
+        params: []http.router.Param,
     ) !void {
         _ = self;
         _ = ctx;
+        _ = gpa;
+        _ = request;
         _ = reader;
-
-        const uri = try Uri.parse(request.path, true);
-        std.debug.print("request uri: {s}\n", .{uri.path});
+        _ = params;
 
         const response: http.Response = .{
-            .minor_version = 1,
             .status_code = 200,
             .message = "OK",
             .headers = &[_]http.Header{
-                .{
-                    .name = "Content-Type",
-                    .value = "text/html",
-                },
-                .{
-                    .name = "Content-Length",
-                    .value = fmt.comptimePrint("{d}", .{"hello world".len}),
-                },
+                .{ .name = "Content-Type", .value = "text/html" },
+                .{ .name = "Content-Length", .value = fmt.comptimePrint("{d}", .{"hello world".len}) },
             },
             .num_headers = 2,
         };
 
         try writer.print("{}", .{response});
         try writer.print("hello world", .{});
+    }
+
+    pub fn httpGetBlocks(
+        self: *Node,
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        request: http.Request,
+        reader: anytype,
+        writer: anytype,
+        params: []http.router.Param,
+    ) !void {
+        _ = self;
+        _ = ctx;
+        _ = gpa;
+        _ = request;
+        _ = reader;
+        _ = params;
+
+        const uri = try http.Uri.parse(request.path, true);
+
+        var query = try http.Uri.mapQuery(gpa, uri.query);
+        defer query.deinit();
+
+        var body = std.ArrayList(u8).init(gpa);
+        defer body.deinit();
+
+        var content = io.countingWriter(body.writer());
+        var length_buf: [16]u8 = undefined;
+
+        if (query.get("id")) |id_hex| {
+            if (id_hex.len != 64) {
+                return error.BadBlockId;
+            }
+
+            var id: [32]u8 = undefined;
+            _ = try fmt.hexToBytes(&id, id_hex);
+
+            const maybe_block_result = maybe_block: {
+                var conn = try self.chain.store.acquireConnection();
+                defer self.chain.store.releaseConnection(&conn);
+
+                runtime.startCpuBoundOperation();
+                defer runtime.endCpuBoundOperation();
+
+                break :maybe_block self.chain.store.getBlockById(gpa, &conn, id);
+            };
+
+            const maybe_block = try maybe_block_result;
+            defer if (maybe_block) |block| block.deinit(gpa);
+
+            const block = maybe_block orelse return error.BlockNotFound;
+            try std.json.stringify(block, .{}, content.writer());
+
+            const response: http.Response = .{
+                .status_code = 200,
+                .message = "OK",
+                .headers = &[_]http.Header{
+                    .{
+                        .name = "Content-Type",
+                        .value = "application/json",
+                    },
+                    .{
+                        .name = "Content-Length",
+                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
+                    },
+                },
+                .num_headers = 2,
+            };
+
+            try writer.print("{}", .{response});
+            try std.json.stringify(block, .{}, writer);
+        } else if (query.get("height")) |height_text| {
+            const height = try fmt.parseUnsigned(u64, height_text, 10);
+
+            const maybe_block_result = maybe_block: {
+                var conn = try self.chain.store.acquireConnection();
+                defer self.chain.store.releaseConnection(&conn);
+
+                runtime.startCpuBoundOperation();
+                defer runtime.endCpuBoundOperation();
+
+                break :maybe_block self.chain.store.getBlockByHeight(gpa, &conn, height);
+            };
+
+            const maybe_block = try maybe_block_result;
+            defer if (maybe_block) |block| block.deinit(gpa);
+
+            const block = maybe_block orelse return error.BlockNotFound;
+            try std.json.stringify(block, .{}, content.writer());
+
+            const response: http.Response = .{
+                .status_code = 200,
+                .message = "OK",
+                .headers = &[_]http.Header{
+                    .{
+                        .name = "Content-Type",
+                        .value = "application/json",
+                    },
+                    .{
+                        .name = "Content-Length",
+                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
+                    },
+                },
+                .num_headers = 2,
+            };
+
+            try writer.print("{}", .{response});
+            try std.json.stringify(block, .{}, writer);
+        } else {
+            const offset = if (query.get("offset")) |text| try fmt.parseInt(usize, text, 10) else 0;
+            const limit = math.min(100, if (query.get("limit")) |text| try fmt.parseInt(usize, text, 10) else 100);
+
+            const blocks_result = blocks: {
+                var conn = try self.chain.store.acquireConnection();
+                defer self.chain.store.releaseConnection(&conn);
+
+                runtime.startCpuBoundOperation();
+                defer runtime.endCpuBoundOperation();
+
+                break :blocks self.chain.store.getBlockSummaries(gpa, &conn, offset, limit);
+            };
+
+            const blocks = try blocks_result;
+            defer gpa.free(blocks);
+
+            try std.json.stringify(blocks, .{}, content.writer());
+
+            const response: http.Response = .{
+                .status_code = 200,
+                .message = "OK",
+                .headers = &[_]http.Header{
+                    .{
+                        .name = "Content-Type",
+                        .value = "application/json",
+                    },
+                    .{
+                        .name = "Content-Length",
+                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
+                    },
+                },
+                .num_headers = 2,
+            };
+
+            try writer.print("{}", .{response});
+            try std.json.stringify(blocks, .{}, writer);
+        }
+    }
+
+    pub fn httpGetTransactions(
+        self: *Node,
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        request: http.Request,
+        reader: anytype,
+        writer: anytype,
+        params: []http.router.Param,
+    ) !void {
+        _ = self;
+        _ = ctx;
+        _ = gpa;
+        _ = request;
+        _ = reader;
+        _ = params;
+
+        const uri = try http.Uri.parse(request.path, true);
+
+        var query = try http.Uri.mapQuery(gpa, uri.query);
+        defer query.deinit();
+
+        var body = std.ArrayList(u8).init(gpa);
+        defer body.deinit();
+
+        var content = io.countingWriter(body.writer());
+        var length_buf: [16]u8 = undefined;
+
+        if (query.get("id")) |id_hex| {
+            if (id_hex.len != 64) {
+                return error.BadTransactionId;
+            }
+
+            var id: [32]u8 = undefined;
+            _ = try fmt.hexToBytes(&id, id_hex);
+
+            const maybe_tx_result = maybe_tx: {
+                var conn = try self.chain.store.acquireConnection();
+                defer self.chain.store.releaseConnection(&conn);
+
+                runtime.startCpuBoundOperation();
+                defer runtime.endCpuBoundOperation();
+
+                break :maybe_tx self.chain.store.getTransactionById(gpa, &conn, id);
+            };
+
+            const maybe_tx = try maybe_tx_result;
+            defer if (maybe_tx) |tx| tx.deinit(gpa);
+
+            const tx = maybe_tx orelse return error.TransactionNotFound;
+            try std.json.stringify(tx, .{}, content.writer());
+
+            const response: http.Response = .{
+                .status_code = 200,
+                .message = "OK",
+                .headers = &[_]http.Header{
+                    .{
+                        .name = "Content-Type",
+                        .value = "application/json",
+                    },
+                    .{
+                        .name = "Content-Length",
+                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
+                    },
+                },
+                .num_headers = 2,
+            };
+
+            try writer.print("{}", .{response});
+            try std.json.stringify(tx, .{}, writer);
+        } else if (query.get("block_height")) |block_height_text| {
+            const block_height = try fmt.parseUnsigned(u64, block_height_text, 10);
+            const offset = if (query.get("offset")) |text| try fmt.parseInt(usize, text, 10) else 0;
+            const limit = math.min(100, if (query.get("limit")) |text| try fmt.parseInt(usize, text, 10) else 100);
+
+            const transactions_result = transactions: {
+                var conn = try self.chain.store.acquireConnection();
+                defer self.chain.store.releaseConnection(&conn);
+
+                runtime.startCpuBoundOperation();
+                defer runtime.endCpuBoundOperation();
+
+                break :transactions self.chain.store.getTransactionsByBlockHeight(gpa, &conn, block_height, offset, limit);
+            };
+
+            const transactions = try transactions_result;
+            defer {
+                for (transactions) |tx| {
+                    tx.deinit(gpa);
+                }
+                gpa.free(transactions);
+            }
+
+            try std.json.stringify(transactions, .{}, content.writer());
+
+            const response: http.Response = .{
+                .status_code = 200,
+                .message = "OK",
+                .headers = &[_]http.Header{
+                    .{
+                        .name = "Content-Type",
+                        .value = "application/json",
+                    },
+                    .{
+                        .name = "Content-Length",
+                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
+                    },
+                },
+                .num_headers = 2,
+            };
+
+            try writer.print("{}", .{response});
+            try std.json.stringify(transactions, .{}, writer);
+        } else {
+            const offset = if (query.get("offset")) |text| try fmt.parseInt(usize, text, 10) else 0;
+            const limit = math.min(100, if (query.get("limit")) |text| try fmt.parseInt(usize, text, 10) else 100);
+
+            const transactions_result = transactions: {
+                var conn = try self.chain.store.acquireConnection();
+                defer self.chain.store.releaseConnection(&conn);
+
+                runtime.startCpuBoundOperation();
+                defer runtime.endCpuBoundOperation();
+
+                break :transactions self.chain.store.getTransactions(gpa, &conn, offset, limit);
+            };
+
+            const transactions = try transactions_result;
+            defer {
+                for (transactions) |tx| {
+                    tx.deinit(gpa);
+                }
+                gpa.free(transactions);
+            }
+
+            try std.json.stringify(transactions, .{}, content.writer());
+
+            const response: http.Response = .{
+                .status_code = 200,
+                .message = "OK",
+                .headers = &[_]http.Header{
+                    .{
+                        .name = "Content-Type",
+                        .value = "application/json",
+                    },
+                    .{
+                        .name = "Content-Length",
+                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
+                    },
+                },
+                .num_headers = 2,
+            };
+
+            try writer.print("{}", .{response});
+            try std.json.stringify(transactions, .{}, writer);
+        }
+    }
+
+    pub fn httpQueryDatabase(
+        self: *Node,
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        request: http.Request,
+        reader: anytype,
+        writer: anytype,
+        params: []const http.router.Param,
+    ) !void {
+        _ = self;
+        _ = ctx;
+        _ = gpa;
+        _ = request;
+        _ = reader;
+
+        const query = (try http.Uri.decode(gpa, params[0].value)) orelse return error.QueryNotEncoded;
+        defer gpa.free(query);
+
+        const query_result = query: {
+            var conn = try self.chain.store.acquireConnection();
+            defer self.chain.store.releaseConnection(&conn);
+
+            runtime.startCpuBoundOperation();
+            defer runtime.endCpuBoundOperation();
+
+            break :query self.chain.store.queryJson(gpa, &conn, query);
+        };
+
+        const result = try query_result;
+        defer gpa.free(result);
+
+        var length_buf: [128]u8 = undefined;
+
+        const response: http.Response = .{
+            .status_code = 200,
+            .message = "OK",
+            .headers = &[_]http.Header{
+                .{ .name = "Content-Type", .value = "application/json" },
+                .{ .name = "Content-Length", .value = fmt.bufPrintIntToSlice(&length_buf, result.len, 10, .lower, .{}) },
+            },
+            .num_headers = 2,
+        };
+
+        try writer.print("{}", .{response});
+        try writer.writeAll(result);
+    }
+
+    pub fn httpSubmitTransaction(
+        self: *Node,
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        request: http.Request,
+        reader: anytype,
+        writer: anytype,
+        params: []http.router.Param,
+    ) !void {
+        _ = self;
+        _ = ctx;
+        _ = gpa;
+        _ = request;
+        _ = reader;
+        _ = params;
+
+        const content_length = for (request.getHeaders()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "content-length")) {
+                break try fmt.parseInt(usize, header.value, 10);
+            }
+        } else return error.ContentLengthExpected;
+
+        var body = io.limitedReader(reader, content_length);
+
+        const tx = try Transaction.read(gpa, body.reader());
+        defer tx.deinit(gpa);
+
+        self.addTransaction(ctx, gpa, tx.ref()) catch |err| {
+            tx.deinit(gpa);
+            return err;
+        };
+
+        var transaction_id_buf: [64]u8 = undefined;
+        var length_buf: [16]u8 = undefined;
+
+        const result = .{
+            .result = "ok",
+            .transaction_id = try fmt.bufPrint(&transaction_id_buf, "{}", .{fmt.fmtSliceHexLower(&tx.id)}),
+        };
+
+        var content = io.countingWriter(io.null_writer);
+        try std.json.stringify(result, .{}, content.writer());
+
+        const response: http.Response = .{
+            .status_code = 200,
+            .message = "OK",
+            .headers = &[_]http.Header{
+                .{ .name = "Content-Type", .value = "application/json" },
+                .{ .name = "Content-Length", .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}) },
+            },
+            .num_headers = 2,
+        };
+
+        try writer.print("{}", .{response});
+        try std.json.stringify(result, .{}, writer);
     }
 
     fn handleServerPacket(
@@ -952,7 +1531,12 @@ pub const Node = struct {
                     },
                     .pull_transaction => {
                         var transactions: std.ArrayListUnmanaged(*Transaction) = .{};
-                        defer transactions.deinit(gpa);
+                        defer {
+                            for (transactions.items) |tx| {
+                                tx.deinit(gpa);
+                            }
+                            transactions.deinit(gpa);
+                        }
 
                         var num_bytes: u32 = 0;
                         while (true) {
@@ -961,8 +1545,18 @@ pub const Node = struct {
                                 else => return err,
                             };
 
-                            const tx = self.chain.pending.get(tx_id) orelse continue;
-                            try transactions.append(gpa, tx);
+                            var maybe_tx = self.chain.pending.get(tx_id);
+                            if (maybe_tx == null) {
+                                var pooled_conn = try self.chain.store.acquireConnection();
+                                defer self.chain.store.releaseConnection(&pooled_conn);
+
+                                maybe_tx = try self.chain.store.getTransactionById(gpa, &pooled_conn, tx_id);
+                            }
+
+                            const tx = maybe_tx orelse continue;
+                            errdefer tx.deinit(gpa);
+
+                            try transactions.append(gpa, tx.ref());
                             num_bytes += tx.size();
                         }
 
@@ -984,6 +1578,8 @@ pub const Node = struct {
                         const requested_cache_id = frame.reader().readBytesNoEof(32) catch null;
                         const latest_height = if (self.chain.blocks.latest()) |latest_block| latest_block.height else 0;
 
+                        var block_allocated = false;
+
                         const requested_block = block: {
                             if (requested_height == latest_height + 1) {
                                 break :block self.chain.sampler.preferred;
@@ -991,8 +1587,18 @@ pub const Node = struct {
                             if (self.chain.blocks.get(requested_height)) |old_block| {
                                 break :block old_block;
                             }
+
+                            var pooled_conn = try self.chain.store.acquireConnection();
+                            defer self.chain.store.releaseConnection(&pooled_conn);
+
+                            if (try self.chain.store.getBlockByHeight(gpa, &pooled_conn, requested_height)) |old_block| {
+                                block_allocated = true;
+                                break :block old_block;
+                            }
                             break :block null;
                         };
+
+                        defer if (block_allocated) requested_block.?.deinit(gpa);
 
                         const cache_hit = cache_hit: {
                             const cache_id = requested_cache_id orelse break :cache_hit false;
@@ -1088,22 +1694,22 @@ pub const Chain = struct {
     pub const connected_delay_min: i64 = 0 * time.ns_per_ms;
     pub const connected_delay_max: i64 = 500 * time.ns_per_ms;
 
+    store: *Store,
     sampler: Sampler,
     pending: SortedHashMap(*Transaction, 50),
     missing: lru.AutoIntrusiveHashMap([32]u8, u64, 50),
-    finalized: lru.AutoIntrusiveHashMap([32]u8, void, 50),
 
     /// 'head' and 'tail' are set at 1 until genesis blocks are implemented. Genesis
     /// blocks are blocks whose height is 0. Until they are implemented it is safe to
     /// assume that the first block that is to be pushed into this ring buffer starts
     /// at height 1.
-    blocks: StaticRingBuffer(*Block, u64, 32) = .{ .head = 1, .tail = 1 },
+    blocks: StaticRingBuffer(*Block, u64, 32),
     block_proposal_cache: lru.AutoIntrusiveHashMap(ip.Address, *Block, 50),
 
     propose_delay: i64 = propose_delay_min,
     connected_delay: i64 = connected_delay_min,
 
-    pub fn init(gpa: *mem.Allocator) !Chain {
+    pub fn init(gpa: *mem.Allocator, store: *Store) !Chain {
         var sampler = try Sampler.init(gpa);
         errdefer sampler.deinit(gpa);
 
@@ -1113,17 +1719,45 @@ pub const Chain = struct {
         var missing = try lru.AutoIntrusiveHashMap([32]u8, u64, 50).initCapacity(gpa, 1 << 16);
         errdefer missing.deinit(gpa);
 
-        var finalized = try lru.AutoIntrusiveHashMap([32]u8, void, 50).initCapacity(gpa, 1 << 20);
-        errdefer finalized.deinit(gpa);
-
         var block_proposal_cache = try lru.AutoIntrusiveHashMap(ip.Address, *Block, 50).initCapacity(gpa, 128);
         errdefer block_proposal_cache.deinit(gpa);
 
+        var conn = try store.acquireConnection();
+        defer store.releaseConnection(&conn);
+
+        const cached_blocks = try store.getBlocks(gpa, &conn, 0, 32);
+        defer {
+            for (cached_blocks) |cached_block| {
+                cached_block.deinit(gpa);
+            }
+            gpa.free(cached_blocks);
+        }
+
+        var blocks: StaticRingBuffer(*Block, u64, 32) = .{ .head = 1, .tail = 1 };
+        if (cached_blocks.len > 0) {
+            blocks.head = cached_blocks[cached_blocks.len - 1].height;
+            blocks.tail = cached_blocks[cached_blocks.len - 1].height;
+
+            log.info("latest block is {} (height: {}, num transactions: {})", .{
+                fmt.fmtSliceHexLower(&cached_blocks[0].id),
+                cached_blocks[0].height,
+                cached_blocks[0].num_transaction_ids,
+            });
+        } else {
+            log.info("no blocks found in store: starting off with an empty blockchain", .{});
+        }
+
+        var i: usize = cached_blocks.len;
+        while (i > 0) : (i -= 1) {
+            blocks.push(cached_blocks[i - 1].ref());
+        }
+
         return Chain{
+            .store = store,
             .sampler = sampler,
             .pending = pending,
             .missing = missing,
-            .finalized = finalized,
+            .blocks = blocks,
             .block_proposal_cache = block_proposal_cache,
         };
     }
@@ -1145,8 +1779,6 @@ pub const Chain = struct {
         self.pending.deinit(gpa);
 
         self.missing.deinit(gpa);
-
-        self.finalized.deinit(gpa);
 
         while (self.blocks.popOrNull()) |block| {
             block.deinit(gpa);
@@ -1183,7 +1815,13 @@ pub const Chain = struct {
             self.connected_delay = connected_delay_min;
 
             const preferred_block = self.sampler.preferred orelse {
-                try self.proposeBlock(ctx, gpa, &transaction_ids);
+                self.proposeBlock(ctx, gpa, &transaction_ids) catch |err| switch (err) {
+                    error.NoTransactionsToPropose => {
+                        const next_block_height = (if (self.blocks.latest()) |latest_block| latest_block.height else 0) + 1;
+                        try self.pullBlockProposals(ctx, gpa, node, null, peer_ids[0..num_peers], next_block_height);
+                    },
+                    else => return err,
+                };
                 continue;
             };
 
@@ -1259,10 +1897,37 @@ pub const Chain = struct {
                 self.sampler.reset(gpa);
             }
 
+            var finalized_transactions: std.ArrayListUnmanaged(*Transaction) = .{};
+            defer finalized_transactions.deinit(gpa);
+
+            try finalized_transactions.ensureUnusedCapacity(gpa, finalized_block.num_transaction_ids);
+
             for (finalized_block.transaction_ids[0..finalized_block.num_transaction_ids]) |tx_id| {
-                _ = node.chain.finalized.update(tx_id, {});
-                const tx = self.pending.delete(tx_id) orelse unreachable;
-                tx.deinit(gpa);
+                finalized_transactions.appendAssumeCapacity(self.pending.get(tx_id).?);
+            }
+
+            const store_block_result = store_block: {
+                var conn = try self.store.acquireConnection();
+                defer self.store.releaseConnection(&conn);
+
+                runtime.startCpuBoundOperation();
+                defer runtime.endCpuBoundOperation();
+
+                break :store_block self.store.storeBlock(&conn, finalized_block, finalized_transactions.items);
+            };
+
+            store_block_result catch |err| {
+                log.warn("failed to save block {} (height {}, {} transaction(s): {}", .{
+                    fmt.fmtSliceHexLower(&finalized_block.id),
+                    finalized_block.height,
+                    finalized_block.num_transaction_ids,
+                    err,
+                });
+                continue;
+            };
+
+            for (finalized_block.transaction_ids[0..finalized_block.num_transaction_ids]) |tx_id| {
+                self.pending.delete(tx_id).?.deinit(gpa);
             }
 
             if (self.blocks.pushOrNull(finalized_block.ref())) |evicted_block| {
@@ -1270,17 +1935,6 @@ pub const Chain = struct {
             }
 
             _ = finalized_count.fetchAdd(finalized_block.num_transaction_ids, .Monotonic);
-
-            // var debug_it = block_proposals.iterator();
-            // while (debug_it.next()) |entry| {
-            //     log.debug("block proposal {}: {}", .{
-            //         fmt.fmtSliceHexLower(if (entry.key_ptr.*) |block| &block.id else &([_]u8{0} ** 32)),
-            //         entry.value_ptr.*,
-            //     });
-            // }
-            // for (votes[0..num_votes]) |vote, i| {
-            //     log.debug("vote {}: {}", .{ i, vote });
-            // }
 
             log.info("finalized block {} (height {}, {} transaction(s))", .{
                 fmt.fmtSliceHexLower(&finalized_block.id),
@@ -1299,7 +1953,7 @@ pub const Chain = struct {
         if (self.pending.len == 0) {
             try runtime.timeout(ctx, .{ .nanoseconds = self.propose_delay });
             self.propose_delay = math.min(propose_delay_max, self.propose_delay + (propose_delay_max - propose_delay_min) / 10);
-            return;
+            return error.NoTransactionsToPropose;
         }
 
         self.propose_delay = propose_delay_min;
@@ -1315,8 +1969,10 @@ pub const Chain = struct {
             }
         }
 
+        const next_block_height = (if (self.blocks.latest()) |latest_block| latest_block.height else 0) + 1;
+
         const block = try Block.create(gpa, .{
-            .height = (if (self.blocks.latest()) |latest_block| latest_block.height else 0) + 1,
+            .height = next_block_height,
             .merkle_root = [_]u8{0} ** 32,
             .transaction_ids = transaction_ids.items,
         });
@@ -1335,7 +1991,7 @@ pub const Chain = struct {
         ctx: *Context,
         gpa: *mem.Allocator,
         node: *Node,
-        block_proposals: *BlockProposalMap,
+        maybe_block_proposals: ?*BlockProposalMap,
         peer_ids: []const kademlia.ID,
         block_proposal_height: u64,
     ) !void {
@@ -1357,6 +2013,7 @@ pub const Chain = struct {
 
         for (frames[0..frame_index]) |*frame| {
             const maybe_block_proposal = await frame catch null;
+            const block_proposals = maybe_block_proposals orelse continue;
 
             const result = block_proposals.getOrPutAssumeCapacity(maybe_block_proposal);
             if (!result.found_existing) {
@@ -1435,12 +2092,21 @@ pub const Chain = struct {
             return error.UnexpectedPulledBlockHeight;
         }
 
+        var conn = try self.store.acquireConnection();
+        defer self.store.releaseConnection(&conn);
+
         var maybe_err: ?anyerror = null;
 
         var it = [_]u8{0} ** 32;
         for (block.transaction_ids[0..block.num_transaction_ids]) |tx_id| {
             if (!mem.lessThan(u8, &it, &tx_id)) {
                 maybe_err = error.BlockProposalTransactionIdsNotSorted;
+            }
+            if (node.chain.store.isTransactionFinalized(&conn, tx_id)) {
+                if (maybe_err == null) {
+                    maybe_err = error.TransactionAlreadyFinalized;
+                }
+                continue;
             }
             if (node.chain.pending.get(tx_id) == null) {
                 _ = node.chain.missing.update(tx_id, block_height);
@@ -1548,8 +2214,9 @@ pub const TransactionPuller = struct {
 
         var num_pulled_transactions: usize = 0;
         defer if (num_pulled_transactions >= 0) {
-            log.info("pulled {}/{} missing transactions", .{
+            log.info("pulled {}/{} missing transactions ({} total missing)", .{
                 num_pulled_transactions,
+                ids.len,
                 num_pulled_transactions + self.node.chain.missing.len,
             });
         };
@@ -1558,13 +2225,6 @@ pub const TransactionPuller = struct {
         defer for (frames[0..frame_index]) |*frame| {
             const transactions = await frame catch continue;
             defer gpa.free(transactions);
-
-            self.node.chain.pending.ensureUnusedCapacity(gpa, transactions.len) catch {
-                for (transactions) |tx| {
-                    tx.deinit(gpa);
-                }
-                continue;
-            };
 
             for (transactions) |tx| {
                 self.node.addTransaction(ctx, gpa, tx) catch {
@@ -1966,7 +2626,7 @@ pub const Sampler = struct {
     const log = std.log.scoped(.sampler);
 
     pub const default_alpha = 0.8;
-    pub const default_beta = 150;
+    pub const default_beta = 20;
 
     pub const Vote = struct {
         block: ?*Block,
@@ -2087,5 +2747,423 @@ pub const Sampler = struct {
         }
 
         return null;
+    }
+};
+
+const sqlite = @import("zig-sqlite/sqlite.zig");
+const fs = std.fs;
+
+pub const Store = struct {
+    const log = std.log.scoped(.sqlite);
+
+    pool: std.fifo.LinearFifo(sqlite.Db, .Dynamic),
+    maybe_path: ?[]const u8,
+
+    pub fn init(gpa: *mem.Allocator, maybe_path: ?[]const u8) !Store {
+        var db = try createConnection(maybe_path);
+        errdefer db.deinit();
+
+        @setEvalBranchQuota(10_000);
+        comptime var it = mem.tokenize(u8, @embedFile("schema.sql"), ";");
+        inline while (comptime it.next()) |stmt| {
+            try db.exec(stmt, .{}, .{});
+        }
+
+        var pool = std.fifo.LinearFifo(sqlite.Db, .Dynamic).init(gpa);
+        errdefer pool.deinit();
+
+        try pool.writeItem(db);
+
+        return Store{ .pool = pool, .maybe_path = maybe_path };
+    }
+
+    pub fn deinit(self: *Store) void {
+        while (self.pool.readItem()) |conn_const| {
+            var conn = conn_const;
+            conn.deinit();
+        }
+        self.pool.deinit();
+    }
+
+    fn createConnection(maybe_path: ?[]const u8) !sqlite.Db {
+        var db: sqlite.Db = db: {
+            const path = maybe_path orelse {
+                break :db try sqlite.Db.init(.{
+                    .mode = .Memory,
+                    .open_flags = .{ .create = true, .write = true },
+                    .threading_mode = .MultiThread,
+                    .shared_cache = true,
+                });
+            };
+
+            var path_buf: [fs.MAX_PATH_BYTES]u8 = undefined;
+            mem.copy(u8, &path_buf, path);
+            path_buf[path.len] = 0;
+
+            break :db try sqlite.Db.init(.{
+                .mode = .{ .File = path_buf[0..path.len :0] },
+                .open_flags = .{ .create = true, .write = true },
+                .threading_mode = .MultiThread,
+                .shared_cache = true,
+            });
+        };
+        errdefer db.deinit();
+
+        _ = try db.pragma(void, .{}, "journal_mode", "WAL");
+        _ = try db.pragma(void, .{}, "read_uncommitted", "true");
+        _ = try db.pragma(void, .{}, "synchronous", "normal");
+        _ = try db.pragma(void, .{}, "temp_store", "memory");
+
+        return db;
+    }
+
+    pub fn acquireConnection(self: *Store) !sqlite.Db {
+        if (self.pool.readItem()) |conn| {
+            return conn;
+        }
+        return try createConnection(self.maybe_path);
+    }
+
+    pub fn releaseConnection(self: *Store, conn: *sqlite.Db) void {
+        // Silently fail.
+        self.pool.writeItem(conn.*) catch conn.deinit();
+    }
+
+    fn execute(conn: *sqlite.Db, raw_query: []const u8) !void {
+        var diags: sqlite.Diagnostics = .{};
+        errdefer |err| log.warn("error while executing query ({}): {}", .{ diags, err });
+
+        var stmt: ?*sqlite.c.sqlite3_stmt = undefined;
+        var result = sqlite.c.sqlite3_prepare_v3(
+            conn.db,
+            raw_query.ptr,
+            @intCast(c_int, raw_query.len),
+            0,
+            &stmt,
+            null,
+        );
+        if (result != sqlite.c.SQLITE_OK) {
+            diags.err = conn.getDetailedError();
+            return sqlite.errorFromResultCode(result);
+        }
+        defer _ = sqlite.c.sqlite3_finalize(stmt);
+
+        if (sqlite.c.sqlite3_stmt_readonly(stmt) != 0) {
+            return error.QueryIsReadOnly;
+        }
+
+        result = sqlite.c.sqlite3_step(stmt);
+        switch (result) {
+            sqlite.c.SQLITE_DONE => {},
+            else => {
+                diags.err = conn.getDetailedError();
+                return sqlite.errorFromResultCode(result);
+            },
+        }
+    }
+
+    pub fn queryJson(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, raw_query: []const u8) ![]const u8 {
+        var diags: sqlite.Diagnostics = .{};
+        errdefer |err| log.warn("error while querying json ({}): {}", .{ diags, err });
+
+        var buffer = std.ArrayList(u8).init(gpa);
+        defer buffer.deinit();
+
+        var stream = std.json.writeStream(buffer.writer(), 128);
+
+        var stmt: ?*sqlite.c.sqlite3_stmt = undefined;
+        var result = sqlite.c.sqlite3_prepare_v3(
+            conn.db,
+            raw_query.ptr,
+            @intCast(c_int, raw_query.len),
+            0,
+            &stmt,
+            null,
+        );
+        if (result != sqlite.c.SQLITE_OK) {
+            diags.err = conn.getDetailedError();
+            return sqlite.errorFromResultCode(result);
+        }
+        defer _ = sqlite.c.sqlite3_finalize(stmt);
+
+        if (sqlite.c.sqlite3_stmt_readonly(stmt) == 0) {
+            return error.QueryNotReadOnly;
+        }
+
+        var count: usize = 0;
+
+        try stream.beginObject();
+
+        try stream.objectField("results");
+        try stream.beginArray();
+
+        while (true) {
+            result = sqlite.c.sqlite3_step(stmt);
+            switch (result) {
+                sqlite.c.SQLITE_DONE => break,
+                sqlite.c.SQLITE_ROW => {},
+                else => {
+                    diags.err = conn.getDetailedError();
+                    return sqlite.errorFromResultCode(result);
+                },
+            }
+
+            try stream.arrayElem();
+            try stream.beginObject();
+
+            var i: c_int = 0;
+            while (i < sqlite.c.sqlite3_column_count(stmt)) : (i += 1) {
+                const column_name = sqlite.c.sqlite3_column_name(stmt, i) orelse return error.OutOfMemory;
+                try stream.objectField(mem.sliceTo(column_name, 0));
+                switch (sqlite.c.sqlite3_column_type(stmt, i)) {
+                    sqlite.c.SQLITE_INTEGER => {
+                        try stream.emitNumber(sqlite.c.sqlite3_column_int64(stmt, i));
+                    },
+                    sqlite.c.SQLITE_FLOAT => {
+                        try stream.emitNumber(sqlite.c.sqlite3_column_double(stmt, i));
+                    },
+                    sqlite.c.SQLITE_TEXT => {
+                        const num_bytes = @intCast(usize, sqlite.c.sqlite3_column_bytes(stmt, i));
+                        try stream.emitJson(.{ .String = sqlite.c.sqlite3_column_text(stmt, i)[0..num_bytes] });
+                    },
+                    sqlite.c.SQLITE_BLOB => {
+                        const num_bytes = @intCast(usize, sqlite.c.sqlite3_column_bytes(stmt, i));
+                        try stream.emitJson(.{ .String = sqlite.c.sqlite3_column_text(stmt, i)[0..num_bytes] });
+                    },
+                    sqlite.c.SQLITE_NULL => {
+                        try stream.emitNull();
+                    },
+                    else => unreachable,
+                }
+            }
+
+            try stream.endObject();
+
+            count += 1;
+
+            if (buffer.items.len > 1 * 1024 * 1024) {
+                break;
+            }
+        }
+
+        try stream.endArray();
+
+        try stream.objectField("count");
+        try stream.emitNumber(count);
+
+        try stream.endObject();
+
+        return buffer.toOwnedSlice();
+    }
+
+    pub fn storeBlock(_: *Store, conn: *sqlite.Db, block: *Block, transactions: []const *Transaction) !void {
+        var diags: sqlite.Diagnostics = .{};
+        errdefer |err| log.warn("error while saving block ({}): {}", .{ diags, err });
+
+        try conn.exec("begin", .{ .diags = &diags }, .{});
+        errdefer conn.exec("rollback", .{ .diags = &diags }, .{}) catch {};
+
+        try conn.exec("insert into blocks(id, height, merkle_root, num_transaction_ids) values (?{[]const u8}, ?{u64}, ?{[]const u8}, ?{u16})", .{ .diags = &diags }, .{
+            .id = @as([]const u8, &block.id),
+            .height = block.height,
+            .merkle_root = @as([]const u8, &block.merkle_root),
+            .num_transaction_ids = block.num_transaction_ids,
+        });
+
+        for (transactions) |tx| {
+            try conn.exec(
+                "insert into transactions(id, block_height, sender, signature, sender_nonce, created_at, tag, data) values (?{[]const u8}, ?{u64}, ?{[]const u8}, ?{[]const u8}, ?{u64}, ?{u64}, ?{[]const u8}, ?{[]const u8})",
+                .{ .diags = &diags },
+                .{
+                    .id = @as([]const u8, &tx.id),
+                    .block_height = block.height,
+                    .sender = @as([]const u8, &tx.sender),
+                    .signature = @as([]const u8, &tx.signature),
+                    .sender_nonce = tx.sender_nonce,
+                    .created_at = tx.created_at,
+                    .tag = tx.tag,
+                    .data = @as([]const u8, tx.data[0..tx.data_len]),
+                },
+            );
+
+            if (tx.tag == .stmt) {
+                execute(conn, tx.data[0..tx.data_len]) catch {};
+            }
+        }
+
+        try conn.exec("commit", .{ .diags = &diags }, .{});
+    }
+
+    pub fn isTransactionFinalized(_: *Store, conn: *sqlite.Db, id: [32]u8) bool {
+        var diags: sqlite.Diagnostics = .{};
+        errdefer log.warn("error while checking if transaction is finalized: {}", .{diags});
+
+        const result = conn.one(usize, "select 1 from transactions where id = ?{[]const u8}", .{ .diags = &diags }, .{ .id = @as([]const u8, &id) }) catch return false;
+        return result != null;
+    }
+
+    fn getTransactionIdsByBlockHeight(gpa: *mem.Allocator, conn: *sqlite.Db, block_height: u64) ![]const [32]u8 {
+        var stmt = try conn.prepare("select id from transactions where block_height = ?{u64}");
+        defer stmt.deinit();
+
+        return try stmt.all([32]u8, gpa, .{}, .{ .block_height = block_height });
+    }
+
+    pub fn getBlockSummaries(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, offset: usize, limit: usize) ![]const Block.Summary {
+        var blocks: std.ArrayListUnmanaged(Block.Summary) = .{};
+        defer blocks.deinit(gpa);
+
+        var diags: sqlite.Diagnostics = .{};
+        errdefer |err| log.warn("error while fetching block summaries ({}): {}", .{ diags, err });
+
+        var stmt = try conn.prepareWithDiags("select id, height, merkle_root, num_transaction_ids from blocks order by height desc limit ?{usize} offset ?{usize}", .{ .diags = &diags });
+        defer stmt.deinit();
+
+        var it = try stmt.iterator(Block.Summary, .{ limit, offset });
+        while (try it.next(.{ .diags = &diags })) |summary| {
+            try blocks.append(gpa, summary);
+        }
+
+        return blocks.toOwnedSlice(gpa);
+    }
+
+    pub fn getBlocks(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, offset: usize, limit: usize) ![]const *Block {
+        var blocks: std.ArrayListUnmanaged(*Block) = .{};
+        defer {
+            for (blocks.items) |block| {
+                block.deinit(gpa);
+            }
+            blocks.deinit(gpa);
+        }
+
+        var diags: sqlite.Diagnostics = .{};
+        errdefer |err| log.warn("error while fetching blocks ({}): {}", .{ diags, err });
+
+        var stmt = try conn.prepareWithDiags("select id, height, merkle_root from blocks order by height desc limit ?{usize} offset ?{usize}", .{ .diags = &diags });
+        defer stmt.deinit();
+
+        var it = try stmt.iterator(struct { id: [32]u8, height: u64, merkle_root: [32]u8 }, .{ limit, offset });
+        while (try it.next(.{ .diags = &diags })) |header| {
+            const transaction_ids = try getTransactionIdsByBlockHeight(gpa, conn, header.height);
+            defer gpa.free(transaction_ids);
+
+            const block = try Block.from(gpa, .{
+                .id = header.id,
+                .height = header.height,
+                .merkle_root = header.merkle_root,
+                .transaction_ids = transaction_ids,
+            });
+            errdefer block.deinit(gpa);
+
+            try blocks.append(gpa, block);
+        }
+
+        return blocks.toOwnedSlice(gpa);
+    }
+
+    pub fn getTransactions(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, offset: usize, limit: usize) ![]const *Transaction {
+        var transactions: std.ArrayListUnmanaged(*Transaction) = .{};
+        defer {
+            for (transactions.items) |tx| {
+                tx.deinit(gpa);
+            }
+            transactions.deinit(gpa);
+        }
+
+        var diags: sqlite.Diagnostics = .{};
+        errdefer |err| log.warn("error while fetching transactions ({}): {}", .{ diags, err });
+
+        var stmt = try conn.prepareWithDiags("select id, sender, signature, sender_nonce, created_at, tag, data from transactions order by block_height desc limit ?{usize} offset ?{usize}", .{ .diags = &diags });
+        defer stmt.deinit();
+
+        var it = try stmt.iterator(Transaction.Data, .{ limit, offset });
+        while (try it.nextAlloc(gpa, .{ .diags = &diags })) |format| {
+            defer gpa.free(format.data);
+
+            const tx = try Transaction.from(gpa, format);
+            errdefer tx.deinit(gpa);
+
+            try transactions.append(gpa, tx);
+        }
+
+        return transactions.toOwnedSlice(gpa);
+    }
+
+    pub fn getTransactionsByBlockHeight(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, block_height: u64, offset: usize, limit: usize) ![]const *Transaction {
+        var transactions: std.ArrayListUnmanaged(*Transaction) = .{};
+        defer {
+            for (transactions.items) |tx| {
+                tx.deinit(gpa);
+            }
+            transactions.deinit(gpa);
+        }
+
+        var diags: sqlite.Diagnostics = .{};
+        errdefer |err| log.warn("error while fetching transactions ({}): {}", .{ diags, err });
+
+        var stmt = try conn.prepareWithDiags("select id, sender, signature, sender_nonce, created_at, tag, data from transactions where block_height = ?{u64} limit ?{usize} offset ?{usize}", .{ .diags = &diags });
+        defer stmt.deinit();
+
+        var it = try stmt.iterator(Transaction.Data, .{ block_height, limit, offset });
+        while (try it.nextAlloc(gpa, .{ .diags = &diags })) |format| {
+            defer gpa.free(format.data);
+
+            const tx = try Transaction.from(gpa, format);
+            errdefer tx.deinit(gpa);
+
+            try transactions.append(gpa, tx);
+        }
+
+        return transactions.toOwnedSlice(gpa);
+    }
+
+    pub fn getBlockById(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, block_id: [32]u8) !?*Block {
+        var diags: sqlite.Diagnostics = .{};
+        errdefer |err| log.warn("error while fetching block by id ({}): {}", .{ diags, err });
+
+        const header = (try conn.one(struct {
+            height: u64,
+            merkle_root: [32]u8,
+        }, "select height, merkle_root from blocks where id = ?{[]const u8}", .{ .diags = &diags }, .{ .id = @as([]const u8, &block_id) })) orelse return null;
+
+        const transaction_ids = try getTransactionIdsByBlockHeight(gpa, conn, header.height);
+        defer gpa.free(transaction_ids);
+
+        return try Block.from(gpa, .{
+            .id = block_id,
+            .height = header.height,
+            .merkle_root = header.merkle_root,
+            .transaction_ids = transaction_ids,
+        });
+    }
+
+    pub fn getBlockByHeight(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, height: u64) !?*Block {
+        var diags: sqlite.Diagnostics = .{};
+        errdefer |err| log.warn("error while fetching block by height ({}): {}", .{ diags, err });
+
+        const header = (try conn.one(struct {
+            id: [32]u8,
+            merkle_root: [32]u8,
+        }, "select id, merkle_root from blocks where height = ?{u64}", .{ .diags = &diags }, .{ .height = height })) orelse return null;
+
+        const transaction_ids = try getTransactionIdsByBlockHeight(gpa, conn, height);
+        defer gpa.free(transaction_ids);
+
+        return try Block.from(gpa, .{
+            .id = header.id,
+            .height = height,
+            .merkle_root = header.merkle_root,
+            .transaction_ids = transaction_ids,
+        });
+    }
+
+    pub fn getTransactionById(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, id: [32]u8) !?*Transaction {
+        var diags: sqlite.Diagnostics = .{};
+        errdefer |err| log.warn("error while fetching transaction by id ({}): {}", .{ diags, err });
+
+        const format = (try conn.oneAlloc(Transaction.Data, gpa, "select id, sender, signature, sender_nonce, created_at, tag, data from transactions where id = ?", .{ .diags = &diags }, .{ .id = @as([]const u8, &id) })) orelse return null;
+        defer gpa.free(format.data);
+
+        return try Transaction.from(gpa, format);
     }
 };

@@ -21,14 +21,16 @@
 // SOFTWARE.
 
 const std = @import("std");
-const mem = std.mem;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const parseUnsigned = std.fmt.parseUnsigned;
-const net = std.net;
-const testing = std.testing;
 const expect = testing.expect;
 const expectEqualStrings = testing.expectEqualStrings;
+
+const fmt = std.fmt;
+const net = std.net;
+const mem = std.mem;
+const testing = std.testing;
 
 const ValueMap = std.StringHashMap([]const u8);
 
@@ -48,6 +50,48 @@ pub const Uri = struct {
         ip: net.Address,
         name: []const u8,
     };
+
+    // FIXME: this was quickly written and needs to be looked at again
+    pub fn format(self: Uri, comptime layout: []const u8, options: fmt.FormatOptions, writer: anytype) !void {
+        _ = layout;
+        _ = options;
+
+        if (self.scheme.len != 0) {
+            try fmt.format(writer, "{s}:", .{self.scheme});
+        }
+        if (self.scheme.len > 0 or self.username.len > 0) {
+            if (self.path.len > 0 or self.username.len > 0) {
+                try fmt.format(writer, "//", .{});
+            }
+            if (self.username.len > 0) {
+                try fmt.format(writer, "{}", .{fmt.fmtSliceEscapeLower(self.username)});
+                if (self.password.len > 0) {
+                    try fmt.format(writer, ":{}", .{fmt.fmtSliceEscapeLower(self.password)});
+                }
+            }
+            switch (self.host) {
+                .ip => |ip| try fmt.format(writer, "{}", .{ip}),
+                .name => |name| try fmt.format(writer, "{s}", .{name}),
+            }
+        }
+        if (self.path.len > 0 and self.path[0] != '/') {
+            try fmt.format(writer, "/", .{});
+        }
+        if (self.len == 0) {
+            if (mem.indexOfScalar(u8, self.path, ':')) |i| {
+                if (mem.indexOfScalar(u8, self.path[0..i], '/') == null) {
+                    try fmt.format(writer, "./", .{});
+                }
+            }
+        }
+        try fmt.format(writer, "{s}", .{self.path});
+        if (self.query.len > 0) {
+            try fmt.format(writer, "?{s}", .{self.query});
+        }
+        if (self.fragment.len > 0) {
+            try fmt.format(writer, "#{s}", .{self.fragment});
+        }
+    }
 
     /// map query string into a hashmap of key value pairs with no value being an empty string
     pub fn mapQuery(allocator: *Allocator, query: []const u8) Allocator.Error!ValueMap {

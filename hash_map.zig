@@ -55,6 +55,35 @@ pub fn StaticHashMap(comptime K: type, comptime V: type, comptime Context: type,
         del_probe_count: usize = 0,
 
         pub usingnamespace HashMapMixin(Self, K, V, Context);
+
+        pub fn ensureUnusedCapacity(self: *Self, count: usize) !void {
+            try self.ensureTotalCapacity(self.len + count);
+        }
+
+        pub fn ensureTotalCapacity(_: *Self, count: usize) !void {
+            if (count <= capacity) {
+                return;
+            }
+            return error.OutOfMemory;
+        }
+
+        pub fn put(self: *Self, key: K, value: V) !void {
+            try self.putContext(key, value, undefined);
+        }
+
+        pub fn putContext(self: *Self, key: K, value: V, ctx: Context) !void {
+            try self.ensureUnusedCapacity(1);
+            self.putAssumeCapacityContext(key, value, ctx);
+        }
+
+        pub fn getOrPut(self: *Self, key: K) !GetOrPutResult {
+            return try self.getOrPutContext(key, undefined);
+        }
+
+        pub fn getOrPutContext(self: *Self, key: K, ctx: Context) !GetOrPutResult {
+            try self.ensureUnusedCapacity(1);
+            return self.getOrPutAssumeCapacityContext(key, ctx);
+        }
     };
 }
 
