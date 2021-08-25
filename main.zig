@@ -2786,6 +2786,9 @@ pub const Store = struct {
     }
 
     fn createConnection(maybe_path: ?[]const u8) !sqlite.Db {
+        var diags: sqlite.Diagnostics = .{};
+        errdefer |err| log.warn("failed to create sqlite connection to '{s}' ({}): {}", .{ maybe_path, err, diags });
+
         var db: sqlite.Db = db: {
             const path = maybe_path orelse {
                 break :db try sqlite.Db.init(.{
@@ -2793,6 +2796,7 @@ pub const Store = struct {
                     .open_flags = .{ .create = true, .write = true },
                     .threading_mode = .MultiThread,
                     .shared_cache = true,
+                    .diags = &diags,
                 });
             };
 
@@ -2805,6 +2809,7 @@ pub const Store = struct {
                 .open_flags = .{ .create = true, .write = true },
                 .threading_mode = .MultiThread,
                 .shared_cache = true,
+                .diags = &diags,
             });
         };
         errdefer db.deinit();
