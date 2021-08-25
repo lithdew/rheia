@@ -81,27 +81,63 @@ pub fn timeout(ctx: *Context, params: Timeout) !void {
     return instance.timeout(ctx, params);
 }
 
+var global_signal_state: usize = 0;
+
 pub fn waitForSignal(ctx: *Context, codes: anytype) !void {
     var set = mem.zeroes(os.sigset_t);
     inline for (codes) |code| {
         os.linux.sigaddset(&set, code);
     }
 
-    var prev_set: os.sigset_t = undefined;
-    if (os.system.sigprocmask(os.SIG_BLOCK, &set, &prev_set) != 0) {
-        return error.UnableToMaskSignals;
-    }
-    defer if (os.system.sigprocmask(os.SIG_SETMASK, &prev_set, null) != 0) {
-        @panic("failed to unmask signals");
+    const sigaction: os.Sigaction = .{
+        .handler = .{ .handler = waitForSignalHandler },
+        .mask = set,
+        .flags = os.SA_SIGINFO,
     };
 
-    const fd = try os.signalfd(-1, &set, os.O_CLOEXEC);
-    defer os.close(fd);
+    inline for (codes) |code| {
+        os.sigaction(code, &sigaction, null);
+    }
 
-    var info: os.signalfd_siginfo = undefined;
+    var task: Task = .{ .frame = @frame() };
 
-    const num_bytes = try runtime.read(ctx, fd, mem.asBytes(&info), 0);
-    if (num_bytes < @sizeOf(os.signalfd_siginfo)) return error.ShortRead;
+    var callback: struct {
+        state: Context.Callback = .{ .run = @This().run },
+        task: *Task,
+
+        pub fn run(state: *Context.Callback) void {
+            const callback = @fieldParentPtr(@This(), "state", state);
+            runtime.schedule(callback.task);
+        }
+    } = .{ .task = &task };
+
+    try ctx.register(&callback.state);
+    defer ctx.deregister(&callback.state);
+
+    suspend {
+        if (@atomicRmw(usize, &global_signal_state, .Xchg, @ptrToInt(&task), .SeqCst) == 1) {
+            ctx.deregister(&callback.state);
+            runtime.schedule(&task);
+        }
+    }
+}
+
+fn waitForSignalHandler(_: c_int) callconv(.C) void {
+    var state = @atomicLoad(usize, &global_signal_state, .SeqCst);
+    while (true) {
+        const new_state: usize = switch (state) {
+            0 => 1,
+            else => 0,
+        };
+
+        state = @cmpxchgWeak(usize, &global_signal_state, state, new_state, .SeqCst, .SeqCst) orelse {
+            if (new_state == 0) {
+                runtime.instance.incoming_tasks.push(@intToPtr(*Task, state));
+                runtime.instance.notify();
+            }
+            return;
+        };
+    }
 }
 
 pub fn getAllocator() *mem.Allocator {
