@@ -47,8 +47,9 @@ const usage = fmt.comptimePrint(
     \\  -h, --help                                Show this screen.
     \\  -v, --version                             Show version.
     \\  -d, --database-path                       File path for storing all state and data.
-    \\  -l, --listen-address ([<host>][:]<port>)  Address to listen for peers on. [default: 127.0.0.1:9000]
-    \\  -b, --http-address ([<host>][:]<port>)    Address to handle HTTP requests on. [default: 127.0.0.1:8080]
+    \\  -l, --listen-address ([<host>][:]<port>)  Address to listen for peers on. [default: 0.0.0.0:9000]
+    \\  -b, --http-address ([<host>][:]<port>)    Address to handle HTTP requests on. [default: --listen-address]
+    \\  -n, --node-address ([<host>][:]<port>)    Address for peers to reach this node on. [default: 0.0.0.0:9000]
     \\
     \\To spawn and bootstrap a three-node Rheia cluster:
     \\  rheia -l 9000
@@ -57,8 +58,9 @@ const usage = fmt.comptimePrint(
 , .{});
 
 pub const Arguments = struct {
-    @"listen-address": []const u8 = "127.0.0.1:9000",
-    @"http-address": []const u8 = "127.0.0.1:8080",
+    @"listen-address": []const u8 = "0.0.0.0:9000",
+    @"http-address": []const u8 = "0.0.0.0:8080",
+    @"node-address": ?[]const u8 = null,
     @"database-path": ?[]const u8 = null,
     help: bool = false,
     version: bool = false,
@@ -69,6 +71,7 @@ pub const Arguments = struct {
         .d = "database-path",
         .l = "listen-address",
         .b = "http-address",
+        .n = "node-address",
     };
 
     pub fn parse(gpa: *mem.Allocator) !args.ParseArgsResult(Arguments) {
@@ -79,6 +82,7 @@ pub const Arguments = struct {
 pub const Options = struct {
     listen_address: ip.Address,
     http_address: ip.Address,
+    node_address: ip.Address,
     database_path: ?[]const u8,
     bootstrap_addresses: []const ip.Address,
 
@@ -100,6 +104,7 @@ pub const Options = struct {
 
         var listen_address = try net.parseIpAddress(arguments.options.@"listen-address");
         var http_address = try net.parseIpAddress(arguments.options.@"http-address");
+        var node_address = if (arguments.options.@"node-address") |address| try net.parseIpAddress(address) else listen_address;
 
         const database_path = if (arguments.options.@"database-path") |text| try gpa.dupe(u8, text) else null;
         errdefer if (database_path) |text| gpa.free(text);
@@ -114,6 +119,7 @@ pub const Options = struct {
         return Options{
             .listen_address = listen_address,
             .http_address = http_address,
+            .node_address = node_address,
             .database_path = database_path,
             .bootstrap_addresses = bootstrap_addresses,
         };
@@ -160,7 +166,7 @@ pub fn run() !void {
     defer store.deinit();
 
     var node: Node = undefined;
-    try node.init(runtime.getAllocator(), &store, keys, options.listen_address);
+    try node.init(runtime.getAllocator(), &store, keys, options.node_address);
     defer {
         var shutdown_ctx: Context = .{};
         defer shutdown_ctx.cancel();
@@ -1039,18 +1045,63 @@ pub const Node = struct {
         _ = reader;
         _ = params;
 
+        var buffer = std.ArrayList(u8).init(gpa);
+        defer buffer.deinit();
+
+        var peer_ids: [16]kademlia.ID = undefined;
+        const num_peer_ids = self.table.closestTo(&peer_ids, self.id.public_key);
+
+        var stream = std.json.writeStream(buffer.writer(), 128);
+        var buf: [1024]u8 = undefined;
+
+        try stream.beginObject();
+
+        try stream.objectField("id");
+        try stream.beginObject();
+        try stream.objectField("public_key");
+        try stream.emitString(try fmt.bufPrint(&buf, "{}", .{fmt.fmtSliceHexLower(&self.id.public_key)}));
+        try stream.objectField("address");
+        try stream.emitString(try fmt.bufPrint(&buf, "{}", .{self.id.address}));
+        try stream.endObject();
+
+        try stream.objectField("database_path");
+        try stream.emitString(if (self.chain.store.maybe_path) |path| path else ":memory:");
+
+        try stream.objectField("current_block_height");
+        try stream.emitNumber(if (self.chain.blocks.latest()) |latest_block| latest_block.height else 0);
+
+        try stream.objectField("num_pending_transactions");
+        try stream.emitNumber(self.chain.pending.len);
+
+        try stream.objectField("num_missing_transactions");
+        try stream.emitNumber(self.chain.missing.len);
+
+        try stream.objectField("peer_ids");
+        try stream.beginArray();
+        for (peer_ids[0..num_peer_ids]) |peer_id| {
+            try stream.beginObject();
+            try stream.objectField("public_key");
+            try stream.emitString(try fmt.bufPrint(&buf, "{}", .{fmt.fmtSliceHexLower(&peer_id.public_key)}));
+            try stream.objectField("address");
+            try stream.emitString(try fmt.bufPrint(&buf, "{}", .{peer_id.address}));
+            try stream.endObject();
+        }
+        try stream.endArray();
+
+        try stream.endObject();
+
         const response: http.Response = .{
             .status_code = 200,
             .message = "OK",
             .headers = &[_]http.Header{
-                .{ .name = "Content-Type", .value = "text/html" },
-                .{ .name = "Content-Length", .value = fmt.comptimePrint("{d}", .{"hello world".len}) },
+                .{ .name = "Content-Type", .value = "application/json" },
+                .{ .name = "Content-Length", .value = fmt.bufPrintIntToSlice(&buf, buffer.items.len, 10, .lower, .{}) },
             },
             .num_headers = 2,
         };
 
         try writer.print("{}", .{response});
-        try writer.print("hello world", .{});
+        try writer.print("{s}", .{buffer.items});
     }
 
     pub fn httpGetBlocks(
