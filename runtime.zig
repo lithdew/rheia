@@ -415,22 +415,22 @@ pub const Runtime = struct {
 
             const result = syscall.result orelse continue;
             if (result < 0) {
-                return switch (-result) {
-                    os.EINTR => continue,
-                    os.EAGAIN => error.WouldBlock,
-                    os.EBADF => unreachable,
-                    os.ECONNABORTED => error.ConnectionAborted,
-                    os.EFAULT => unreachable,
-                    os.EINVAL => error.SocketNotListening,
-                    os.ENOTSOCK => unreachable,
-                    os.EMFILE => error.ProcessFdQuotaExceeded,
-                    os.ENFILE => error.SystemFdQuotaExceeded,
-                    os.ENOBUFS => error.SystemResources,
-                    os.ENOMEM => error.SystemResources,
-                    os.EOPNOTSUPP => unreachable,
-                    os.EPROTO => error.ProtocolFailure,
-                    os.EPERM => error.BlockedByFirewall,
-                    os.ECANCELED => error.Cancelled,
+                return switch (@intToEnum(os.E, -result)) {
+                    .INTR => continue,
+                    .AGAIN => error.WouldBlock,
+                    .BADF => unreachable,
+                    .CONNABORTED => error.ConnectionAborted,
+                    .FAULT => unreachable,
+                    .INVAL => error.SocketNotListening,
+                    .NOTSOCK => unreachable,
+                    .MFILE => error.ProcessFdQuotaExceeded,
+                    .NFILE => error.SystemFdQuotaExceeded,
+                    .NOBUFS => error.SystemResources,
+                    .NOMEM => error.SystemResources,
+                    .OPNOTSUPP => unreachable,
+                    .PROTO => error.ProtocolFailure,
+                    .PERM => error.BlockedByFirewall,
+                    .CANCELED => error.Cancelled,
                     else => |err| return os.unexpectedErrno(err),
                 };
             }
@@ -480,18 +480,18 @@ pub const Runtime = struct {
 
             const result = syscall.result orelse continue;
             if (result < 0) {
-                return switch (-result) {
-                    os.EBADF => unreachable,
-                    os.EFAULT => unreachable,
-                    os.EINVAL => unreachable,
-                    os.ENOTCONN => unreachable,
-                    os.ENOTSOCK => unreachable,
-                    os.EINTR => continue,
-                    os.EAGAIN => error.WouldBlock,
-                    os.ENOMEM => error.SystemResources,
-                    os.ECONNREFUSED => error.ConnectionRefused,
-                    os.ECONNRESET => error.ConnectionResetByPeer,
-                    os.ECANCELED => error.Cancelled,
+                return switch (@intToEnum(os.E, -result)) {
+                    .BADF => unreachable,
+                    .FAULT => unreachable,
+                    .INVAL => unreachable,
+                    .NOTCONN => unreachable,
+                    .NOTSOCK => unreachable,
+                    .INTR => continue,
+                    .AGAIN => error.WouldBlock,
+                    .NOMEM => error.SystemResources,
+                    .CONNREFUSED => error.ConnectionRefused,
+                    .CONNRESET => error.ConnectionResetByPeer,
+                    .CANCELED => error.Cancelled,
                     else => |err| os.unexpectedErrno(err),
                 };
             }
@@ -537,33 +537,33 @@ pub const Runtime = struct {
 
             const result = syscall.result orelse continue;
             if (result < 0) {
-                return switch (-result) {
-                    os.EACCES => error.AccessDenied,
-                    os.EAGAIN => error.WouldBlock,
-                    os.EALREADY => error.FastOpenAlreadyInProgress,
-                    os.EBADF => unreachable,
-                    os.ECONNRESET => error.ConnectionResetByPeer,
-                    os.EDESTADDRREQ => unreachable,
-                    os.EFAULT => unreachable,
-                    os.EINTR => continue,
-                    os.EINVAL => unreachable,
-                    os.EISCONN => unreachable,
-                    os.EMSGSIZE => error.MessageTooBig,
-                    os.ENOBUFS => error.SystemResources,
-                    os.ENOMEM => error.SystemResources,
-                    os.ENOTSOCK => unreachable,
-                    os.EOPNOTSUPP => unreachable,
-                    os.EPIPE => error.BrokenPipe,
-                    os.EAFNOSUPPORT => error.AddressFamilyNotSupported,
-                    os.ELOOP => error.SymLinkLoop,
-                    os.ENAMETOOLONG => error.NameTooLong,
-                    os.ENOENT => error.FileNotFound,
-                    os.ENOTDIR => error.NotDir,
-                    os.EHOSTUNREACH => error.NetworkUnreachable,
-                    os.ENETUNREACH => error.NetworkUnreachable,
-                    os.ENOTCONN => error.SocketNotConnected,
-                    os.ENETDOWN => error.NetworkSubsystemFailed,
-                    os.ECANCELED => error.Cancelled,
+                return switch (@intToEnum(os.E, -result)) {
+                    .ACCES => error.AccessDenied,
+                    .AGAIN => error.WouldBlock,
+                    .ALREADY => error.FastOpenAlreadyInProgress,
+                    .BADF => unreachable,
+                    .CONNRESET => error.ConnectionResetByPeer,
+                    .DESTADDRREQ => unreachable,
+                    .FAULT => unreachable,
+                    .INTR => continue,
+                    .INVAL => unreachable,
+                    .ISCONN => unreachable,
+                    .MSGSIZE => error.MessageTooBig,
+                    .NOBUFS => error.SystemResources,
+                    .NOMEM => error.SystemResources,
+                    .NOTSOCK => unreachable,
+                    .OPNOTSUPP => unreachable,
+                    .PIPE => error.BrokenPipe,
+                    .AFNOSUPPORT => error.AddressFamilyNotSupported,
+                    .LOOP => error.SymLinkLoop,
+                    .NAMETOOLONG => error.NameTooLong,
+                    .NOENT => error.FileNotFound,
+                    .NOTDIR => error.NotDir,
+                    .HOSTUNREACH => error.NetworkUnreachable,
+                    .NETUNREACH => error.NetworkUnreachable,
+                    .NOTCONN => error.SocketNotConnected,
+                    .NETDOWN => error.NetworkSubsystemFailed,
+                    .CANCELED => error.Cancelled,
                     else => |err| os.unexpectedErrno(err),
                 };
             }
@@ -614,26 +614,26 @@ pub const Runtime = struct {
 
             const result = syscall.result orelse continue;
             if (result < 0) {
-                return switch (-result) {
-                    os.EACCES => error.PermissionDenied,
-                    os.EPERM => error.PermissionDenied,
-                    os.EADDRINUSE => error.AddressInUse,
-                    os.EADDRNOTAVAIL => error.AddressNotAvailable,
-                    os.EAFNOSUPPORT => error.AddressFamilyNotSupported,
-                    os.EAGAIN, os.EINPROGRESS => error.WouldBlock,
-                    os.EALREADY => error.ConnectionPending,
-                    os.EBADF => unreachable,
-                    os.ECONNREFUSED => error.ConnectionRefused,
-                    os.ECONNRESET => error.ConnectionResetByPeer,
-                    os.EFAULT => unreachable,
-                    os.EINTR => continue,
-                    os.EISCONN => unreachable,
-                    os.ENETUNREACH => error.NetworkUnreachable,
-                    os.ENOTSOCK => unreachable,
-                    os.EPROTOTYPE => unreachable,
-                    os.ETIMEDOUT => error.ConnectionTimedOut,
-                    os.ENOENT => error.FileNotFound,
-                    os.ECANCELED => error.Cancelled,
+                return switch (@intToEnum(os.E, -result)) {
+                    .ACCES => error.PermissionDenied,
+                    .PERM => error.PermissionDenied,
+                    .ADDRINUSE => error.AddressInUse,
+                    .ADDRNOTAVAIL => error.AddressNotAvailable,
+                    .AFNOSUPPORT => error.AddressFamilyNotSupported,
+                    .AGAIN, .INPROGRESS => error.WouldBlock,
+                    .ALREADY => error.ConnectionPending,
+                    .BADF => unreachable,
+                    .CONNREFUSED => error.ConnectionRefused,
+                    .CONNRESET => error.ConnectionResetByPeer,
+                    .FAULT => unreachable,
+                    .INTR => continue,
+                    .ISCONN => unreachable,
+                    .NETUNREACH => error.NetworkUnreachable,
+                    .NOTSOCK => unreachable,
+                    .PROTOTYPE => unreachable,
+                    .TIMEDOUT => error.ConnectionTimedOut,
+                    .NOENT => error.FileNotFound,
+                    .CANCELED => error.Cancelled,
                     else => |err| os.unexpectedErrno(err),
                 };
             }
@@ -679,18 +679,18 @@ pub const Runtime = struct {
 
             const result = syscall.result orelse continue;
             if (result < 0) {
-                return switch (-result) {
-                    os.EBADF => unreachable,
-                    os.EFAULT => unreachable,
-                    os.EINVAL => unreachable,
-                    os.ENOTCONN => unreachable,
-                    os.ENOTSOCK => unreachable,
-                    os.EINTR => continue,
-                    os.EAGAIN => error.WouldBlock,
-                    os.ENOMEM => error.SystemResources,
-                    os.ECONNREFUSED => error.ConnectionRefused,
-                    os.ECONNRESET => error.ConnectionResetByPeer,
-                    os.ECANCELED => error.Cancelled,
+                return switch (@intToEnum(os.E, -result)) {
+                    .BADF => unreachable,
+                    .FAULT => unreachable,
+                    .INVAL => unreachable,
+                    .NOTCONN => unreachable,
+                    .NOTSOCK => unreachable,
+                    .INTR => continue,
+                    .AGAIN => error.WouldBlock,
+                    .NOMEM => error.SystemResources,
+                    .CONNREFUSED => error.ConnectionRefused,
+                    .CONNRESET => error.ConnectionResetByPeer,
+                    .CANCELED => error.Cancelled,
                     else => |err| os.unexpectedErrno(err),
                 };
             }
@@ -745,9 +745,9 @@ pub const Runtime = struct {
 
             const result = syscall.result orelse continue;
             if (result < 0) {
-                return switch (-result) {
-                    os.ETIME => {},
-                    os.ECANCELED => error.Cancelled,
+                return switch (@intToEnum(os.E, -result)) {
+                    .TIME => {},
+                    .CANCELED => error.Cancelled,
                     else => |err| os.unexpectedErrno(err),
                 };
             }
@@ -778,9 +778,9 @@ pub const Runtime = struct {
 
             const result = syscall.result orelse continue;
             if (result < 0) {
-                return switch (-result) {
-                    os.ENOENT => {},
-                    os.EALREADY => {},
+                return switch (@intToEnum(os.E, -result)) {
+                    .NOENT => {},
+                    .ALREADY => {},
                     else => |err| panic("{}", .{os.unexpectedErrno(err)}),
                 };
             }
