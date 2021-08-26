@@ -46,10 +46,11 @@ const usage = fmt.comptimePrint(
     \\Options:
     \\  -h, --help                                Show this screen.
     \\  -v, --version                             Show version.
-    \\  -d, --database-path                       File path for storing all state and data.
-    \\  -l, --listen-address ([<host>][:]<port>)  Address to listen for peers on. [default: 0.0.0.0:9000]
-    \\  -b, --http-address ([<host>][:]<port>)    Address to handle HTTP requests on. [default: --listen-address]
-    \\  -n, --node-address ([<host>][:]<port>)    Address for peers to reach this node on. [default: 0.0.0.0:9000]
+    \\  -d, --database-path                       File path for storing all state and data. (env: DB_PATH)
+    \\  -l, --listen-address ([<host>][:]<port>)  Address to listen for peers on. (env: LISTEN_ADDR) [default: 0.0.0.0:9000]
+    \\  -b, --http-address ([<host>][:]<port>)    Address to handle HTTP requests on. (env: HTTP_ADDR) [default: --listen-address]
+    \\  -n, --node-address ([<host>][:]<port>)    Address for peers to reach this node on. (env: NODE_ADDR) [default: 0.0.0.0:9000]
+    \\  -s, --secret-key <secret key>             Hex-encoded Ed25519 secret key of this node. (env: SECRET_KEY) [default: randomly generated]
     \\
     \\To spawn and bootstrap a three-node Rheia cluster:
     \\  rheia -l 9000
@@ -57,11 +58,30 @@ const usage = fmt.comptimePrint(
     \\  rheia -l 9002 127.0.0.1:9000
 , .{});
 
+pub const EnvironmentVariables = struct {
+    listen_address: ?[]const u8 = null,
+    http_address: ?[]const u8 = null,
+    node_address: ?[]const u8 = null,
+    database_path: ?[]const u8 = null,
+    secret_key: ?[]const u8 = null,
+
+    pub fn parse() EnvironmentVariables {
+        return EnvironmentVariables{
+            .listen_address = os.getenv("LISTEN_ADDR"),
+            .http_address = os.getenv("HTTP_ADDR"),
+            .node_address = os.getenv("NODE_ADDR"),
+            .database_path = os.getenv("DB_PATH"),
+            .secret_key = os.getenv("SECRET_KEY"),
+        };
+    }
+};
+
 pub const Arguments = struct {
-    @"listen-address": []const u8 = "0.0.0.0:9000",
-    @"http-address": []const u8 = "0.0.0.0:8080",
+    @"listen-address": ?[]const u8 = null,
+    @"http-address": ?[]const u8 = null,
     @"node-address": ?[]const u8 = null,
     @"database-path": ?[]const u8 = null,
+    @"secret-key": ?[]const u8 = null,
     help: bool = false,
     version: bool = false,
 
@@ -72,6 +92,7 @@ pub const Arguments = struct {
         .l = "listen-address",
         .b = "http-address",
         .n = "node-address",
+        .s = "secret-key",
     };
 
     pub fn parse(gpa: *mem.Allocator) !args.ParseArgsResult(Arguments) {
@@ -85,9 +106,17 @@ pub const Options = struct {
     node_address: ip.Address,
     database_path: ?[]const u8,
     bootstrap_addresses: []const ip.Address,
+    keys: Ed25519.KeyPair,
 
     pub fn parse(gpa: *mem.Allocator) !Options {
-        errdefer os.exit(0);
+        errdefer {
+            if (@errorReturnTrace()) |stack_trace| {
+                std.debug.dumpStackTrace(stack_trace.*);
+            }
+            os.exit(0);
+        }
+
+        // parse command-line arguments
 
         const arguments = try Arguments.parse(gpa);
         defer arguments.deinit();
@@ -102,12 +131,44 @@ pub const Options = struct {
             return error.Cancelled;
         }
 
-        var listen_address = try net.parseIpAddress(arguments.options.@"listen-address");
-        var http_address = try net.parseIpAddress(arguments.options.@"http-address");
-        var node_address = if (arguments.options.@"node-address") |address| try net.parseIpAddress(address) else listen_address;
+        var listen_address: ip.Address = ip.Address.initIPv4(IPv4.unspecified, 9000);
+        var http_address: ip.Address = ip.Address.initIPv4(IPv4.unspecified, 8080);
+        var node_address: ip.Address = listen_address;
 
-        const database_path = if (arguments.options.@"database-path") |text| try gpa.dupe(u8, text) else null;
+        var database_path: ?[]const u8 = null;
         errdefer if (database_path) |text| gpa.free(text);
+
+        var keys = try Ed25519.KeyPair.create(null);
+
+        // take from environment variables first
+        const env = EnvironmentVariables.parse();
+        if (env.listen_address) |text| listen_address = try net.parseIpAddress(text);
+        if (env.http_address) |text| http_address = try net.parseIpAddress(text);
+        if (env.node_address) |text| node_address = try net.parseIpAddress(text);
+        if (env.database_path) |text| database_path = try gpa.dupe(u8, text);
+
+        if (env.secret_key) |text| {
+            var buf: [32]u8 = undefined;
+            keys = try Ed25519.KeyPair.create((try fmt.hexToBytes(&buf, text))[0..32].*);
+        }
+
+        // take from command-line arguments second
+        if (arguments.options.@"listen-address") |text| listen_address = try net.parseIpAddress(text);
+        if (arguments.options.@"http-address") |text| http_address = try net.parseIpAddress(text);
+        if (arguments.options.@"node-address") |text| node_address = try net.parseIpAddress(text);
+
+        if (arguments.options.@"database-path") |text| {
+            if (database_path) |old_text| {
+                gpa.free(old_text);
+                database_path = null;
+            }
+            database_path = try gpa.dupe(u8, text);
+        }
+
+        if (arguments.options.@"secret-key") |text| {
+            var buf: [32]u8 = undefined;
+            keys = try Ed25519.KeyPair.create((try fmt.hexToBytes(&buf, text))[0..32].*);
+        }
 
         const bootstrap_addresses = try gpa.alloc(ip.Address, arguments.positionals.len);
         errdefer gpa.free(bootstrap_addresses);
@@ -121,6 +182,7 @@ pub const Options = struct {
             .http_address = http_address,
             .node_address = node_address,
             .database_path = database_path,
+            .keys = keys,
             .bootstrap_addresses = bootstrap_addresses,
         };
     }
@@ -153,9 +215,8 @@ pub fn run() !void {
     const options = try Options.parse(runtime.getAllocator());
     defer options.deinit(runtime.getAllocator());
 
-    const keys = try Ed25519.KeyPair.create(null);
-    log.debug("public key: {}", .{fmt.fmtSliceHexLower(&keys.public_key)});
-    log.debug("secret key: {}", .{fmt.fmtSliceHexLower(keys.secret_key[0..Ed25519.seed_length])});
+    log.debug("public key: {}", .{fmt.fmtSliceHexLower(&options.keys.public_key)});
+    log.debug("secret key: {}", .{fmt.fmtSliceHexLower(options.keys.secret_key[0..Ed25519.seed_length])});
 
     log.info("press ctrl+c to commence graceful shutdown", .{});
 
@@ -166,7 +227,7 @@ pub fn run() !void {
     defer store.deinit();
 
     var node: Node = undefined;
-    try node.init(runtime.getAllocator(), &store, keys, options.node_address);
+    try node.init(runtime.getAllocator(), &store, options.keys, options.node_address);
     defer {
         var shutdown_ctx: Context = .{};
         defer shutdown_ctx.cancel();
