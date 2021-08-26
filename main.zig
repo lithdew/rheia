@@ -2933,7 +2933,7 @@ pub const Store = struct {
         var db: sqlite.Db = db: {
             const path = maybe_path orelse {
                 break :db try sqlite.Db.init(.{
-                    .mode = .Memory,
+                    .mode = .{ .File = "file:rheia?mode=memory&cache=shared" },
                     .open_flags = .{ .create = true, .write = true },
                     .threading_mode = .MultiThread,
                     .shared_cache = true,
