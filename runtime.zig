@@ -53,6 +53,10 @@ pub fn endCpuBoundOperation() void {
     return instance.endCpuBoundOperation();
 }
 
+pub fn pollAdd(ctx: *Context, fd: os.fd_t, poll_mask: u32) !void {
+    return instance.pollAdd(ctx, fd, poll_mask);
+}
+
 pub fn read(ctx: *Context, fd: os.fd_t, buffer: []u8, offset: u64) !usize {
     return instance.read(ctx, fd, buffer, offset);
 }
@@ -81,63 +85,29 @@ pub fn timeout(ctx: *Context, params: Timeout) !void {
     return instance.timeout(ctx, params);
 }
 
-var global_signal_state: usize = 0;
-
 pub fn waitForSignal(ctx: *Context, codes: anytype) !void {
     var set = mem.zeroes(os.sigset_t);
     inline for (codes) |code| {
         os.linux.sigaddset(&set, code);
     }
 
-    const sigaction: os.Sigaction = .{
-        .handler = .{ .handler = waitForSignalHandler },
-        .mask = set,
-        .flags = os.SA_SIGINFO,
+    var prev_set: os.sigset_t = undefined;
+    if (os.system.sigprocmask(os.SIG_BLOCK, &set, &prev_set) != 0) {
+        return error.UnableToMaskSignals;
+    }
+    defer if (os.system.sigprocmask(os.SIG_SETMASK, &prev_set, null) != 0) {
+        @panic("failed to unmask signals");
     };
 
-    inline for (codes) |code| {
-        os.sigaction(code, &sigaction, null);
-    }
+    const fd = try os.signalfd(-1, &set, os.O_CLOEXEC);
+    defer os.close(fd);
 
-    var task: Task = .{ .frame = @frame() };
+    try runtime.pollAdd(ctx, fd, os.POLLIN);
 
-    var callback: struct {
-        state: Context.Callback = .{ .run = @This().run },
-        task: *Task,
+    var info: os.signalfd_siginfo = undefined;
 
-        pub fn run(state: *Context.Callback) void {
-            const callback = @fieldParentPtr(@This(), "state", state);
-            runtime.schedule(callback.task);
-        }
-    } = .{ .task = &task };
-
-    try ctx.register(&callback.state);
-    defer ctx.deregister(&callback.state);
-
-    suspend {
-        if (@atomicRmw(usize, &global_signal_state, .Xchg, @ptrToInt(&task), .SeqCst) == 1) {
-            ctx.deregister(&callback.state);
-            runtime.schedule(&task);
-        }
-    }
-}
-
-fn waitForSignalHandler(_: c_int) callconv(.C) void {
-    var state = @atomicLoad(usize, &global_signal_state, .SeqCst);
-    while (true) {
-        const new_state: usize = switch (state) {
-            0 => 1,
-            else => 0,
-        };
-
-        state = @cmpxchgWeak(usize, &global_signal_state, state, new_state, .SeqCst, .SeqCst) orelse {
-            if (new_state == 0) {
-                runtime.instance.incoming_tasks.push(@intToPtr(*Task, state));
-                runtime.instance.notify();
-            }
-            return;
-        };
-    }
+    const num_bytes = try runtime.read(ctx, fd, mem.asBytes(&info), 0);
+    if (num_bytes < @sizeOf(os.signalfd_siginfo)) return error.ShortRead;
 }
 
 pub fn getAllocator() *mem.Allocator {
@@ -669,6 +639,58 @@ pub const Runtime = struct {
                     .PROTOTYPE => unreachable,
                     .TIMEDOUT => error.ConnectionTimedOut,
                     .NOENT => error.FileNotFound,
+                    .CANCELED => error.Cancelled,
+                    else => |err| os.unexpectedErrno(err),
+                };
+            }
+            return;
+        }
+    }
+
+    pub fn pollAdd(self: *Runtime, ctx: *Context, fd: os.fd_t, poll_mask: u32) !void {
+        var syscall: Syscall = .{ .task = .{ .frame = @frame() } };
+
+        var callback: struct {
+            state: Context.Callback = .{ .run = @This().run },
+
+            self: *Runtime,
+            syscall: *Syscall,
+
+            pub fn run(state: *Context.Callback) void {
+                const callback = @fieldParentPtr(@This(), "state", state);
+                return callback.self.cancel(callback.syscall);
+            }
+        } = .{ .self = self, .syscall = &syscall };
+
+        try ctx.register(&callback.state);
+        defer ctx.deregister(&callback.state);
+
+        while (true) {
+            var maybe_err: ?anyerror = null;
+
+            suspend {
+                maybe_err = maybe_err: {
+                    _ = self.ring.poll_add(@ptrToInt(&syscall), fd, poll_mask) catch |err| {
+                        self.pending_tasks.append(&syscall.task);
+                        switch (err) {
+                            error.SubmissionQueueFull => {},
+                            else => break :maybe_err err,
+                        }
+                    };
+                    break :maybe_err null;
+                };
+            }
+
+            if (maybe_err) |err| return err;
+
+            const result = syscall.result orelse continue;
+            if (result < 0) {
+                return switch (@intToEnum(os.E, -result)) {
+                    .BADF => unreachable,
+                    .FAULT => unreachable,
+                    .INVAL => unreachable,
+                    .INTR => continue,
+                    .NOMEM => error.SystemResources,
                     .CANCELED => error.Cancelled,
                     else => |err| os.unexpectedErrno(err),
                 };
