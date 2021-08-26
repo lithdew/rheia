@@ -1965,7 +1965,7 @@ pub const Chain = struct {
                 runtime.startCpuBoundOperation();
                 defer runtime.endCpuBoundOperation();
 
-                break :store_block self.store.storeBlock(&conn, finalized_block, finalized_transactions.items);
+                break :store_block self.store.storeBlock(gpa, &conn, finalized_block, finalized_transactions.items);
             };
 
             store_block_result catch |err| {
@@ -2812,19 +2812,23 @@ pub const Store = struct {
     maybe_path: ?[]const u8,
 
     pub fn init(gpa: *mem.Allocator, maybe_path: ?[]const u8) !Store {
-        var db = try createConnection(maybe_path);
-        errdefer db.deinit();
+        var conn = try createConnection(maybe_path);
+        errdefer conn.deinit();
 
-        @setEvalBranchQuota(10_000);
-        comptime var it = mem.tokenize(u8, @embedFile("schema.sql"), ";");
-        inline while (comptime it.next()) |stmt| {
-            try db.exec(stmt, .{}, .{});
+        var error_message: [*c]u8 = null;
+        defer if (error_message) |error_message_ptr| {
+            log.warn("failed to init schema: {s}", .{error_message_ptr});
+            sqlite.c.sqlite3_free(error_message_ptr);
+        };
+
+        if (sqlite.c.sqlite3_exec(conn.db, @embedFile("schema.sql"), null, null, &error_message) != sqlite.c.SQLITE_OK) {
+            return error.SQLiteError;
         }
 
         var pool = std.fifo.LinearFifo(sqlite.Db, .Dynamic).init(gpa);
         errdefer pool.deinit();
 
-        try pool.writeItem(db);
+        try pool.writeItem(conn);
 
         return Store{ .pool = pool, .maybe_path = maybe_path };
     }
@@ -2886,36 +2890,18 @@ pub const Store = struct {
         self.pool.writeItem(conn.*) catch conn.deinit();
     }
 
-    fn execute(conn: *sqlite.Db, raw_query: []const u8) !void {
-        var diags: sqlite.Diagnostics = .{};
-        errdefer |err| log.warn("error while executing query ({}): {}", .{ diags, err });
+    fn execute(gpa: *mem.Allocator, conn: *sqlite.Db, raw_query: []const u8) !void {
+        var error_message: [*c]u8 = null;
+        defer if (error_message) |error_message_ptr| {
+            log.warn("error while executing query: {s}", .{error_message_ptr});
+            sqlite.c.sqlite3_free(error_message_ptr);
+        };
 
-        var stmt: ?*sqlite.c.sqlite3_stmt = undefined;
-        var result = sqlite.c.sqlite3_prepare_v3(
-            conn.db,
-            raw_query.ptr,
-            @intCast(c_int, raw_query.len),
-            0,
-            &stmt,
-            null,
-        );
-        if (result != sqlite.c.SQLITE_OK) {
-            diags.err = conn.getDetailedError();
-            return sqlite.errorFromResultCode(result);
-        }
-        defer _ = sqlite.c.sqlite3_finalize(stmt);
+        const query = try std.cstr.addNullByte(gpa, raw_query);
+        defer gpa.free(query);
 
-        if (sqlite.c.sqlite3_stmt_readonly(stmt) != 0) {
-            return error.QueryIsReadOnly;
-        }
-
-        result = sqlite.c.sqlite3_step(stmt);
-        switch (result) {
-            sqlite.c.SQLITE_DONE => {},
-            else => {
-                diags.err = conn.getDetailedError();
-                return sqlite.errorFromResultCode(result);
-            },
+        if (sqlite.c.sqlite3_exec(conn.db, query.ptr, null, null, &error_message) != sqlite.c.SQLITE_OK) {
+            return error.SQLiteError;
         }
     }
 
@@ -3013,7 +2999,7 @@ pub const Store = struct {
         return buffer.toOwnedSlice();
     }
 
-    pub fn storeBlock(_: *Store, conn: *sqlite.Db, block: *Block, transactions: []const *Transaction) !void {
+    pub fn storeBlock(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, block: *Block, transactions: []const *Transaction) !void {
         var diags: sqlite.Diagnostics = .{};
         errdefer |err| log.warn("error while saving block ({}): {}", .{ diags, err });
 
@@ -3044,7 +3030,7 @@ pub const Store = struct {
             );
 
             if (tx.tag == .stmt) {
-                execute(conn, tx.data[0..tx.data_len]) catch {};
+                execute(gpa, conn, tx.data[0..tx.data_len]) catch {};
             }
         }
 
