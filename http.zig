@@ -13,9 +13,9 @@ const http = @This();
 
 pub usingnamespace @import("http/http.zig");
 
-pub fn Server(comptime Handler: type) type {
+pub fn Listener(comptime Handler: type) type {
     return struct {
-        const log = std.log.scoped(.http_server);
+        const log = std.log.scoped(.http_listener);
 
         const Self = @This();
 
@@ -25,7 +25,7 @@ pub fn Server(comptime Handler: type) type {
             return Self{ .handler = handler };
         }
 
-        pub fn serve(_: *Self, ctx: *Context, gpa: *mem.Allocator, net_listener: *net.Listener(Self), listener: tcp.Listener) !void {
+        pub fn serve(ctx: *Context, gpa: *mem.Allocator, net_listener: *net.Listener(Self), listener: tcp.Listener) !void {
             const bind_address = try listener.getLocalAddress();
 
             log.info("listening for requests on: {}", .{bind_address});

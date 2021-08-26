@@ -298,19 +298,20 @@ pub fn startNodeListener(ctx: *Context, options: Options, node: *Node) !void {
     try tcp_listener.bind(options.listen_address);
     try tcp_listener.listen(128);
 
-    var node_listener = net.Listener(Node).init(node);
+    var listener: Listener = .{ .node = node };
+    var net_listener = net.Listener(Listener).init(&listener);
     defer {
         var shutdown_ctx: Context = .{};
         defer shutdown_ctx.cancel();
 
-        if (node_listener.deinit(&shutdown_ctx)) |_| {
+        if (net_listener.deinit(&shutdown_ctx)) |_| {
             log.info("node listener successfully shut down", .{});
         } else |err| {
             log.warn("node listener reported an error while shutting down: {}", .{err});
         }
     }
 
-    return node.serve(ctx, runtime.getAllocator(), &node_listener, tcp_listener);
+    return Listener.serve(ctx, runtime.getAllocator(), &net_listener, tcp_listener);
 }
 
 pub fn startHttpListener(ctx: *Context, options: Options, node: *Node) !void {
@@ -327,20 +328,21 @@ pub fn startHttpListener(ctx: *Context, options: Options, node: *Node) !void {
     try tcp_listener.bind(options.http_address);
     try tcp_listener.listen(128);
 
-    var http_server = http.Server(Node).init(node);
-    var http_listener = net.Listener(http.Server(Node)).init(&http_server);
+    var http_handler: HttpHandler = .{ .node = node };
+    var http_listener = http.Listener(HttpHandler).init(&http_handler);
+    var net_listener = net.Listener(http.Listener(HttpHandler)).init(&http_listener);
     defer {
         var shutdown_ctx: Context = .{};
         defer shutdown_ctx.cancel();
 
-        if (http_listener.deinit(&shutdown_ctx)) |_| {
+        if (net_listener.deinit(&shutdown_ctx)) |_| {
             log.info("http listener successfully shut down", .{});
         } else |err| {
             log.warn("http listener reported an error while shutting down: {}", .{err});
         }
     }
 
-    return http_server.serve(ctx, runtime.getAllocator(), &http_listener, tcp_listener);
+    return http.Listener(HttpHandler).serve(ctx, runtime.getAllocator(), &net_listener, tcp_listener);
 }
 
 fn bootstrapNodeWithPeers(ctx: *Context, node: *Node) !void {
@@ -791,7 +793,7 @@ test "Transaction: create, serialize, and deserialize" {
 }
 
 pub const Client = struct {
-    const log = std.log.scoped(.client);
+    const log = std.log.scoped(.node_client);
 
     base: net.Client(Client),
     rpc: net.RPC,
@@ -883,6 +885,776 @@ pub const Client = struct {
     }
 };
 
+pub const Listener = struct {
+    const log = std.log.scoped(.node_listener);
+
+    node: *Node,
+
+    pub fn serve(ctx: *Context, gpa: *mem.Allocator, net_listener: *net.Listener(Listener), listener: tcp.Listener) !void {
+        const bind_address = try listener.getLocalAddress();
+
+        log.info("listening for peers: {}", .{bind_address});
+        defer log.info("stopped listening for peers: {}", .{bind_address});
+
+        return net_listener.serve(ctx, gpa, listener);
+    }
+
+    pub fn runReadLoop(self: Listener, ctx: *Context, gpa: *mem.Allocator, conn: *net.Listener(Listener).Connection) !void {
+        var stream: runtime.Stream = .{ .socket = conn.client.socket, .context = ctx };
+        var reader = stream.reader();
+
+        var buffer = std.fifo.LinearFifo(u8, .Dynamic).init(gpa);
+        defer buffer.deinit();
+
+        while (true) {
+            while (buffer.count < net.Packet.size) {
+                const num_bytes = try reader.read(try buffer.writableWithSize(65536));
+                if (num_bytes == 0) return;
+                buffer.update(num_bytes);
+            }
+
+            const packet = try net.Packet.read(buffer.reader());
+
+            while (buffer.count < packet.len) {
+                const num_bytes = try reader.read(try buffer.writableWithSize(65536));
+                if (num_bytes == 0) return;
+                buffer.update(num_bytes);
+            }
+
+            var frame = io.limitedReader(buffer.reader(), packet.len);
+
+            while (conn.buffer.items.len > 65536) {
+                try conn.write_parker.park(ctx);
+            }
+
+            try self.process(ctx, gpa, conn, packet, &frame);
+        }
+    }
+
+    pub fn runWriteLoop(self: Listener, ctx: *Context, gpa: *mem.Allocator, conn: *net.Listener(Listener).Connection) !void {
+        _ = self;
+        _ = gpa;
+
+        var stream: runtime.Stream = .{ .socket = conn.client.socket, .context = ctx };
+        var writer = stream.writer();
+
+        while (true) {
+            while (conn.buffer.items.len == 0) {
+                try conn.writer_parker.park(ctx);
+            }
+
+            const buffer = conn.buffer.toOwnedSlice();
+            defer gpa.free(buffer);
+
+            try writer.writeAll(buffer);
+            conn.write_parker.notify({});
+        }
+    }
+
+    fn process(
+        self: Listener,
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        conn: *net.Listener(Listener).Connection,
+        packet: net.Packet,
+        frame: anytype,
+    ) !void {
+        switch (packet.op) {
+            .request => {
+                switch (packet.tag) {
+                    .ping => {
+                        try (net.Packet{
+                            .len = "hello world".len,
+                            .nonce = packet.nonce,
+                            .op = .response,
+                            .tag = .ping,
+                        }).write(conn.buffer.writer());
+
+                        try conn.buffer.writer().writeAll("hello world");
+
+                        conn.writer_parker.notify({});
+                    },
+                    .hello => {
+                        const peer_id = try kademlia.ID.read(frame.reader());
+                        const signature = try frame.reader().readBytesNoEof(64);
+                        try crypto.verify(signature, peer_id, peer_id.public_key);
+
+                        switch (self.node.table.put(peer_id)) {
+                            .full => log.info("incoming handshake from {} (peer ignored)", .{peer_id}),
+                            .updated => log.info("incoming handshake from {} (peer updated)", .{peer_id}),
+                            .inserted => log.info("incoming handshake from {} (peer registered)", .{peer_id}),
+                        }
+
+                        try (net.Packet{
+                            .len = self.node.id.size(),
+                            .nonce = packet.nonce,
+                            .op = .response,
+                            .tag = .hello,
+                        }).write(conn.buffer.writer());
+
+                        try self.node.id.write(conn.buffer.writer());
+
+                        conn.writer_parker.notify({});
+                    },
+                    .find_node => {
+                        const public_key = try frame.reader().readBytesNoEof(32);
+
+                        var ids: [16]kademlia.ID = undefined;
+                        const num_ids = self.node.table.closestTo(&ids, public_key);
+
+                        var len: u32 = 0;
+                        for (ids[0..num_ids]) |id| {
+                            len += id.size();
+                        }
+
+                        try (net.Packet{
+                            .len = len,
+                            .nonce = packet.nonce,
+                            .op = .response,
+                            .tag = .find_node,
+                        }).write(conn.buffer.writer());
+
+                        for (ids[0..num_ids]) |id| {
+                            try id.write(conn.buffer.writer());
+                        }
+
+                        conn.writer_parker.notify({});
+                    },
+                    .pull_transaction => {
+                        var transactions: std.ArrayListUnmanaged(*Transaction) = .{};
+                        defer {
+                            for (transactions.items) |tx| {
+                                tx.deinit(gpa);
+                            }
+                            transactions.deinit(gpa);
+                        }
+
+                        var num_bytes: u32 = 0;
+                        while (true) {
+                            const tx_id = frame.reader().readBytesNoEof(32) catch |err| switch (err) {
+                                error.EndOfStream => break,
+                                else => return err,
+                            };
+
+                            var maybe_tx = self.node.chain.pending.get(tx_id);
+                            if (maybe_tx == null) {
+                                var pooled_conn = try self.node.chain.store.acquireConnection();
+                                defer self.node.chain.store.releaseConnection(&pooled_conn);
+
+                                maybe_tx = try self.node.chain.store.getTransactionById(gpa, &pooled_conn, tx_id);
+                            }
+
+                            const tx = maybe_tx orelse continue;
+                            errdefer tx.deinit(gpa);
+
+                            try transactions.append(gpa, tx.ref());
+                            num_bytes += tx.size();
+                        }
+
+                        try (net.Packet{
+                            .len = num_bytes,
+                            .nonce = packet.nonce,
+                            .op = .response,
+                            .tag = .pull_transaction,
+                        }).write(conn.buffer.writer());
+
+                        for (transactions.items) |tx| {
+                            try tx.write(conn.buffer.writer());
+                        }
+
+                        conn.writer_parker.notify({});
+                    },
+                    .pull_block => {
+                        const requested_height = try frame.reader().readIntLittle(u64);
+                        const requested_cache_id = frame.reader().readBytesNoEof(32) catch null;
+                        const latest_height = if (self.node.chain.blocks.latest()) |latest_block| latest_block.height else 0;
+
+                        var block_allocated = false;
+
+                        const requested_block = block: {
+                            if (requested_height == latest_height + 1) {
+                                break :block self.node.chain.sampler.preferred;
+                            }
+                            if (self.node.chain.blocks.get(requested_height)) |old_block| {
+                                break :block old_block;
+                            }
+
+                            var pooled_conn = try self.node.chain.store.acquireConnection();
+                            defer self.node.chain.store.releaseConnection(&pooled_conn);
+
+                            if (try self.node.chain.store.getBlockByHeight(gpa, &pooled_conn, requested_height)) |old_block| {
+                                block_allocated = true;
+                                break :block old_block;
+                            }
+                            break :block null;
+                        };
+
+                        defer if (block_allocated) requested_block.?.deinit(gpa);
+
+                        const cache_hit = cache_hit: {
+                            const cache_id = requested_cache_id orelse break :cache_hit false;
+                            const block = requested_block orelse break :cache_hit false;
+                            break :cache_hit mem.eql(u8, &block.id, &cache_id);
+                        };
+
+                        var len: u32 = 1;
+                        if (requested_block) |block| {
+                            if (!cache_hit) {
+                                len += block.size();
+                            }
+                        }
+
+                        try (net.Packet{
+                            .len = len,
+                            .nonce = packet.nonce,
+                            .op = .response,
+                            .tag = .pull_block,
+                        }).write(conn.buffer.writer());
+
+                        if (requested_block) |block| {
+                            try conn.buffer.writer().writeByte(1);
+                            if (!cache_hit) {
+                                try block.write(conn.buffer.writer());
+                            }
+                        } else {
+                            try conn.buffer.writer().writeByte(0);
+                        }
+
+                        conn.writer_parker.notify({});
+                    },
+                    else => return error.UnexpectedTag,
+                }
+            },
+            .command => {
+                switch (packet.tag) {
+                    .ping => {
+                        try (net.Packet{
+                            .len = "hello world".len,
+                            .nonce = 0,
+                            .op = .command,
+                            .tag = .ping,
+                        }).write(conn.buffer.writer());
+
+                        try conn.buffer.writer().writeAll("hello world");
+
+                        conn.writer_parker.notify({});
+                    },
+                    .push_transaction => {
+                        var count: usize = 0;
+                        while (true) : (count += 1) {
+                            const tx = Transaction.read(gpa, frame.reader()) catch |err| switch (err) {
+                                error.EndOfStream => break,
+                                else => return err,
+                            };
+                            errdefer tx.deinit(gpa);
+
+                            try self.node.verifier.push(ctx, gpa, tx);
+                        }
+                    },
+                    else => return error.UnexpectedTag,
+                }
+            },
+            .response => return error.UnexpectedPacket,
+        }
+    }
+};
+
+pub const HttpHandler = struct {
+    node: *Node,
+
+    pub usingnamespace http.router.build(HttpHandler, .{
+        http.router.get("/", index),
+        http.router.get("/blocks", getBlocks),
+        http.router.get("/transactions", getTransactions),
+        http.router.get("/database/:query", queryDatabase),
+
+        http.router.post("/transactions", submitTransaction),
+    });
+
+    pub fn index(
+        self: HttpHandler,
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        request: http.Request,
+        reader: anytype,
+        writer: anytype,
+        params: []http.router.Param,
+    ) !void {
+        _ = self;
+        _ = ctx;
+        _ = gpa;
+        _ = request;
+        _ = reader;
+        _ = params;
+
+        var buffer = std.ArrayList(u8).init(gpa);
+        defer buffer.deinit();
+
+        var peer_ids: [16]kademlia.ID = undefined;
+        const num_peer_ids = self.node.table.closestTo(&peer_ids, self.node.id.public_key);
+
+        var stream = std.json.writeStream(buffer.writer(), 128);
+        var buf: [1024]u8 = undefined;
+
+        try stream.beginObject();
+
+        try stream.objectField("id");
+        try stream.beginObject();
+        try stream.objectField("public_key");
+        try stream.emitString(try fmt.bufPrint(&buf, "{}", .{fmt.fmtSliceHexLower(&self.node.id.public_key)}));
+        try stream.objectField("address");
+        try stream.emitString(try fmt.bufPrint(&buf, "{}", .{self.node.id.address}));
+        try stream.endObject();
+
+        try stream.objectField("database_path");
+        try stream.emitString(if (self.node.chain.store.maybe_path) |path| path else ":memory:");
+
+        try stream.objectField("current_block_height");
+        try stream.emitNumber(if (self.node.chain.blocks.latest()) |latest_block| latest_block.height else 0);
+
+        try stream.objectField("num_pending_transactions");
+        try stream.emitNumber(self.node.chain.pending.len);
+
+        try stream.objectField("num_missing_transactions");
+        try stream.emitNumber(self.node.chain.missing.len);
+
+        try stream.objectField("peer_ids");
+        try stream.beginArray();
+        for (peer_ids[0..num_peer_ids]) |peer_id| {
+            try stream.arrayElem();
+            try stream.beginObject();
+            try stream.objectField("public_key");
+            try stream.emitString(try fmt.bufPrint(&buf, "{}", .{fmt.fmtSliceHexLower(&peer_id.public_key)}));
+            try stream.objectField("address");
+            try stream.emitString(try fmt.bufPrint(&buf, "{}", .{peer_id.address}));
+            try stream.endObject();
+        }
+        try stream.endArray();
+
+        try stream.endObject();
+
+        const response: http.Response = .{
+            .status_code = 200,
+            .message = "OK",
+            .headers = &[_]http.Header{
+                .{ .name = "Content-Type", .value = "application/json" },
+                .{ .name = "Content-Length", .value = fmt.bufPrintIntToSlice(&buf, buffer.items.len, 10, .lower, .{}) },
+            },
+            .num_headers = 2,
+        };
+
+        try writer.print("{}", .{response});
+        try writer.print("{s}", .{buffer.items});
+    }
+
+    pub fn getBlocks(
+        self: HttpHandler,
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        request: http.Request,
+        reader: anytype,
+        writer: anytype,
+        params: []http.router.Param,
+    ) !void {
+        _ = self;
+        _ = ctx;
+        _ = gpa;
+        _ = request;
+        _ = reader;
+        _ = params;
+
+        const uri = try http.Uri.parse(request.path, true);
+
+        var query = try http.Uri.mapQuery(gpa, uri.query);
+        defer query.deinit();
+
+        var body = std.ArrayList(u8).init(gpa);
+        defer body.deinit();
+
+        var content = io.countingWriter(body.writer());
+        var length_buf: [16]u8 = undefined;
+
+        if (query.get("id")) |id_hex| {
+            if (id_hex.len != 64) {
+                return error.BadBlockId;
+            }
+
+            var id: [32]u8 = undefined;
+            _ = try fmt.hexToBytes(&id, id_hex);
+
+            const maybe_block_result = maybe_block: {
+                var conn = try self.node.chain.store.acquireConnection();
+                defer self.node.chain.store.releaseConnection(&conn);
+
+                runtime.startCpuBoundOperation();
+                defer runtime.endCpuBoundOperation();
+
+                break :maybe_block self.node.chain.store.getBlockById(gpa, &conn, id);
+            };
+
+            const maybe_block = try maybe_block_result;
+            defer if (maybe_block) |block| block.deinit(gpa);
+
+            const block = maybe_block orelse return error.BlockNotFound;
+            try std.json.stringify(block, .{}, content.writer());
+
+            const response: http.Response = .{
+                .status_code = 200,
+                .message = "OK",
+                .headers = &[_]http.Header{
+                    .{
+                        .name = "Content-Type",
+                        .value = "application/json",
+                    },
+                    .{
+                        .name = "Content-Length",
+                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
+                    },
+                },
+                .num_headers = 2,
+            };
+
+            try writer.print("{}", .{response});
+            try std.json.stringify(block, .{}, writer);
+        } else if (query.get("height")) |height_text| {
+            const height = try fmt.parseUnsigned(u64, height_text, 10);
+
+            const maybe_block_result = maybe_block: {
+                var conn = try self.node.chain.store.acquireConnection();
+                defer self.node.chain.store.releaseConnection(&conn);
+
+                runtime.startCpuBoundOperation();
+                defer runtime.endCpuBoundOperation();
+
+                break :maybe_block self.node.chain.store.getBlockByHeight(gpa, &conn, height);
+            };
+
+            const maybe_block = try maybe_block_result;
+            defer if (maybe_block) |block| block.deinit(gpa);
+
+            const block = maybe_block orelse return error.BlockNotFound;
+            try std.json.stringify(block, .{}, content.writer());
+
+            const response: http.Response = .{
+                .status_code = 200,
+                .message = "OK",
+                .headers = &[_]http.Header{
+                    .{
+                        .name = "Content-Type",
+                        .value = "application/json",
+                    },
+                    .{
+                        .name = "Content-Length",
+                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
+                    },
+                },
+                .num_headers = 2,
+            };
+
+            try writer.print("{}", .{response});
+            try std.json.stringify(block, .{}, writer);
+        } else {
+            const offset = if (query.get("offset")) |text| try fmt.parseInt(usize, text, 10) else 0;
+            const limit = math.min(100, if (query.get("limit")) |text| try fmt.parseInt(usize, text, 10) else 100);
+
+            const blocks_result = blocks: {
+                var conn = try self.node.chain.store.acquireConnection();
+                defer self.node.chain.store.releaseConnection(&conn);
+
+                runtime.startCpuBoundOperation();
+                defer runtime.endCpuBoundOperation();
+
+                break :blocks self.node.chain.store.getBlockSummaries(gpa, &conn, offset, limit);
+            };
+
+            const blocks = try blocks_result;
+            defer gpa.free(blocks);
+
+            try std.json.stringify(blocks, .{}, content.writer());
+
+            const response: http.Response = .{
+                .status_code = 200,
+                .message = "OK",
+                .headers = &[_]http.Header{
+                    .{
+                        .name = "Content-Type",
+                        .value = "application/json",
+                    },
+                    .{
+                        .name = "Content-Length",
+                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
+                    },
+                },
+                .num_headers = 2,
+            };
+
+            try writer.print("{}", .{response});
+            try std.json.stringify(blocks, .{}, writer);
+        }
+    }
+
+    pub fn getTransactions(
+        self: HttpHandler,
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        request: http.Request,
+        reader: anytype,
+        writer: anytype,
+        params: []http.router.Param,
+    ) !void {
+        _ = self;
+        _ = ctx;
+        _ = gpa;
+        _ = request;
+        _ = reader;
+        _ = params;
+
+        const uri = try http.Uri.parse(request.path, true);
+
+        var query = try http.Uri.mapQuery(gpa, uri.query);
+        defer query.deinit();
+
+        var body = std.ArrayList(u8).init(gpa);
+        defer body.deinit();
+
+        var content = io.countingWriter(body.writer());
+        var length_buf: [16]u8 = undefined;
+
+        if (query.get("id")) |id_hex| {
+            if (id_hex.len != 64) {
+                return error.BadTransactionId;
+            }
+
+            var id: [32]u8 = undefined;
+            _ = try fmt.hexToBytes(&id, id_hex);
+
+            const maybe_tx_result = maybe_tx: {
+                var conn = try self.node.chain.store.acquireConnection();
+                defer self.node.chain.store.releaseConnection(&conn);
+
+                runtime.startCpuBoundOperation();
+                defer runtime.endCpuBoundOperation();
+
+                break :maybe_tx self.node.chain.store.getTransactionById(gpa, &conn, id);
+            };
+
+            const maybe_tx = try maybe_tx_result;
+            defer if (maybe_tx) |tx| tx.deinit(gpa);
+
+            const tx = maybe_tx orelse return error.TransactionNotFound;
+            try std.json.stringify(tx, .{}, content.writer());
+
+            const response: http.Response = .{
+                .status_code = 200,
+                .message = "OK",
+                .headers = &[_]http.Header{
+                    .{
+                        .name = "Content-Type",
+                        .value = "application/json",
+                    },
+                    .{
+                        .name = "Content-Length",
+                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
+                    },
+                },
+                .num_headers = 2,
+            };
+
+            try writer.print("{}", .{response});
+            try std.json.stringify(tx, .{}, writer);
+        } else if (query.get("block_height")) |block_height_text| {
+            const block_height = try fmt.parseUnsigned(u64, block_height_text, 10);
+            const offset = if (query.get("offset")) |text| try fmt.parseInt(usize, text, 10) else 0;
+            const limit = math.min(100, if (query.get("limit")) |text| try fmt.parseInt(usize, text, 10) else 100);
+
+            const transactions_result = transactions: {
+                var conn = try self.node.chain.store.acquireConnection();
+                defer self.node.chain.store.releaseConnection(&conn);
+
+                runtime.startCpuBoundOperation();
+                defer runtime.endCpuBoundOperation();
+
+                break :transactions self.node.chain.store.getTransactionsByBlockHeight(gpa, &conn, block_height, offset, limit);
+            };
+
+            const transactions = try transactions_result;
+            defer {
+                for (transactions) |tx| {
+                    tx.deinit(gpa);
+                }
+                gpa.free(transactions);
+            }
+
+            try std.json.stringify(transactions, .{}, content.writer());
+
+            const response: http.Response = .{
+                .status_code = 200,
+                .message = "OK",
+                .headers = &[_]http.Header{
+                    .{
+                        .name = "Content-Type",
+                        .value = "application/json",
+                    },
+                    .{
+                        .name = "Content-Length",
+                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
+                    },
+                },
+                .num_headers = 2,
+            };
+
+            try writer.print("{}", .{response});
+            try std.json.stringify(transactions, .{}, writer);
+        } else {
+            const offset = if (query.get("offset")) |text| try fmt.parseInt(usize, text, 10) else 0;
+            const limit = math.min(100, if (query.get("limit")) |text| try fmt.parseInt(usize, text, 10) else 100);
+
+            const transactions_result = transactions: {
+                var conn = try self.node.chain.store.acquireConnection();
+                defer self.node.chain.store.releaseConnection(&conn);
+
+                runtime.startCpuBoundOperation();
+                defer runtime.endCpuBoundOperation();
+
+                break :transactions self.node.chain.store.getTransactions(gpa, &conn, offset, limit);
+            };
+
+            const transactions = try transactions_result;
+            defer {
+                for (transactions) |tx| {
+                    tx.deinit(gpa);
+                }
+                gpa.free(transactions);
+            }
+
+            try std.json.stringify(transactions, .{}, content.writer());
+
+            const response: http.Response = .{
+                .status_code = 200,
+                .message = "OK",
+                .headers = &[_]http.Header{
+                    .{
+                        .name = "Content-Type",
+                        .value = "application/json",
+                    },
+                    .{
+                        .name = "Content-Length",
+                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
+                    },
+                },
+                .num_headers = 2,
+            };
+
+            try writer.print("{}", .{response});
+            try std.json.stringify(transactions, .{}, writer);
+        }
+    }
+
+    pub fn queryDatabase(
+        self: HttpHandler,
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        request: http.Request,
+        reader: anytype,
+        writer: anytype,
+        params: []const http.router.Param,
+    ) !void {
+        _ = self;
+        _ = ctx;
+        _ = gpa;
+        _ = request;
+        _ = reader;
+
+        const query = (try http.Uri.decode(gpa, params[0].value)) orelse return error.QueryNotEncoded;
+        defer gpa.free(query);
+
+        const query_result = query: {
+            var conn = try self.node.chain.store.acquireConnection();
+            defer self.node.chain.store.releaseConnection(&conn);
+
+            runtime.startCpuBoundOperation();
+            defer runtime.endCpuBoundOperation();
+
+            break :query self.node.chain.store.queryJson(gpa, &conn, query);
+        };
+
+        const result = try query_result;
+        defer gpa.free(result);
+
+        var length_buf: [128]u8 = undefined;
+
+        const response: http.Response = .{
+            .status_code = 200,
+            .message = "OK",
+            .headers = &[_]http.Header{
+                .{ .name = "Content-Type", .value = "application/json" },
+                .{ .name = "Content-Length", .value = fmt.bufPrintIntToSlice(&length_buf, result.len, 10, .lower, .{}) },
+            },
+            .num_headers = 2,
+        };
+
+        try writer.print("{}", .{response});
+        try writer.writeAll(result);
+    }
+
+    pub fn submitTransaction(
+        self: HttpHandler,
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        request: http.Request,
+        reader: anytype,
+        writer: anytype,
+        params: []http.router.Param,
+    ) !void {
+        _ = self;
+        _ = ctx;
+        _ = gpa;
+        _ = request;
+        _ = reader;
+        _ = params;
+
+        const content_length = for (request.getHeaders()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "content-length")) {
+                break try fmt.parseInt(usize, header.value, 10);
+            }
+        } else return error.ContentLengthExpected;
+
+        var body = io.limitedReader(reader, content_length);
+
+        const tx = try Transaction.read(gpa, body.reader());
+        defer tx.deinit(gpa);
+
+        self.node.addTransaction(ctx, gpa, tx.ref()) catch |err| {
+            tx.deinit(gpa);
+            return err;
+        };
+
+        var transaction_id_buf: [64]u8 = undefined;
+        var length_buf: [16]u8 = undefined;
+
+        const result = .{
+            .result = "ok",
+            .transaction_id = try fmt.bufPrint(&transaction_id_buf, "{}", .{fmt.fmtSliceHexLower(&tx.id)}),
+        };
+
+        var content = io.countingWriter(io.null_writer);
+        try std.json.stringify(result, .{}, content.writer());
+
+        const response: http.Response = .{
+            .status_code = 200,
+            .message = "OK",
+            .headers = &[_]http.Header{
+                .{ .name = "Content-Type", .value = "application/json" },
+                .{ .name = "Content-Length", .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}) },
+            },
+            .num_headers = 2,
+        };
+
+        try writer.print("{}", .{response});
+        try std.json.stringify(result, .{}, writer);
+    }
+};
+
 pub const Node = struct {
     const log = std.log.scoped(.node);
 
@@ -945,15 +1717,6 @@ pub const Node = struct {
         self.chain.deinit(gpa);
 
         log.info("successfully shut down", .{});
-    }
-
-    pub fn serve(_: *Node, ctx: *Context, gpa: *mem.Allocator, net_listener: *net.Listener(Node), listener: tcp.Listener) !void {
-        const bind_address = try listener.getLocalAddress();
-
-        log.info("listening for peers: {}", .{bind_address});
-        defer log.info("stopped listening for peers: {}", .{bind_address});
-
-        return net_listener.serve(ctx, gpa, listener);
     }
 
     pub fn getOrCreateClient(self: *Node, ctx: *Context, gpa: *mem.Allocator, address: ip.Address) !*Client {
@@ -1051,757 +1814,6 @@ pub const Node = struct {
             tx.deinit(gpa);
             return err;
         };
-    }
-
-    pub fn runReadLoop(self: *Node, ctx: *Context, gpa: *mem.Allocator, conn: *net.Listener(Node).Connection) !void {
-        var stream: runtime.Stream = .{ .socket = conn.client.socket, .context = ctx };
-        var reader = stream.reader();
-
-        var buffer = std.fifo.LinearFifo(u8, .Dynamic).init(gpa);
-        defer buffer.deinit();
-
-        while (true) {
-            while (buffer.count < net.Packet.size) {
-                const num_bytes = try reader.read(try buffer.writableWithSize(65536));
-                if (num_bytes == 0) return;
-                buffer.update(num_bytes);
-            }
-
-            const packet = try net.Packet.read(buffer.reader());
-
-            while (buffer.count < packet.len) {
-                const num_bytes = try reader.read(try buffer.writableWithSize(65536));
-                if (num_bytes == 0) return;
-                buffer.update(num_bytes);
-            }
-
-            var frame = io.limitedReader(buffer.reader(), packet.len);
-
-            while (conn.buffer.items.len > 65536) {
-                try conn.write_parker.park(ctx);
-            }
-
-            try self.handleServerPacket(ctx, gpa, conn, packet, &frame);
-        }
-    }
-
-    pub fn runWriteLoop(self: *Node, ctx: *Context, gpa: *mem.Allocator, conn: *net.Listener(Node).Connection) !void {
-        _ = self;
-        _ = gpa;
-
-        var stream: runtime.Stream = .{ .socket = conn.client.socket, .context = ctx };
-        var writer = stream.writer();
-
-        while (true) {
-            while (conn.buffer.items.len == 0) {
-                try conn.writer_parker.park(ctx);
-            }
-
-            const buffer = conn.buffer.toOwnedSlice();
-            defer gpa.free(buffer);
-
-            try writer.writeAll(buffer);
-            conn.write_parker.notify({});
-        }
-    }
-
-    pub usingnamespace http.router.build(*Node, .{
-        http.router.get("/", Node.httpIndex),
-        http.router.get("/blocks", Node.httpGetBlocks),
-        http.router.get("/transactions", Node.httpGetTransactions),
-        http.router.get("/database/:query", Node.httpQueryDatabase),
-
-        http.router.post("/transactions", Node.httpSubmitTransaction),
-    });
-
-    pub fn httpIndex(
-        self: *Node,
-        ctx: *Context,
-        gpa: *mem.Allocator,
-        request: http.Request,
-        reader: anytype,
-        writer: anytype,
-        params: []http.router.Param,
-    ) !void {
-        _ = self;
-        _ = ctx;
-        _ = gpa;
-        _ = request;
-        _ = reader;
-        _ = params;
-
-        var buffer = std.ArrayList(u8).init(gpa);
-        defer buffer.deinit();
-
-        var peer_ids: [16]kademlia.ID = undefined;
-        const num_peer_ids = self.table.closestTo(&peer_ids, self.id.public_key);
-
-        var stream = std.json.writeStream(buffer.writer(), 128);
-        var buf: [1024]u8 = undefined;
-
-        try stream.beginObject();
-
-        try stream.objectField("id");
-        try stream.beginObject();
-        try stream.objectField("public_key");
-        try stream.emitString(try fmt.bufPrint(&buf, "{}", .{fmt.fmtSliceHexLower(&self.id.public_key)}));
-        try stream.objectField("address");
-        try stream.emitString(try fmt.bufPrint(&buf, "{}", .{self.id.address}));
-        try stream.endObject();
-
-        try stream.objectField("database_path");
-        try stream.emitString(if (self.chain.store.maybe_path) |path| path else ":memory:");
-
-        try stream.objectField("current_block_height");
-        try stream.emitNumber(if (self.chain.blocks.latest()) |latest_block| latest_block.height else 0);
-
-        try stream.objectField("num_pending_transactions");
-        try stream.emitNumber(self.chain.pending.len);
-
-        try stream.objectField("num_missing_transactions");
-        try stream.emitNumber(self.chain.missing.len);
-
-        try stream.objectField("peer_ids");
-        try stream.beginArray();
-        for (peer_ids[0..num_peer_ids]) |peer_id| {
-            try stream.arrayElem();
-            try stream.beginObject();
-            try stream.objectField("public_key");
-            try stream.emitString(try fmt.bufPrint(&buf, "{}", .{fmt.fmtSliceHexLower(&peer_id.public_key)}));
-            try stream.objectField("address");
-            try stream.emitString(try fmt.bufPrint(&buf, "{}", .{peer_id.address}));
-            try stream.endObject();
-        }
-        try stream.endArray();
-
-        try stream.endObject();
-
-        const response: http.Response = .{
-            .status_code = 200,
-            .message = "OK",
-            .headers = &[_]http.Header{
-                .{ .name = "Content-Type", .value = "application/json" },
-                .{ .name = "Content-Length", .value = fmt.bufPrintIntToSlice(&buf, buffer.items.len, 10, .lower, .{}) },
-            },
-            .num_headers = 2,
-        };
-
-        try writer.print("{}", .{response});
-        try writer.print("{s}", .{buffer.items});
-    }
-
-    pub fn httpGetBlocks(
-        self: *Node,
-        ctx: *Context,
-        gpa: *mem.Allocator,
-        request: http.Request,
-        reader: anytype,
-        writer: anytype,
-        params: []http.router.Param,
-    ) !void {
-        _ = self;
-        _ = ctx;
-        _ = gpa;
-        _ = request;
-        _ = reader;
-        _ = params;
-
-        const uri = try http.Uri.parse(request.path, true);
-
-        var query = try http.Uri.mapQuery(gpa, uri.query);
-        defer query.deinit();
-
-        var body = std.ArrayList(u8).init(gpa);
-        defer body.deinit();
-
-        var content = io.countingWriter(body.writer());
-        var length_buf: [16]u8 = undefined;
-
-        if (query.get("id")) |id_hex| {
-            if (id_hex.len != 64) {
-                return error.BadBlockId;
-            }
-
-            var id: [32]u8 = undefined;
-            _ = try fmt.hexToBytes(&id, id_hex);
-
-            const maybe_block_result = maybe_block: {
-                var conn = try self.chain.store.acquireConnection();
-                defer self.chain.store.releaseConnection(&conn);
-
-                runtime.startCpuBoundOperation();
-                defer runtime.endCpuBoundOperation();
-
-                break :maybe_block self.chain.store.getBlockById(gpa, &conn, id);
-            };
-
-            const maybe_block = try maybe_block_result;
-            defer if (maybe_block) |block| block.deinit(gpa);
-
-            const block = maybe_block orelse return error.BlockNotFound;
-            try std.json.stringify(block, .{}, content.writer());
-
-            const response: http.Response = .{
-                .status_code = 200,
-                .message = "OK",
-                .headers = &[_]http.Header{
-                    .{
-                        .name = "Content-Type",
-                        .value = "application/json",
-                    },
-                    .{
-                        .name = "Content-Length",
-                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
-                    },
-                },
-                .num_headers = 2,
-            };
-
-            try writer.print("{}", .{response});
-            try std.json.stringify(block, .{}, writer);
-        } else if (query.get("height")) |height_text| {
-            const height = try fmt.parseUnsigned(u64, height_text, 10);
-
-            const maybe_block_result = maybe_block: {
-                var conn = try self.chain.store.acquireConnection();
-                defer self.chain.store.releaseConnection(&conn);
-
-                runtime.startCpuBoundOperation();
-                defer runtime.endCpuBoundOperation();
-
-                break :maybe_block self.chain.store.getBlockByHeight(gpa, &conn, height);
-            };
-
-            const maybe_block = try maybe_block_result;
-            defer if (maybe_block) |block| block.deinit(gpa);
-
-            const block = maybe_block orelse return error.BlockNotFound;
-            try std.json.stringify(block, .{}, content.writer());
-
-            const response: http.Response = .{
-                .status_code = 200,
-                .message = "OK",
-                .headers = &[_]http.Header{
-                    .{
-                        .name = "Content-Type",
-                        .value = "application/json",
-                    },
-                    .{
-                        .name = "Content-Length",
-                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
-                    },
-                },
-                .num_headers = 2,
-            };
-
-            try writer.print("{}", .{response});
-            try std.json.stringify(block, .{}, writer);
-        } else {
-            const offset = if (query.get("offset")) |text| try fmt.parseInt(usize, text, 10) else 0;
-            const limit = math.min(100, if (query.get("limit")) |text| try fmt.parseInt(usize, text, 10) else 100);
-
-            const blocks_result = blocks: {
-                var conn = try self.chain.store.acquireConnection();
-                defer self.chain.store.releaseConnection(&conn);
-
-                runtime.startCpuBoundOperation();
-                defer runtime.endCpuBoundOperation();
-
-                break :blocks self.chain.store.getBlockSummaries(gpa, &conn, offset, limit);
-            };
-
-            const blocks = try blocks_result;
-            defer gpa.free(blocks);
-
-            try std.json.stringify(blocks, .{}, content.writer());
-
-            const response: http.Response = .{
-                .status_code = 200,
-                .message = "OK",
-                .headers = &[_]http.Header{
-                    .{
-                        .name = "Content-Type",
-                        .value = "application/json",
-                    },
-                    .{
-                        .name = "Content-Length",
-                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
-                    },
-                },
-                .num_headers = 2,
-            };
-
-            try writer.print("{}", .{response});
-            try std.json.stringify(blocks, .{}, writer);
-        }
-    }
-
-    pub fn httpGetTransactions(
-        self: *Node,
-        ctx: *Context,
-        gpa: *mem.Allocator,
-        request: http.Request,
-        reader: anytype,
-        writer: anytype,
-        params: []http.router.Param,
-    ) !void {
-        _ = self;
-        _ = ctx;
-        _ = gpa;
-        _ = request;
-        _ = reader;
-        _ = params;
-
-        const uri = try http.Uri.parse(request.path, true);
-
-        var query = try http.Uri.mapQuery(gpa, uri.query);
-        defer query.deinit();
-
-        var body = std.ArrayList(u8).init(gpa);
-        defer body.deinit();
-
-        var content = io.countingWriter(body.writer());
-        var length_buf: [16]u8 = undefined;
-
-        if (query.get("id")) |id_hex| {
-            if (id_hex.len != 64) {
-                return error.BadTransactionId;
-            }
-
-            var id: [32]u8 = undefined;
-            _ = try fmt.hexToBytes(&id, id_hex);
-
-            const maybe_tx_result = maybe_tx: {
-                var conn = try self.chain.store.acquireConnection();
-                defer self.chain.store.releaseConnection(&conn);
-
-                runtime.startCpuBoundOperation();
-                defer runtime.endCpuBoundOperation();
-
-                break :maybe_tx self.chain.store.getTransactionById(gpa, &conn, id);
-            };
-
-            const maybe_tx = try maybe_tx_result;
-            defer if (maybe_tx) |tx| tx.deinit(gpa);
-
-            const tx = maybe_tx orelse return error.TransactionNotFound;
-            try std.json.stringify(tx, .{}, content.writer());
-
-            const response: http.Response = .{
-                .status_code = 200,
-                .message = "OK",
-                .headers = &[_]http.Header{
-                    .{
-                        .name = "Content-Type",
-                        .value = "application/json",
-                    },
-                    .{
-                        .name = "Content-Length",
-                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
-                    },
-                },
-                .num_headers = 2,
-            };
-
-            try writer.print("{}", .{response});
-            try std.json.stringify(tx, .{}, writer);
-        } else if (query.get("block_height")) |block_height_text| {
-            const block_height = try fmt.parseUnsigned(u64, block_height_text, 10);
-            const offset = if (query.get("offset")) |text| try fmt.parseInt(usize, text, 10) else 0;
-            const limit = math.min(100, if (query.get("limit")) |text| try fmt.parseInt(usize, text, 10) else 100);
-
-            const transactions_result = transactions: {
-                var conn = try self.chain.store.acquireConnection();
-                defer self.chain.store.releaseConnection(&conn);
-
-                runtime.startCpuBoundOperation();
-                defer runtime.endCpuBoundOperation();
-
-                break :transactions self.chain.store.getTransactionsByBlockHeight(gpa, &conn, block_height, offset, limit);
-            };
-
-            const transactions = try transactions_result;
-            defer {
-                for (transactions) |tx| {
-                    tx.deinit(gpa);
-                }
-                gpa.free(transactions);
-            }
-
-            try std.json.stringify(transactions, .{}, content.writer());
-
-            const response: http.Response = .{
-                .status_code = 200,
-                .message = "OK",
-                .headers = &[_]http.Header{
-                    .{
-                        .name = "Content-Type",
-                        .value = "application/json",
-                    },
-                    .{
-                        .name = "Content-Length",
-                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
-                    },
-                },
-                .num_headers = 2,
-            };
-
-            try writer.print("{}", .{response});
-            try std.json.stringify(transactions, .{}, writer);
-        } else {
-            const offset = if (query.get("offset")) |text| try fmt.parseInt(usize, text, 10) else 0;
-            const limit = math.min(100, if (query.get("limit")) |text| try fmt.parseInt(usize, text, 10) else 100);
-
-            const transactions_result = transactions: {
-                var conn = try self.chain.store.acquireConnection();
-                defer self.chain.store.releaseConnection(&conn);
-
-                runtime.startCpuBoundOperation();
-                defer runtime.endCpuBoundOperation();
-
-                break :transactions self.chain.store.getTransactions(gpa, &conn, offset, limit);
-            };
-
-            const transactions = try transactions_result;
-            defer {
-                for (transactions) |tx| {
-                    tx.deinit(gpa);
-                }
-                gpa.free(transactions);
-            }
-
-            try std.json.stringify(transactions, .{}, content.writer());
-
-            const response: http.Response = .{
-                .status_code = 200,
-                .message = "OK",
-                .headers = &[_]http.Header{
-                    .{
-                        .name = "Content-Type",
-                        .value = "application/json",
-                    },
-                    .{
-                        .name = "Content-Length",
-                        .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}),
-                    },
-                },
-                .num_headers = 2,
-            };
-
-            try writer.print("{}", .{response});
-            try std.json.stringify(transactions, .{}, writer);
-        }
-    }
-
-    pub fn httpQueryDatabase(
-        self: *Node,
-        ctx: *Context,
-        gpa: *mem.Allocator,
-        request: http.Request,
-        reader: anytype,
-        writer: anytype,
-        params: []const http.router.Param,
-    ) !void {
-        _ = self;
-        _ = ctx;
-        _ = gpa;
-        _ = request;
-        _ = reader;
-
-        const query = (try http.Uri.decode(gpa, params[0].value)) orelse return error.QueryNotEncoded;
-        defer gpa.free(query);
-
-        const query_result = query: {
-            var conn = try self.chain.store.acquireConnection();
-            defer self.chain.store.releaseConnection(&conn);
-
-            runtime.startCpuBoundOperation();
-            defer runtime.endCpuBoundOperation();
-
-            break :query self.chain.store.queryJson(gpa, &conn, query);
-        };
-
-        const result = try query_result;
-        defer gpa.free(result);
-
-        var length_buf: [128]u8 = undefined;
-
-        const response: http.Response = .{
-            .status_code = 200,
-            .message = "OK",
-            .headers = &[_]http.Header{
-                .{ .name = "Content-Type", .value = "application/json" },
-                .{ .name = "Content-Length", .value = fmt.bufPrintIntToSlice(&length_buf, result.len, 10, .lower, .{}) },
-            },
-            .num_headers = 2,
-        };
-
-        try writer.print("{}", .{response});
-        try writer.writeAll(result);
-    }
-
-    pub fn httpSubmitTransaction(
-        self: *Node,
-        ctx: *Context,
-        gpa: *mem.Allocator,
-        request: http.Request,
-        reader: anytype,
-        writer: anytype,
-        params: []http.router.Param,
-    ) !void {
-        _ = self;
-        _ = ctx;
-        _ = gpa;
-        _ = request;
-        _ = reader;
-        _ = params;
-
-        const content_length = for (request.getHeaders()) |header| {
-            if (std.ascii.eqlIgnoreCase(header.name, "content-length")) {
-                break try fmt.parseInt(usize, header.value, 10);
-            }
-        } else return error.ContentLengthExpected;
-
-        var body = io.limitedReader(reader, content_length);
-
-        const tx = try Transaction.read(gpa, body.reader());
-        defer tx.deinit(gpa);
-
-        self.addTransaction(ctx, gpa, tx.ref()) catch |err| {
-            tx.deinit(gpa);
-            return err;
-        };
-
-        var transaction_id_buf: [64]u8 = undefined;
-        var length_buf: [16]u8 = undefined;
-
-        const result = .{
-            .result = "ok",
-            .transaction_id = try fmt.bufPrint(&transaction_id_buf, "{}", .{fmt.fmtSliceHexLower(&tx.id)}),
-        };
-
-        var content = io.countingWriter(io.null_writer);
-        try std.json.stringify(result, .{}, content.writer());
-
-        const response: http.Response = .{
-            .status_code = 200,
-            .message = "OK",
-            .headers = &[_]http.Header{
-                .{ .name = "Content-Type", .value = "application/json" },
-                .{ .name = "Content-Length", .value = fmt.bufPrintIntToSlice(&length_buf, content.bytes_written, 10, .lower, .{}) },
-            },
-            .num_headers = 2,
-        };
-
-        try writer.print("{}", .{response});
-        try std.json.stringify(result, .{}, writer);
-    }
-
-    fn handleServerPacket(
-        self: *Node,
-        ctx: *Context,
-        gpa: *mem.Allocator,
-        conn: *net.Listener(Node).Connection,
-        packet: net.Packet,
-        frame: anytype,
-    ) !void {
-        switch (packet.op) {
-            .request => {
-                switch (packet.tag) {
-                    .ping => {
-                        try (net.Packet{
-                            .len = "hello world".len,
-                            .nonce = packet.nonce,
-                            .op = .response,
-                            .tag = .ping,
-                        }).write(conn.buffer.writer());
-
-                        try conn.buffer.writer().writeAll("hello world");
-
-                        conn.writer_parker.notify({});
-                    },
-                    .hello => {
-                        const peer_id = try kademlia.ID.read(frame.reader());
-                        const signature = try frame.reader().readBytesNoEof(64);
-                        try crypto.verify(signature, peer_id, peer_id.public_key);
-
-                        switch (self.table.put(peer_id)) {
-                            .full => log.info("incoming handshake from {} (peer ignored)", .{peer_id}),
-                            .updated => log.info("incoming handshake from {} (peer updated)", .{peer_id}),
-                            .inserted => log.info("incoming handshake from {} (peer registered)", .{peer_id}),
-                        }
-
-                        try (net.Packet{
-                            .len = self.id.size(),
-                            .nonce = packet.nonce,
-                            .op = .response,
-                            .tag = .hello,
-                        }).write(conn.buffer.writer());
-
-                        try self.id.write(conn.buffer.writer());
-
-                        conn.writer_parker.notify({});
-                    },
-                    .find_node => {
-                        const public_key = try frame.reader().readBytesNoEof(32);
-
-                        var ids: [16]kademlia.ID = undefined;
-                        const num_ids = self.table.closestTo(&ids, public_key);
-
-                        var len: u32 = 0;
-                        for (ids[0..num_ids]) |id| {
-                            len += id.size();
-                        }
-
-                        try (net.Packet{
-                            .len = len,
-                            .nonce = packet.nonce,
-                            .op = .response,
-                            .tag = .find_node,
-                        }).write(conn.buffer.writer());
-
-                        for (ids[0..num_ids]) |id| {
-                            try id.write(conn.buffer.writer());
-                        }
-
-                        conn.writer_parker.notify({});
-                    },
-                    .pull_transaction => {
-                        var transactions: std.ArrayListUnmanaged(*Transaction) = .{};
-                        defer {
-                            for (transactions.items) |tx| {
-                                tx.deinit(gpa);
-                            }
-                            transactions.deinit(gpa);
-                        }
-
-                        var num_bytes: u32 = 0;
-                        while (true) {
-                            const tx_id = frame.reader().readBytesNoEof(32) catch |err| switch (err) {
-                                error.EndOfStream => break,
-                                else => return err,
-                            };
-
-                            var maybe_tx = self.chain.pending.get(tx_id);
-                            if (maybe_tx == null) {
-                                var pooled_conn = try self.chain.store.acquireConnection();
-                                defer self.chain.store.releaseConnection(&pooled_conn);
-
-                                maybe_tx = try self.chain.store.getTransactionById(gpa, &pooled_conn, tx_id);
-                            }
-
-                            const tx = maybe_tx orelse continue;
-                            errdefer tx.deinit(gpa);
-
-                            try transactions.append(gpa, tx.ref());
-                            num_bytes += tx.size();
-                        }
-
-                        try (net.Packet{
-                            .len = num_bytes,
-                            .nonce = packet.nonce,
-                            .op = .response,
-                            .tag = .pull_transaction,
-                        }).write(conn.buffer.writer());
-
-                        for (transactions.items) |tx| {
-                            try tx.write(conn.buffer.writer());
-                        }
-
-                        conn.writer_parker.notify({});
-                    },
-                    .pull_block => {
-                        const requested_height = try frame.reader().readIntLittle(u64);
-                        const requested_cache_id = frame.reader().readBytesNoEof(32) catch null;
-                        const latest_height = if (self.chain.blocks.latest()) |latest_block| latest_block.height else 0;
-
-                        var block_allocated = false;
-
-                        const requested_block = block: {
-                            if (requested_height == latest_height + 1) {
-                                break :block self.chain.sampler.preferred;
-                            }
-                            if (self.chain.blocks.get(requested_height)) |old_block| {
-                                break :block old_block;
-                            }
-
-                            var pooled_conn = try self.chain.store.acquireConnection();
-                            defer self.chain.store.releaseConnection(&pooled_conn);
-
-                            if (try self.chain.store.getBlockByHeight(gpa, &pooled_conn, requested_height)) |old_block| {
-                                block_allocated = true;
-                                break :block old_block;
-                            }
-                            break :block null;
-                        };
-
-                        defer if (block_allocated) requested_block.?.deinit(gpa);
-
-                        const cache_hit = cache_hit: {
-                            const cache_id = requested_cache_id orelse break :cache_hit false;
-                            const block = requested_block orelse break :cache_hit false;
-                            break :cache_hit mem.eql(u8, &block.id, &cache_id);
-                        };
-
-                        var len: u32 = 1;
-                        if (requested_block) |block| {
-                            if (!cache_hit) {
-                                len += block.size();
-                            }
-                        }
-
-                        try (net.Packet{
-                            .len = len,
-                            .nonce = packet.nonce,
-                            .op = .response,
-                            .tag = .pull_block,
-                        }).write(conn.buffer.writer());
-
-                        if (requested_block) |block| {
-                            try conn.buffer.writer().writeByte(1);
-                            if (!cache_hit) {
-                                try block.write(conn.buffer.writer());
-                            }
-                        } else {
-                            try conn.buffer.writer().writeByte(0);
-                        }
-
-                        conn.writer_parker.notify({});
-                    },
-                    else => return error.UnexpectedTag,
-                }
-            },
-            .command => {
-                switch (packet.tag) {
-                    .ping => {
-                        try (net.Packet{
-                            .len = "hello world".len,
-                            .nonce = 0,
-                            .op = .command,
-                            .tag = .ping,
-                        }).write(conn.buffer.writer());
-
-                        try conn.buffer.writer().writeAll("hello world");
-
-                        conn.writer_parker.notify({});
-                    },
-                    .push_transaction => {
-                        var count: usize = 0;
-                        while (true) : (count += 1) {
-                            const tx = Transaction.read(gpa, frame.reader()) catch |err| switch (err) {
-                                error.EndOfStream => break,
-                                else => return err,
-                            };
-                            errdefer tx.deinit(gpa);
-
-                            try self.verifier.push(ctx, gpa, tx);
-                        }
-                    },
-                    else => return error.UnexpectedTag,
-                }
-            },
-            .response => return error.UnexpectedPacket,
-        }
     }
 };
 
