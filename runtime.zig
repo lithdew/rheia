@@ -99,20 +99,11 @@ pub fn waitForSignal(ctx: *Context, codes: anytype) !void {
         @panic("failed to unmask signals");
     };
 
-    const epfd = try os.epoll_create1(os.EFD_CLOEXEC);
-    defer os.close(epfd);
-
     const fd = try os.signalfd(-1, &set, os.O_CLOEXEC);
     defer os.close(fd);
 
-    try os.epoll_ctl(epfd, os.EPOLL_CTL_ADD, fd, &os.epoll_event{
-        .events = os.EPOLLIN | os.EPOLLET | os.EPOLLONESHOT,
-        .data = .{ .fd = fd },
-    });
-
-    try runtime.pollAdd(ctx, epfd, os.POLLIN);
-
     var info: os.signalfd_siginfo = undefined;
+
     const num_bytes = try runtime.read(ctx, fd, mem.asBytes(&info), 0);
     if (num_bytes < @sizeOf(os.signalfd_siginfo)) return error.ShortRead;
 }
