@@ -1079,6 +1079,7 @@ pub const Node = struct {
         try stream.objectField("peer_ids");
         try stream.beginArray();
         for (peer_ids[0..num_peer_ids]) |peer_id| {
+            try stream.arrayElem();
             try stream.beginObject();
             try stream.objectField("public_key");
             try stream.emitString(try fmt.bufPrint(&buf, "{}", .{fmt.fmtSliceHexLower(&peer_id.public_key)}));
