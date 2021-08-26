@@ -116,6 +116,10 @@ pub const Options = struct {
             os.exit(0);
         }
 
+        // parse environment variables
+
+        const env = EnvironmentVariables.parse();
+
         // parse command-line arguments
 
         const arguments = try Arguments.parse(gpa);
@@ -131,44 +135,54 @@ pub const Options = struct {
             return error.Cancelled;
         }
 
-        var listen_address: ip.Address = ip.Address.initIPv4(IPv4.unspecified, 9000);
-        var http_address: ip.Address = ip.Address.initIPv4(IPv4.unspecified, 8080);
-        var node_address: ip.Address = listen_address;
+        var maybe_listen_address: ?ip.Address = null;
+        var maybe_http_address: ?ip.Address = null;
+        var maybe_node_address: ?ip.Address = null;
 
-        var database_path: ?[]const u8 = null;
-        errdefer if (database_path) |text| gpa.free(text);
+        var maybe_database_path: ?[]const u8 = null;
+        errdefer if (maybe_database_path) |text| gpa.free(text);
 
-        var keys = try Ed25519.KeyPair.create(null);
+        var maybe_keys: ?Ed25519.KeyPair = null;
 
         // take from environment variables first
-        const env = EnvironmentVariables.parse();
-        if (env.listen_address) |text| listen_address = try net.parseIpAddress(text);
-        if (env.http_address) |text| http_address = try net.parseIpAddress(text);
-        if (env.node_address) |text| node_address = try net.parseIpAddress(text);
-        if (env.database_path) |text| database_path = try gpa.dupe(u8, text);
+
+        if (env.listen_address) |text| maybe_listen_address = try net.parseIpAddress(text);
+        if (env.http_address) |text| maybe_http_address = try net.parseIpAddress(text);
+        if (env.node_address) |text| maybe_node_address = try net.parseIpAddress(text);
+
+        if (env.database_path) |text| {
+            if (maybe_database_path) |old_text| {
+                gpa.free(old_text);
+                maybe_database_path = null;
+            }
+            maybe_database_path = text;
+        }
 
         if (env.secret_key) |text| {
             var buf: [32]u8 = undefined;
-            keys = try Ed25519.KeyPair.create((try fmt.hexToBytes(&buf, text))[0..32].*);
+            maybe_keys = try Ed25519.KeyPair.create((try fmt.hexToBytes(&buf, text))[0..32].*);
         }
 
         // take from command-line arguments second
-        if (arguments.options.@"listen-address") |text| listen_address = try net.parseIpAddress(text);
-        if (arguments.options.@"http-address") |text| http_address = try net.parseIpAddress(text);
-        if (arguments.options.@"node-address") |text| node_address = try net.parseIpAddress(text);
+
+        if (arguments.options.@"listen-address") |text| maybe_listen_address = try net.parseIpAddress(text);
+        if (arguments.options.@"http-address") |text| maybe_http_address = try net.parseIpAddress(text);
+        if (arguments.options.@"node-address") |text| maybe_node_address = try net.parseIpAddress(text);
 
         if (arguments.options.@"database-path") |text| {
-            if (database_path) |old_text| {
+            if (maybe_database_path) |old_text| {
                 gpa.free(old_text);
-                database_path = null;
+                maybe_database_path = null;
             }
-            database_path = try gpa.dupe(u8, text);
+            maybe_database_path = try gpa.dupe(u8, text);
         }
 
         if (arguments.options.@"secret-key") |text| {
             var buf: [32]u8 = undefined;
-            keys = try Ed25519.KeyPair.create((try fmt.hexToBytes(&buf, text))[0..32].*);
+            maybe_keys = try Ed25519.KeyPair.create((try fmt.hexToBytes(&buf, text))[0..32].*);
         }
+
+        // load bootstrap addresses from command-line positional arguments
 
         const bootstrap_addresses = try gpa.alloc(ip.Address, arguments.positionals.len);
         errdefer gpa.free(bootstrap_addresses);
@@ -176,6 +190,15 @@ pub const Options = struct {
         for (arguments.positionals) |arg, i| {
             bootstrap_addresses[i] = try net.parseIpAddress(arg);
         }
+
+        // load default values
+
+        const listen_address = maybe_listen_address orelse ip.Address.initIPv4(IPv4.unspecified, 9000);
+        const http_address = maybe_http_address orelse ip.Address.initIPv4(IPv4.unspecified, 8080);
+        const node_address = maybe_node_address orelse listen_address;
+
+        const database_path = maybe_database_path;
+        const keys = maybe_keys orelse try Ed25519.KeyPair.create(null);
 
         return Options{
             .listen_address = listen_address,
@@ -215,7 +238,8 @@ pub fn run() !void {
     const options = try Options.parse(runtime.getAllocator());
     defer options.deinit(runtime.getAllocator());
 
-    log.debug("public key: {}", .{fmt.fmtSliceHexLower(&options.keys.public_key)});
+    log.debug("advertising to peers our address is: {}", .{options.node_address});
+    log.debug("public key: {}", .{fmt.fmtSliceHexLower(options.keys.public_key[0..Ed25519.public_length])});
     log.debug("secret key: {}", .{fmt.fmtSliceHexLower(options.keys.secret_key[0..Ed25519.seed_length])});
 
     log.info("press ctrl+c to commence graceful shutdown", .{});
