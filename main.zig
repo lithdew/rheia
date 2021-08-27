@@ -2967,6 +2967,34 @@ pub const Store = struct {
         };
         errdefer db.deinit();
 
+        const Authorizer = struct {
+            pub fn check(user_data: ?*c_void, action_code: c_int, param_1: ?[*:0]const u8, param_2: ?[*:0]const u8, param_3: ?[*:0]const u8, param_4: ?[*:0]const u8) callconv(.C) c_int {
+                _ = user_data;
+                _ = param_2;
+                _ = param_3;
+                _ = param_4;
+
+                switch (action_code) {
+                    sqlite.c.SQLITE_UPDATE,
+                    sqlite.c.SQLITE_DELETE,
+                    sqlite.c.SQLITE_DROP_TABLE,
+                    => {
+                        const table_name = mem.sliceTo(param_1 orelse return sqlite.c.SQLITE_OK, 0);
+                        if (mem.eql(u8, table_name, "blocks") or mem.eql(u8, table_name, "transactions")) {
+                            return sqlite.c.SQLITE_DENY;
+                        }
+                    },
+                    else => {},
+                }
+
+                return sqlite.c.SQLITE_OK;
+            }
+        };
+
+        if (sqlite.c.sqlite3_set_authorizer(db.db, Authorizer.check, null) != sqlite.c.SQLITE_OK) {
+            return error.AuthorizerNotInitialized;
+        }
+
         _ = try db.pragma(void, .{}, "journal_mode", "WAL");
         _ = try db.pragma(void, .{}, "read_uncommitted", "true");
         _ = try db.pragma(void, .{}, "synchronous", "normal");
