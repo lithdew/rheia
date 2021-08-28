@@ -247,7 +247,10 @@ pub fn run() !void {
     var ctx: Context = .{};
     defer ctx.cancel();
 
-    var store = try Store.init(runtime.getAllocator(), options.database_path);
+    // var store = try SqliteStore.init(runtime.getAllocator(), options.database_path);
+    // defer store.deinit();
+
+    var store = try NullStore.init(runtime.getAllocator(), options.database_path);
     defer store.deinit();
 
     var node: Node = undefined;
@@ -888,6 +891,11 @@ pub const Client = struct {
 pub const Listener = struct {
     const log = std.log.scoped(.node_listener);
 
+    pub const Connection = struct {
+        base: *net.Listener(Listener).Connection,
+        id: ?kademlia.ID = null,
+    };
+
     node: *Node,
 
     pub fn serve(ctx: *Context, gpa: *mem.Allocator, net_listener: *net.Listener(Listener), listener: tcp.Listener) !void {
@@ -899,8 +907,10 @@ pub const Listener = struct {
         return net_listener.serve(ctx, gpa, listener);
     }
 
-    pub fn runReadLoop(self: Listener, ctx: *Context, gpa: *mem.Allocator, conn: *net.Listener(Listener).Connection) !void {
-        var stream: runtime.Stream = .{ .socket = conn.client.socket, .context = ctx };
+    pub fn runReadLoop(self: Listener, ctx: *Context, gpa: *mem.Allocator, base: *net.Listener(Listener).Connection) !void {
+        var conn: Listener.Connection = .{ .base = base };
+
+        var stream: runtime.Stream = .{ .socket = conn.base.client.socket, .context = ctx };
         var reader = stream.reader();
 
         var buffer = std.fifo.LinearFifo(u8, .Dynamic).init(gpa);
@@ -923,11 +933,15 @@ pub const Listener = struct {
 
             var frame = io.limitedReader(buffer.reader(), packet.len);
 
-            while (conn.buffer.items.len > 65536) {
-                try conn.write_parker.park(ctx);
+            while (conn.base.buffer.items.len > 65536) {
+                try conn.base.write_parker.park(ctx);
             }
 
-            try self.process(ctx, gpa, conn, packet, &frame);
+            try self.process(ctx, gpa, &conn, packet, &frame);
+
+            if (conn.base.buffer.items.len > 0) {
+                conn.base.writer_parker.notify({});
+            }
         }
     }
 
@@ -955,10 +969,17 @@ pub const Listener = struct {
         self: Listener,
         ctx: *Context,
         gpa: *mem.Allocator,
-        conn: *net.Listener(Listener).Connection,
+        conn: *Listener.Connection,
         packet: net.Packet,
         frame: anytype,
     ) !void {
+        if (conn.id) |peer_id| {
+            switch (self.node.table.put(peer_id)) {
+                .full => conn.id = null,
+                .updated, .inserted => {},
+            }
+        }
+
         switch (packet.op) {
             .request => {
                 switch (packet.tag) {
@@ -968,21 +989,30 @@ pub const Listener = struct {
                             .nonce = packet.nonce,
                             .op = .response,
                             .tag = .ping,
-                        }).write(conn.buffer.writer());
+                        }).write(conn.base.buffer.writer());
 
-                        try conn.buffer.writer().writeAll("hello world");
-
-                        conn.writer_parker.notify({});
+                        try conn.base.buffer.writer().writeAll("hello world");
                     },
                     .hello => {
+                        if (conn.id) |peer_id| {
+                            log.warn("{} attempted to handshake twice from the same connection", .{peer_id});
+                            return error.AlreadyHandshaked;
+                        }
+
                         const peer_id = try kademlia.ID.read(frame.reader());
                         const signature = try frame.reader().readBytesNoEof(64);
                         try crypto.verify(signature, peer_id, peer_id.public_key);
 
                         switch (self.node.table.put(peer_id)) {
                             .full => log.info("incoming handshake from {} (peer ignored)", .{peer_id}),
-                            .updated => log.info("incoming handshake from {} (peer updated)", .{peer_id}),
-                            .inserted => log.info("incoming handshake from {} (peer registered)", .{peer_id}),
+                            .updated => {
+                                log.info("incoming handshake from {} (peer updated)", .{peer_id});
+                                conn.id = peer_id;
+                            },
+                            .inserted => {
+                                log.info("incoming handshake from {} (peer registered)", .{peer_id});
+                                conn.id = peer_id;
+                            },
                         }
 
                         try (net.Packet{
@@ -990,11 +1020,9 @@ pub const Listener = struct {
                             .nonce = packet.nonce,
                             .op = .response,
                             .tag = .hello,
-                        }).write(conn.buffer.writer());
+                        }).write(conn.base.buffer.writer());
 
-                        try self.node.id.write(conn.buffer.writer());
-
-                        conn.writer_parker.notify({});
+                        try self.node.id.write(conn.base.buffer.writer());
                     },
                     .find_node => {
                         const public_key = try frame.reader().readBytesNoEof(32);
@@ -1012,13 +1040,11 @@ pub const Listener = struct {
                             .nonce = packet.nonce,
                             .op = .response,
                             .tag = .find_node,
-                        }).write(conn.buffer.writer());
+                        }).write(conn.base.buffer.writer());
 
                         for (ids[0..num_ids]) |id| {
-                            try id.write(conn.buffer.writer());
+                            try id.write(conn.base.buffer.writer());
                         }
-
-                        conn.writer_parker.notify({});
                     },
                     .pull_transaction => {
                         var transactions: std.ArrayListUnmanaged(*Transaction) = .{};
@@ -1029,6 +1055,9 @@ pub const Listener = struct {
                             transactions.deinit(gpa);
                         }
 
+                        var pooled_conn = try self.node.chain.store.acquireConnection();
+                        defer self.node.chain.store.releaseConnection(&pooled_conn);
+
                         var num_bytes: u32 = 0;
                         while (true) {
                             const tx_id = frame.reader().readBytesNoEof(32) catch |err| switch (err) {
@@ -1038,16 +1067,16 @@ pub const Listener = struct {
 
                             var maybe_tx = self.node.chain.pending.get(tx_id);
                             if (maybe_tx == null) {
-                                var pooled_conn = try self.node.chain.store.acquireConnection();
-                                defer self.node.chain.store.releaseConnection(&pooled_conn);
-
                                 maybe_tx = try self.node.chain.store.getTransactionById(gpa, &pooled_conn, tx_id);
                             }
 
                             const tx = maybe_tx orelse continue;
-                            errdefer tx.deinit(gpa);
 
-                            try transactions.append(gpa, tx.ref());
+                            transactions.append(gpa, tx.ref()) catch {
+                                tx.deinit(gpa);
+                                continue;
+                            };
+
                             num_bytes += tx.size();
                         }
 
@@ -1056,40 +1085,37 @@ pub const Listener = struct {
                             .nonce = packet.nonce,
                             .op = .response,
                             .tag = .pull_transaction,
-                        }).write(conn.buffer.writer());
+                        }).write(conn.base.buffer.writer());
 
                         for (transactions.items) |tx| {
-                            try tx.write(conn.buffer.writer());
+                            try tx.write(conn.base.buffer.writer());
                         }
-
-                        conn.writer_parker.notify({});
                     },
                     .pull_block => {
                         const requested_height = try frame.reader().readIntLittle(u64);
                         const requested_cache_id = frame.reader().readBytesNoEof(32) catch null;
                         const latest_height = if (self.node.chain.blocks.latest()) |latest_block| latest_block.height else 0;
 
-                        var block_allocated = false;
-
                         const requested_block = block: {
                             if (requested_height == latest_height + 1) {
-                                break :block self.node.chain.sampler.preferred;
+                                if (self.node.chain.sampler.preferred) |preferred_block| {
+                                    break :block preferred_block.ref();
+                                }
+                                break :block null;
                             }
                             if (self.node.chain.blocks.get(requested_height)) |old_block| {
-                                break :block old_block;
+                                break :block old_block.ref();
                             }
 
                             var pooled_conn = try self.node.chain.store.acquireConnection();
                             defer self.node.chain.store.releaseConnection(&pooled_conn);
 
                             if (try self.node.chain.store.getBlockByHeight(gpa, &pooled_conn, requested_height)) |old_block| {
-                                block_allocated = true;
                                 break :block old_block;
                             }
                             break :block null;
                         };
-
-                        defer if (block_allocated) requested_block.?.deinit(gpa);
+                        defer if (requested_block) |block| block.deinit(gpa);
 
                         const cache_hit = cache_hit: {
                             const cache_id = requested_cache_id orelse break :cache_hit false;
@@ -1109,18 +1135,16 @@ pub const Listener = struct {
                             .nonce = packet.nonce,
                             .op = .response,
                             .tag = .pull_block,
-                        }).write(conn.buffer.writer());
+                        }).write(conn.base.buffer.writer());
 
                         if (requested_block) |block| {
-                            try conn.buffer.writer().writeByte(1);
+                            try conn.base.buffer.writer().writeByte(1);
                             if (!cache_hit) {
-                                try block.write(conn.buffer.writer());
+                                try block.write(conn.base.buffer.writer());
                             }
                         } else {
-                            try conn.buffer.writer().writeByte(0);
+                            try conn.base.buffer.writer().writeByte(0);
                         }
-
-                        conn.writer_parker.notify({});
                     },
                     else => return error.UnexpectedTag,
                 }
@@ -1133,11 +1157,9 @@ pub const Listener = struct {
                             .nonce = 0,
                             .op = .command,
                             .tag = .ping,
-                        }).write(conn.buffer.writer());
+                        }).write(conn.base.buffer.writer());
 
-                        try conn.buffer.writer().writeAll("hello world");
-
-                        conn.writer_parker.notify({});
+                        try conn.base.buffer.writer().writeAll("hello world");
                     },
                     .push_transaction => {
                         var count: usize = 0;
@@ -1146,9 +1168,20 @@ pub const Listener = struct {
                                 error.EndOfStream => break,
                                 else => return err,
                             };
-                            errdefer tx.deinit(gpa);
+                            defer tx.deinit(gpa);
 
-                            try self.node.verifier.push(ctx, gpa, tx);
+                            // do not push transactions we receive from a peer back
+
+                            if (conn.id) |peer_id| {
+                                if (self.node.pusher.isAlreadyGossipedToPeer(peer_id.address, tx.id)) {
+                                    continue;
+                                }
+                            }
+
+                            self.node.verifier.push(ctx, gpa, tx.ref()) catch {
+                                tx.deinit(gpa);
+                                continue;
+                            };
                         }
                     },
                     else => return error.UnexpectedTag,
@@ -1661,7 +1694,7 @@ pub const Node = struct {
     id: kademlia.ID,
     keys: Ed25519.KeyPair,
 
-    chain: Chain,
+    chain: Chain(NullStore),
     pusher: TransactionPusher,
     puller: TransactionPuller,
     verifier: TransactionVerifier,
@@ -1677,11 +1710,11 @@ pub const Node = struct {
     table: kademlia.RoutingTable,
     closed: bool = false,
 
-    pub fn init(self: *Node, gpa: *mem.Allocator, store: *Store, keys: Ed25519.KeyPair, address: ip.Address) !void {
+    pub fn init(self: *Node, gpa: *mem.Allocator, store: *NullStore, keys: Ed25519.KeyPair, address: ip.Address) !void {
         self.keys = keys;
         self.id = .{ .public_key = keys.public_key, .address = address };
 
-        self.chain = try Chain.init(gpa, store);
+        self.chain = try Chain(NullStore).init(gpa, store);
         errdefer self.chain.deinit(gpa);
 
         self.pusher = try TransactionPusher.init(gpa, self);
@@ -1795,10 +1828,13 @@ pub const Node = struct {
     }
 
     pub fn addTransaction(self: *Node, ctx: *Context, gpa: *mem.Allocator, tx: *Transaction) !void {
-        var conn = try self.chain.store.acquireConnection();
-        defer self.chain.store.releaseConnection(&conn);
+        _ = self.chain.missing.delete(tx.id);
 
-        if (self.chain.store.isTransactionFinalized(&conn, tx.id)) {
+        if (self.chain.finalized.get(tx.id) != null or slow_path: {
+            var conn = try self.chain.store.acquireConnection();
+            defer self.chain.store.releaseConnection(&conn);
+            break :slow_path self.chain.store.isTransactionFinalized(&conn, tx.id);
+        }) {
             return error.AlreadyExists;
         }
 
@@ -1808,8 +1844,6 @@ pub const Node = struct {
         }
         result.value_ptr.* = tx;
 
-        _ = self.chain.missing.delete(tx.id);
-
         self.pusher.push(ctx, gpa, tx.ref()) catch |err| {
             tx.deinit(gpa);
             return err;
@@ -1817,468 +1851,481 @@ pub const Node = struct {
     }
 };
 
-pub const Chain = struct {
-    const log = std.log.scoped(.chain);
+pub fn Chain(comptime Store: type) type {
+    return struct {
+        const log = std.log.scoped(.chain);
 
-    const BlockProposalMap = std.HashMapUnmanaged(
-        ?*Block,
-        usize,
-        struct {
-            pub fn hash(_: @This(), maybe_block: ?*Block) u64 {
-                const block = maybe_block orelse return 0;
-                return mem.readIntNative(u64, block.id[0..8]);
+        const Self = @This();
+
+        const BlockProposalMap = std.HashMapUnmanaged(
+            ?*Block,
+            usize,
+            struct {
+                pub fn hash(_: @This(), maybe_block: ?*Block) u64 {
+                    const block = maybe_block orelse return 0;
+                    return mem.readIntNative(u64, block.id[0..8]);
+                }
+                pub fn eql(_: @This(), maybe_block_a: ?*Block, maybe_block_b: ?*Block) bool {
+                    const block_a = maybe_block_a orelse return maybe_block_b == null;
+                    const block_b = maybe_block_b orelse return false;
+                    return mem.eql(u8, &block_a.id, &block_b.id);
+                }
+            },
+            std.hash_map.default_max_load_percentage,
+        );
+
+        pub const propose_delay_min: i64 = 0 * time.ns_per_ms;
+        pub const propose_delay_max: i64 = 500 * time.ns_per_ms;
+
+        pub const connected_delay_min: i64 = 0 * time.ns_per_ms;
+        pub const connected_delay_max: i64 = 500 * time.ns_per_ms;
+
+        store: *Store,
+        sampler: Sampler,
+        pending: SortedHashMap(*Transaction, 50),
+        missing: lru.AutoIntrusiveHashMap([32]u8, u64, 50),
+        finalized: lru.AutoIntrusiveHashMap([32]u8, void, 50),
+
+        /// 'head' and 'tail' are set at 1 until genesis blocks are implemented. Genesis
+        /// blocks are blocks whose height is 0. Until they are implemented it is safe to
+        /// assume that the first block that is to be pushed into this ring buffer starts
+        /// at height 1.
+        blocks: StaticRingBuffer(*Block, u64, 32),
+        block_proposal_cache: lru.AutoIntrusiveHashMap(ip.Address, *Block, 50),
+
+        propose_delay: i64 = propose_delay_min,
+        connected_delay: i64 = connected_delay_min,
+
+        pub fn init(gpa: *mem.Allocator, store: *Store) !Self {
+            var sampler = try Sampler.init(gpa);
+            errdefer sampler.deinit(gpa);
+
+            var pending = try SortedHashMap(*Transaction, 50).init(gpa);
+            errdefer pending.deinit(gpa);
+
+            var missing = try lru.AutoIntrusiveHashMap([32]u8, u64, 50).initCapacity(gpa, 1 << 16);
+            errdefer missing.deinit(gpa);
+
+            var finalized = try lru.AutoIntrusiveHashMap([32]u8, void, 50).initCapacity(gpa, 1 << 20);
+            errdefer finalized.deinit(gpa);
+
+            var block_proposal_cache = try lru.AutoIntrusiveHashMap(ip.Address, *Block, 50).initCapacity(gpa, 128);
+            errdefer block_proposal_cache.deinit(gpa);
+
+            var conn = try store.acquireConnection();
+            defer store.releaseConnection(&conn);
+
+            const cached_blocks = try store.getBlocks(gpa, &conn, 0, 32);
+            defer {
+                for (cached_blocks) |cached_block| {
+                    cached_block.deinit(gpa);
+                }
+                gpa.free(cached_blocks);
             }
-            pub fn eql(_: @This(), maybe_block_a: ?*Block, maybe_block_b: ?*Block) bool {
-                const block_a = maybe_block_a orelse return maybe_block_b == null;
-                const block_b = maybe_block_b orelse return false;
-                return mem.eql(u8, &block_a.id, &block_b.id);
+
+            var blocks: StaticRingBuffer(*Block, u64, 32) = .{ .head = 1, .tail = 1 };
+            if (cached_blocks.len > 0) {
+                blocks.head = cached_blocks[cached_blocks.len - 1].height;
+                blocks.tail = cached_blocks[cached_blocks.len - 1].height;
+
+                log.info("latest block is {} (height: {}, num transactions: {})", .{
+                    fmt.fmtSliceHexLower(&cached_blocks[0].id),
+                    cached_blocks[0].height,
+                    cached_blocks[0].num_transaction_ids,
+                });
+            } else {
+                log.info("no blocks found in store: starting off with an empty blockchain", .{});
             }
-        },
-        std.hash_map.default_max_load_percentage,
-    );
 
-    pub const propose_delay_min: i64 = 0 * time.ns_per_ms;
-    pub const propose_delay_max: i64 = 500 * time.ns_per_ms;
-
-    pub const connected_delay_min: i64 = 0 * time.ns_per_ms;
-    pub const connected_delay_max: i64 = 500 * time.ns_per_ms;
-
-    store: *Store,
-    sampler: Sampler,
-    pending: SortedHashMap(*Transaction, 50),
-    missing: lru.AutoIntrusiveHashMap([32]u8, u64, 50),
-
-    /// 'head' and 'tail' are set at 1 until genesis blocks are implemented. Genesis
-    /// blocks are blocks whose height is 0. Until they are implemented it is safe to
-    /// assume that the first block that is to be pushed into this ring buffer starts
-    /// at height 1.
-    blocks: StaticRingBuffer(*Block, u64, 32),
-    block_proposal_cache: lru.AutoIntrusiveHashMap(ip.Address, *Block, 50),
-
-    propose_delay: i64 = propose_delay_min,
-    connected_delay: i64 = connected_delay_min,
-
-    pub fn init(gpa: *mem.Allocator, store: *Store) !Chain {
-        var sampler = try Sampler.init(gpa);
-        errdefer sampler.deinit(gpa);
-
-        var pending = try SortedHashMap(*Transaction, 50).init(gpa);
-        errdefer pending.deinit(gpa);
-
-        var missing = try lru.AutoIntrusiveHashMap([32]u8, u64, 50).initCapacity(gpa, 1 << 16);
-        errdefer missing.deinit(gpa);
-
-        var block_proposal_cache = try lru.AutoIntrusiveHashMap(ip.Address, *Block, 50).initCapacity(gpa, 128);
-        errdefer block_proposal_cache.deinit(gpa);
-
-        var conn = try store.acquireConnection();
-        defer store.releaseConnection(&conn);
-
-        const cached_blocks = try store.getBlocks(gpa, &conn, 0, 32);
-        defer {
-            for (cached_blocks) |cached_block| {
-                cached_block.deinit(gpa);
+            var i: usize = cached_blocks.len;
+            while (i > 0) : (i -= 1) {
+                blocks.push(cached_blocks[i - 1].ref());
             }
-            gpa.free(cached_blocks);
+
+            return Self{
+                .store = store,
+                .sampler = sampler,
+                .pending = pending,
+                .missing = missing,
+                .finalized = finalized,
+                .blocks = blocks,
+                .block_proposal_cache = block_proposal_cache,
+            };
         }
 
-        var blocks: StaticRingBuffer(*Block, u64, 32) = .{ .head = 1, .tail = 1 };
-        if (cached_blocks.len > 0) {
-            blocks.head = cached_blocks[cached_blocks.len - 1].height;
-            blocks.tail = cached_blocks[cached_blocks.len - 1].height;
+        pub fn deinit(self: *Self, gpa: *mem.Allocator) void {
+            log.info("shutting down...", .{});
 
-            log.info("latest block is {} (height: {}, num transactions: {})", .{
-                fmt.fmtSliceHexLower(&cached_blocks[0].id),
-                cached_blocks[0].height,
-                cached_blocks[0].num_transaction_ids,
-            });
-        } else {
-            log.info("no blocks found in store: starting off with an empty blockchain", .{});
-        }
-
-        var i: usize = cached_blocks.len;
-        while (i > 0) : (i -= 1) {
-            blocks.push(cached_blocks[i - 1].ref());
-        }
-
-        return Chain{
-            .store = store,
-            .sampler = sampler,
-            .pending = pending,
-            .missing = missing,
-            .blocks = blocks,
-            .block_proposal_cache = block_proposal_cache,
-        };
-    }
-
-    pub fn deinit(self: *Chain, gpa: *mem.Allocator) void {
-        log.info("shutting down...", .{});
-
-        var it = self.block_proposal_cache.head;
-        while (it) |entry| : (it = entry.next) {
-            entry.value.deinit(gpa);
-        }
-        self.block_proposal_cache.deinit(gpa);
-
-        for (self.pending.slice()) |entry| {
-            if (!entry.isEmpty()) {
+            var it = self.block_proposal_cache.head;
+            while (it) |entry| : (it = entry.next) {
                 entry.value.deinit(gpa);
             }
-        }
-        self.pending.deinit(gpa);
+            self.block_proposal_cache.deinit(gpa);
 
-        self.missing.deinit(gpa);
-
-        while (self.blocks.popOrNull()) |block| {
-            block.deinit(gpa);
-        }
-
-        self.sampler.deinit(gpa);
-
-        log.info("successfully shut down", .{});
-    }
-
-    pub fn run(self: *Chain, ctx: *Context, gpa: *mem.Allocator, node: *Node) !void {
-        // TODO: cleanup error handling in this function
-
-        var transaction_ids: std.ArrayListUnmanaged([32]u8) = .{};
-        defer transaction_ids.deinit(gpa);
-
-        var block_proposals: BlockProposalMap = .{};
-        defer block_proposals.deinit(gpa);
-
-        try transaction_ids.ensureTotalCapacity(gpa, Block.max_num_transaction_ids);
-        try block_proposals.ensureTotalCapacity(gpa, 32);
-
-        // TODO: randomly sample peer ids from routing table instead
-        var peer_ids: [16]kademlia.ID = undefined;
-
-        while (true) {
-            const num_peers = node.table.closestTo(&peer_ids, node.id.public_key);
-            if (num_peers == 0) {
-                try runtime.timeout(ctx, .{ .nanoseconds = self.connected_delay });
-                self.connected_delay = math.min(connected_delay_max, self.connected_delay + (connected_delay_max - connected_delay_min) / 10);
-                continue;
-            }
-
-            self.connected_delay = connected_delay_min;
-
-            const preferred_block = self.sampler.preferred orelse {
-                self.proposeBlock(ctx, gpa, &transaction_ids) catch |err| switch (err) {
-                    error.NoTransactionsToPropose => {
-                        const next_block_height = (if (self.blocks.latest()) |latest_block| latest_block.height else 0) + 1;
-                        try self.pullBlockProposals(ctx, gpa, node, null, peer_ids[0..num_peers], next_block_height);
-                    },
-                    else => return err,
-                };
-                continue;
-            };
-
-            defer block_proposals.clearRetainingCapacity();
-
-            // sample block proposals proposals and tally them
-
-            try self.pullBlockProposals(ctx, gpa, node, &block_proposals, peer_ids[0..num_peers], preferred_block.height);
-
-            // steal a valid block proposal to be our preferred block proposal if there are any valid ones that seem promising
-
-            var max_block_proposal: ?*Block = null;
-            var block_proposals_it = block_proposals.keyIterator();
-            while (block_proposals_it.next()) |block_ptr| {
-                const block: *Block = block_ptr.* orelse continue;
-                if (max_block_proposal == null or block.num_transaction_ids > max_block_proposal.?.num_transaction_ids) {
-                    max_block_proposal = block;
-                }
-            }
-
-            if (max_block_proposal) |block_proposal| {
-                if (!mem.eql(u8, &preferred_block.id, &block_proposal.id) and (self.sampler.stalled >= Sampler.default_beta or block_proposal.num_transaction_ids >= preferred_block.num_transaction_ids)) {
-                    log.debug("moved from block {} (height: {}, {} transaction(s)) to block {} (height: {}, {} transaction(s))", .{
-                        fmt.fmtSliceHexLower(&preferred_block.id),
-                        preferred_block.height,
-                        preferred_block.num_transaction_ids,
-                        fmt.fmtSliceHexLower(&block_proposal.id),
-                        block_proposal.height,
-                        block_proposal.num_transaction_ids,
-                    });
-
-                    self.sampler.reset(gpa);
-                    self.sampler.prefer(gpa, block_proposal.ref());
-
-                    continue;
-                }
-            }
-
-            // tally our own preferred block proposal
-
-            const result = block_proposals.getOrPutAssumeCapacity(preferred_block);
-            if (!result.found_existing) {
-                result.value_ptr.* = 0;
-            }
-            result.value_ptr.* += 1;
-
-            // group block proposal tallies together by block id
-
-            var votes: [16]Sampler.Vote = undefined;
-            var num_votes: usize = 0;
-
-            var blocks_it = block_proposals.iterator();
-            while (blocks_it.next()) |entry| : (num_votes += 1) {
-                const count = @intToFloat(f64, entry.value_ptr.*);
-                const total = @intToFloat(f64, num_peers + 1);
-                votes[num_votes] = .{ .block = entry.key_ptr.*, .tally = count / total };
-            }
-
-            // update the block sampler
-
-            // if the block sampler concludes that a block has been finalized, mark all transactions in
-            // the block by their id to have been finalized, store the block on-disk, and reset the
-            // block sampler
-
-            const finalized_block = (try self.sampler.update(gpa, &votes)) orelse continue;
-            defer {
-                var it = self.block_proposal_cache.head;
-                while (it) |entry| : (it = entry.next) {
+            for (self.pending.slice()) |entry| {
+                if (!entry.isEmpty()) {
                     entry.value.deinit(gpa);
                 }
-                self.block_proposal_cache.clear();
+            }
+            self.pending.deinit(gpa);
 
-                self.sampler.reset(gpa);
+            self.missing.deinit(gpa);
+            self.finalized.deinit(gpa);
+
+            while (self.blocks.popOrNull()) |block| {
+                block.deinit(gpa);
             }
 
-            var finalized_transactions: std.ArrayListUnmanaged(*Transaction) = .{};
-            defer finalized_transactions.deinit(gpa);
+            self.sampler.deinit(gpa);
 
-            try finalized_transactions.ensureUnusedCapacity(gpa, finalized_block.num_transaction_ids);
+            log.info("successfully shut down", .{});
+        }
 
-            for (finalized_block.transaction_ids[0..finalized_block.num_transaction_ids]) |tx_id| {
-                finalized_transactions.appendAssumeCapacity(self.pending.get(tx_id).?);
-            }
+        pub fn run(self: *Self, ctx: *Context, gpa: *mem.Allocator, node: *Node) !void {
+            // TODO: cleanup error handling in this function
 
-            const store_block_result = store_block: {
-                var conn = try self.store.acquireConnection();
-                defer self.store.releaseConnection(&conn);
+            var transaction_ids: std.ArrayListUnmanaged([32]u8) = .{};
+            defer transaction_ids.deinit(gpa);
 
-                runtime.startCpuBoundOperation();
-                defer runtime.endCpuBoundOperation();
+            var block_proposals: BlockProposalMap = .{};
+            defer block_proposals.deinit(gpa);
 
-                break :store_block self.store.storeBlock(gpa, &conn, finalized_block, finalized_transactions.items);
-            };
+            try transaction_ids.ensureTotalCapacity(gpa, Block.max_num_transaction_ids);
+            try block_proposals.ensureTotalCapacity(gpa, 32);
 
-            store_block_result catch |err| {
-                log.warn("failed to save block {} (height {}, {} transaction(s): {}", .{
+            var rng = std.rand.DefaultPrng.init(@bitCast(u64, time.timestamp()));
+
+            // TODO: randomly sample peer ids from routing table instead
+            var peer_ids: [16]kademlia.ID = undefined;
+
+            while (true) {
+                const num_peers = node.table.closestTo(&peer_ids, node.id.public_key);
+                if (num_peers == 0) {
+                    try runtime.timeout(ctx, .{ .nanoseconds = self.connected_delay });
+                    self.connected_delay = math.min(connected_delay_max, self.connected_delay + (connected_delay_max - connected_delay_min) / 10);
+                    continue;
+                }
+
+                self.connected_delay = connected_delay_min;
+
+                const preferred_block = self.sampler.preferred orelse {
+                    self.proposeBlock(ctx, gpa, &transaction_ids) catch |err| switch (err) {
+                        error.NoTransactionsToPropose => {
+                            const next_block_height = (if (self.blocks.latest()) |latest_block| latest_block.height else 0) + 1;
+                            try self.pullBlockProposals(ctx, gpa, node, null, peer_ids[0..num_peers], next_block_height);
+                        },
+                        else => return err,
+                    };
+                    continue;
+                };
+
+                defer block_proposals.clearRetainingCapacity();
+
+                // sample block proposals proposals and tally them
+
+                try self.pullBlockProposals(ctx, gpa, node, &block_proposals, peer_ids[0..num_peers], preferred_block.height);
+
+                // steal a valid block proposal to be our preferred block proposal if there are any valid ones that seem promising
+
+                var max_block_proposal: ?*Block = null;
+                var block_proposals_it = block_proposals.keyIterator();
+                while (block_proposals_it.next()) |block_ptr| {
+                    const block: *Block = block_ptr.* orelse continue;
+                    if (max_block_proposal == null or block.num_transaction_ids > max_block_proposal.?.num_transaction_ids) {
+                        max_block_proposal = block;
+                    }
+                }
+
+                if (max_block_proposal) |block_proposal| {
+                    if (!mem.eql(u8, &preferred_block.id, &block_proposal.id) and ((self.sampler.stalled >= Sampler.default_beta and rng.random.boolean()) or block_proposal.num_transaction_ids > preferred_block.num_transaction_ids)) {
+                        log.debug("moved from block {} (height: {}, {} transaction(s)) to block {} (height: {}, {} transaction(s))", .{
+                            fmt.fmtSliceHexLower(&preferred_block.id),
+                            preferred_block.height,
+                            preferred_block.num_transaction_ids,
+                            fmt.fmtSliceHexLower(&block_proposal.id),
+                            block_proposal.height,
+                            block_proposal.num_transaction_ids,
+                        });
+
+                        self.sampler.reset(gpa);
+                        self.sampler.prefer(gpa, block_proposal.ref());
+
+                        continue;
+                    }
+                }
+
+                // tally our own preferred block proposal
+
+                const result = block_proposals.getOrPutAssumeCapacity(preferred_block);
+                if (!result.found_existing) {
+                    result.value_ptr.* = 0;
+                }
+                result.value_ptr.* += 1;
+
+                // group block proposal tallies together by block id
+
+                var votes: [16]Sampler.Vote = undefined;
+                var num_votes: usize = 0;
+
+                var blocks_it = block_proposals.iterator();
+                while (blocks_it.next()) |entry| : (num_votes += 1) {
+                    const count = @intToFloat(f64, entry.value_ptr.*);
+                    const total = @intToFloat(f64, num_peers + 1);
+                    votes[num_votes] = .{ .block = entry.key_ptr.*, .tally = count / total };
+                }
+
+                // update the block sampler
+
+                // if the block sampler concludes that a block has been finalized, mark all transactions in
+                // the block by their id to have been finalized, store the block on-disk, and reset the
+                // block sampler
+
+                const finalized_block = (try self.sampler.update(gpa, &votes)) orelse continue;
+                defer {
+                    var it = self.block_proposal_cache.head;
+                    while (it) |entry| : (it = entry.next) {
+                        entry.value.deinit(gpa);
+                    }
+                    self.block_proposal_cache.clear();
+
+                    self.sampler.reset(gpa);
+                }
+
+                var finalized_transactions: std.ArrayListUnmanaged(*Transaction) = .{};
+                defer finalized_transactions.deinit(gpa);
+
+                try finalized_transactions.ensureUnusedCapacity(gpa, finalized_block.num_transaction_ids);
+
+                for (finalized_block.transaction_ids[0..finalized_block.num_transaction_ids]) |tx_id| {
+                    finalized_transactions.appendAssumeCapacity(self.pending.get(tx_id).?);
+                }
+
+                const store_block_result = store_block: {
+                    var conn = try self.store.acquireConnection();
+                    defer self.store.releaseConnection(&conn);
+
+                    runtime.startCpuBoundOperation();
+                    defer runtime.endCpuBoundOperation();
+
+                    break :store_block self.store.storeBlock(gpa, &conn, finalized_block, finalized_transactions.items);
+                };
+
+                store_block_result catch |err| {
+                    log.warn("failed to save block {} (height {}, {} transaction(s): {}", .{
+                        fmt.fmtSliceHexLower(&finalized_block.id),
+                        finalized_block.height,
+                        finalized_block.num_transaction_ids,
+                        err,
+                    });
+                    continue;
+                };
+
+                for (finalized_block.transaction_ids[0..finalized_block.num_transaction_ids]) |tx_id| {
+                    _ = self.finalized.update(tx_id, .{});
+                    self.pending.delete(tx_id).?.deinit(gpa);
+                }
+
+                if (self.blocks.pushOrNull(finalized_block.ref())) |evicted_block| {
+                    evicted_block.deinit(gpa);
+                }
+
+                _ = finalized_count.fetchAdd(finalized_block.num_transaction_ids, .Monotonic);
+
+                log.info("finalized block {} (height {}, {} transaction(s))", .{
                     fmt.fmtSliceHexLower(&finalized_block.id),
                     finalized_block.height,
                     finalized_block.num_transaction_ids,
-                    err,
                 });
-                continue;
-            };
-
-            for (finalized_block.transaction_ids[0..finalized_block.num_transaction_ids]) |tx_id| {
-                self.pending.delete(tx_id).?.deinit(gpa);
             }
-
-            if (self.blocks.pushOrNull(finalized_block.ref())) |evicted_block| {
-                evicted_block.deinit(gpa);
-            }
-
-            _ = finalized_count.fetchAdd(finalized_block.num_transaction_ids, .Monotonic);
-
-            log.info("finalized block {} (height {}, {} transaction(s))", .{
-                fmt.fmtSliceHexLower(&finalized_block.id),
-                finalized_block.height,
-                finalized_block.num_transaction_ids,
-            });
-        }
-    }
-
-    fn proposeBlock(
-        self: *Chain,
-        ctx: *Context,
-        gpa: *mem.Allocator,
-        transaction_ids: *std.ArrayListUnmanaged([32]u8),
-    ) !void {
-        if (self.pending.len == 0) {
-            try runtime.timeout(ctx, .{ .nanoseconds = self.propose_delay });
-            self.propose_delay = math.min(propose_delay_max, self.propose_delay + (propose_delay_max - propose_delay_min) / 10);
-            return error.NoTransactionsToPropose;
         }
 
-        self.propose_delay = propose_delay_min;
+        fn proposeBlock(
+            self: *Self,
+            ctx: *Context,
+            gpa: *mem.Allocator,
+            transaction_ids: *std.ArrayListUnmanaged([32]u8),
+        ) !void {
+            if (self.pending.len == 0) {
+                try runtime.timeout(ctx, .{ .nanoseconds = self.propose_delay });
+                self.propose_delay = math.min(propose_delay_max, self.propose_delay + (propose_delay_max - propose_delay_min) / 10);
+                return error.NoTransactionsToPropose;
+            }
 
-        defer transaction_ids.clearRetainingCapacity();
+            self.propose_delay = propose_delay_min;
 
-        for (self.pending.slice()) |entry| {
-            if (!entry.isEmpty()) {
-                transaction_ids.appendAssumeCapacity(entry.value.id);
-                if (transaction_ids.items.len == Block.max_num_transaction_ids) {
-                    break;
+            defer transaction_ids.clearRetainingCapacity();
+
+            for (self.pending.slice()) |entry| {
+                if (!entry.isEmpty()) {
+                    transaction_ids.appendAssumeCapacity(entry.value.id);
+                    if (transaction_ids.items.len == Block.max_num_transaction_ids) {
+                        break;
+                    }
                 }
             }
+
+            const next_block_height = (if (self.blocks.latest()) |latest_block| latest_block.height else 0) + 1;
+
+            const block = try Block.create(gpa, .{
+                .height = next_block_height,
+                .merkle_root = [_]u8{0} ** 32,
+                .transaction_ids = transaction_ids.items,
+            });
+
+            self.sampler.prefer(gpa, block);
+
+            log.debug("proposed block {} (height {}, {} transaction(s))", .{
+                fmt.fmtSliceHexLower(&block.id),
+                block.height,
+                block.num_transaction_ids,
+            });
         }
 
-        const next_block_height = (if (self.blocks.latest()) |latest_block| latest_block.height else 0) + 1;
+        fn pullBlockProposals(
+            self: *Self,
+            ctx: *Context,
+            gpa: *mem.Allocator,
+            node: *Node,
+            maybe_block_proposals: ?*BlockProposalMap,
+            peer_ids: []const kademlia.ID,
+            block_proposal_height: u64,
+        ) !void {
+            const frames = try gpa.alloc(@Frame(pullBlock), peer_ids.len);
+            defer gpa.free(frames);
 
-        const block = try Block.create(gpa, .{
-            .height = next_block_height,
-            .merkle_root = [_]u8{0} ** 32,
-            .transaction_ids = transaction_ids.items,
-        });
+            var wg: sync.WaitGroup = .{};
 
-        self.sampler.prefer(gpa, block);
+            var frame_index: usize = 0;
+            errdefer for (frames[0..frame_index]) |*frame| {
+                _ = await frame catch continue;
+            };
 
-        log.debug("proposed block {} (height {}, {} transaction(s))", .{
-            fmt.fmtSliceHexLower(&block.id),
-            block.height,
-            block.num_transaction_ids,
-        });
-    }
-
-    fn pullBlockProposals(
-        self: *Chain,
-        ctx: *Context,
-        gpa: *mem.Allocator,
-        node: *Node,
-        maybe_block_proposals: ?*BlockProposalMap,
-        peer_ids: []const kademlia.ID,
-        block_proposal_height: u64,
-    ) !void {
-        const frames = try gpa.alloc(@Frame(pullBlock), peer_ids.len);
-        defer gpa.free(frames);
-
-        var wg: sync.WaitGroup = .{};
-
-        var frame_index: usize = 0;
-        errdefer for (frames[0..frame_index]) |*frame| {
-            _ = await frame catch continue;
-        };
-
-        while (frame_index < peer_ids.len) : (frame_index += 1) {
-            frames[frame_index] = async self.pullBlock(ctx, gpa, &wg, node, peer_ids[frame_index].address, block_proposal_height);
-        }
-
-        try wg.wait(ctx);
-
-        for (frames[0..frame_index]) |*frame| {
-            const maybe_block_proposal = await frame catch null;
-            const block_proposals = maybe_block_proposals orelse continue;
-
-            const result = block_proposals.getOrPutAssumeCapacity(maybe_block_proposal);
-            if (!result.found_existing) {
-                result.value_ptr.* = 0;
+            while (frame_index < peer_ids.len) : (frame_index += 1) {
+                frames[frame_index] = async self.pullBlock(ctx, gpa, &wg, node, peer_ids[frame_index].address, block_proposal_height);
             }
-            result.value_ptr.* += 1;
-        }
-    }
 
-    fn pullBlock(
-        self: *Chain,
-        ctx: *Context,
-        gpa: *mem.Allocator,
-        wg: *sync.WaitGroup,
-        node: *Node,
-        address: ip.Address,
-        block_height: u64,
-    ) !*Block {
-        wg.add(1);
-        defer wg.sub(1);
+            try wg.wait(ctx);
 
-        const client = try node.getOrCreateClient(ctx, gpa, address);
+            for (frames[0..frame_index]) |*frame| {
+                const maybe_block_proposal = await frame catch null;
+                const block_proposals = maybe_block_proposals orelse continue;
 
-        const cached_block_proposal = if (self.block_proposal_cache.get(address)) |entry| entry.value.ref() else null;
-        defer if (cached_block_proposal) |block_proposal| block_proposal.deinit(gpa);
-
-        var entry: net.RPC.Entry = .{};
-        var nonce = try client.rpc.register(ctx, &entry);
-
-        {
-            const writer = try client.acquireWriter(ctx, gpa);
-            defer client.releaseWriter(writer);
-
-            try (net.Packet{
-                .len = @sizeOf(u64) + @as(u32, if (cached_block_proposal != null) @sizeOf([32]u8) else 0),
-                .nonce = nonce,
-                .op = .request,
-                .tag = .pull_block,
-            }).write(writer);
-
-            try writer.writeIntLittle(u64, block_height);
-            if (cached_block_proposal) |block_proposal| {
-                try writer.writeAll(&block_proposal.id);
+                const result = block_proposals.getOrPutAssumeCapacity(maybe_block_proposal);
+                if (!result.found_existing) {
+                    result.value_ptr.* = 0;
+                }
+                result.value_ptr.* += 1;
             }
         }
 
-        const response = try await entry.response;
-        defer response.deinit(gpa);
+        fn pullBlock(
+            self: *Self,
+            ctx: *Context,
+            gpa: *mem.Allocator,
+            wg: *sync.WaitGroup,
+            node: *Node,
+            address: ip.Address,
+            block_height: u64,
+        ) !*Block {
+            wg.add(1);
+            defer wg.sub(1);
 
-        var body = io.fixedBufferStream(response.body);
+            const client = try node.getOrCreateClient(ctx, gpa, address);
 
-        const exists = (try body.reader().readByte()) != 0;
-        if (!exists) return error.BlockNotExists;
+            const cached_block_proposal = if (self.block_proposal_cache.get(address)) |entry| entry.value.ref() else null;
+            defer if (cached_block_proposal) |block_proposal| block_proposal.deinit(gpa);
 
-        const block = Block.read(gpa, body.reader()) catch |err| {
-            if (response.body.len > 1) {
+            var entry: net.RPC.Entry = .{};
+            var nonce = try client.rpc.register(ctx, &entry);
+
+            {
+                const writer = try client.acquireWriter(ctx, gpa);
+                defer client.releaseWriter(writer);
+
+                try (net.Packet{
+                    .len = @sizeOf(u64) + @as(u32, if (cached_block_proposal != null) @sizeOf([32]u8) else 0),
+                    .nonce = nonce,
+                    .op = .request,
+                    .tag = .pull_block,
+                }).write(writer);
+
+                try writer.writeIntLittle(u64, block_height);
+                if (cached_block_proposal) |block_proposal| {
+                    try writer.writeAll(&block_proposal.id);
+                }
+            }
+
+            const response = try await entry.response;
+            defer response.deinit(gpa);
+
+            var body = io.fixedBufferStream(response.body);
+
+            const exists = (try body.reader().readByte()) != 0;
+            if (!exists) return error.BlockNotExists;
+
+            const block = Block.read(gpa, body.reader()) catch |err| {
+                if (response.body.len > 1) {
+                    return err;
+                }
+
+                const block_proposal = cached_block_proposal orelse return err;
+
+                // it is possible that our cached block proposal response may have
+                // been evicted by time we reach here, so an insertion may happen
+                // yet again
+
+                switch (self.block_proposal_cache.update(address, block_proposal.ref())) {
+                    .inserted => {},
+                    .updated => |old_block| old_block.deinit(gpa),
+                    .evicted => |old_entry| old_entry.value.deinit(gpa),
+                }
+                return block_proposal;
+            };
+            errdefer block.deinit(gpa);
+
+            if (block.height != block_height) {
+                return error.UnexpectedPulledBlockHeight;
+            }
+
+            var conn = try self.store.acquireConnection();
+            defer self.store.releaseConnection(&conn);
+
+            var maybe_err: ?anyerror = null;
+
+            var it = [_]u8{0} ** 32;
+            for (block.transaction_ids[0..block.num_transaction_ids]) |tx_id| {
+                if (!mem.lessThan(u8, &it, &tx_id)) {
+                    maybe_err = error.BlockProposalTransactionIdsNotSorted;
+                }
+                if (node.chain.finalized.get(tx_id) != null or node.chain.store.isTransactionFinalized(&conn, tx_id)) {
+                    if (maybe_err == null) {
+                        maybe_err = error.TransactionAlreadyFinalized;
+                    }
+                    continue;
+                }
+                if (node.chain.pending.get(tx_id) == null) {
+                    _ = node.chain.missing.update(tx_id, block_height);
+                    if (maybe_err == null) {
+                        maybe_err = error.BlockProposalContainsUnknownTransactionId;
+                    }
+                }
+                it = tx_id;
+            }
+
+            if (maybe_err) |err| {
                 return err;
             }
 
-            const block_proposal = cached_block_proposal orelse return err;
-
-            // it is possible that our cached block proposal response may have
-            // been evicted by time we reach here, so an insertion may happen
-            // yet again
-
-            switch (self.block_proposal_cache.update(address, block_proposal.ref())) {
+            switch (self.block_proposal_cache.update(address, block)) {
                 .inserted => {},
                 .updated => |old_block| old_block.deinit(gpa),
                 .evicted => |old_entry| old_entry.value.deinit(gpa),
             }
-            return block_proposal;
-        };
-        errdefer block.deinit(gpa);
 
-        if (block.height != block_height) {
-            return error.UnexpectedPulledBlockHeight;
+            return block;
         }
-
-        var conn = try self.store.acquireConnection();
-        defer self.store.releaseConnection(&conn);
-
-        var maybe_err: ?anyerror = null;
-
-        var it = [_]u8{0} ** 32;
-        for (block.transaction_ids[0..block.num_transaction_ids]) |tx_id| {
-            if (!mem.lessThan(u8, &it, &tx_id)) {
-                maybe_err = error.BlockProposalTransactionIdsNotSorted;
-            }
-            if (node.chain.store.isTransactionFinalized(&conn, tx_id)) {
-                if (maybe_err == null) {
-                    maybe_err = error.TransactionAlreadyFinalized;
-                }
-                continue;
-            }
-            if (node.chain.pending.get(tx_id) == null) {
-                _ = node.chain.missing.update(tx_id, block_height);
-                if (maybe_err == null) {
-                    maybe_err = error.BlockProposalContainsUnknownTransactionId;
-                }
-            }
-            it = tx_id;
-        }
-
-        if (maybe_err) |err| {
-            return err;
-        }
-
-        switch (self.block_proposal_cache.update(address, block)) {
-            .inserted => {},
-            .updated => |old_block| old_block.deinit(gpa),
-            .evicted => |old_entry| old_entry.value.deinit(gpa),
-        }
-
-        return block;
-    }
-};
+    };
+}
 
 pub const TransactionPuller = struct {
     const log = std.log.scoped(.tx_puller);
@@ -2371,11 +2418,18 @@ pub const TransactionPuller = struct {
         };
 
         var frame_index: usize = 0;
-        defer for (frames[0..frame_index]) |*frame| {
+        defer for (frames[0..frame_index]) |*frame, i| {
             const transactions = await frame catch continue;
             defer gpa.free(transactions);
 
             for (transactions) |tx| {
+                _ = self.node.chain.missing.delete(tx.id);
+
+                if (self.node.pusher.isAlreadyGossipedToPeer(peer_ids[i].address, tx.id)) {
+                    tx.deinit(gpa);
+                    continue;
+                }
+
                 self.node.addTransaction(ctx, gpa, tx) catch {
                     tx.deinit(gpa);
                     continue;
@@ -2493,7 +2547,7 @@ pub const TransactionPusher = struct {
 
     num_bytes_pending: usize = 0,
     pending: std.ArrayListUnmanaged(*Transaction) = .{},
-    pool: sync.BoundedTaskPool(gossipTransactions) = .{ .capacity = 256 },
+    pool: sync.BoundedTaskPool(gossipTransactions) = .{ .capacity = 128 },
 
     pub fn init(gpa: *mem.Allocator, node: *Node) !TransactionPusher {
         var cache = try Cache.initCapacity(gpa, 1 << 20);
@@ -2559,6 +2613,10 @@ pub const TransactionPusher = struct {
         try self.pool.spawn(ctx, gpa, .{ self, ctx, gpa, peer_ids[0..num_peers] });
     }
 
+    pub fn isAlreadyGossipedToPeer(self: *TransactionPusher, address: ip.Address, transaction_id: [32]u8) bool {
+        return self.cache.update(.{ .address = address, .transaction_id = transaction_id }, {}) == .updated;
+    }
+
     fn gossipTransactions(self: *TransactionPusher, ctx: *Context, gpa: *mem.Allocator, peer_ids: []const kademlia.ID) !void {
         const transactions = self.pending.toOwnedSlice(gpa);
         defer {
@@ -2585,12 +2643,7 @@ pub const TransactionPusher = struct {
 
             var filtered_transactions_len: u32 = 0;
             for (transactions) |tx| {
-                const entry: Entry = .{
-                    .address = peer_ids[frame_index].address,
-                    .transaction_id = tx.id,
-                };
-
-                if (self.cache.update(entry, {}) == .updated) {
+                if (self.isAlreadyGossipedToPeer(peer_ids[frame_index].address, tx.id)) {
                     continue;
                 }
 
@@ -2652,7 +2705,7 @@ pub const TransactionVerifier = struct {
     const log = std.log.scoped(.tx_verifier);
 
     pub const max_signature_batch_size = 64;
-    pub const max_num_allowed_parallel_tasks = 256;
+    pub const max_num_allowed_parallel_tasks = 128;
 
     pub const flush_delay_min: i64 = 100 * time.ns_per_ms;
     pub const flush_delay_max: i64 = 500 * time.ns_per_ms;
@@ -2902,47 +2955,184 @@ pub const Sampler = struct {
 const sqlite = @import("zig-sqlite/sqlite.zig");
 const fs = std.fs;
 
-pub const Store = struct {
-    const log = std.log.scoped(.sqlite);
+pub const NullStore = struct {
+    const PooledConnection = struct {};
 
-    pool: std.fifo.LinearFifo(sqlite.Db, .Dynamic),
     maybe_path: ?[]const u8,
 
-    pub fn init(gpa: *mem.Allocator, maybe_path: ?[]const u8) !Store {
-        var conn = try createConnection(maybe_path);
-        errdefer conn.deinit();
-
-        var error_message: [*c]u8 = null;
-        defer if (error_message) |error_message_ptr| {
-            log.warn("failed to init schema: {s}", .{error_message_ptr});
-            sqlite.c.sqlite3_free(error_message_ptr);
-        };
-
-        if (sqlite.c.sqlite3_exec(conn.db, @embedFile("schema.sql"), null, null, &error_message) != sqlite.c.SQLITE_OK) {
-            return error.SQLiteError;
-        }
-
-        var pool = std.fifo.LinearFifo(sqlite.Db, .Dynamic).init(gpa);
-        errdefer pool.deinit();
-
-        try pool.writeItem(conn);
-
-        return Store{ .pool = pool, .maybe_path = maybe_path };
+    pub fn init(gpa: *mem.Allocator, maybe_path: ?[]const u8) !NullStore {
+        _ = gpa;
+        _ = maybe_path;
+        return NullStore{ .maybe_path = maybe_path };
     }
 
-    pub fn deinit(self: *Store) void {
-        while (self.pool.readItem()) |conn_const| {
-            var conn = conn_const;
-            conn.deinit();
+    pub fn deinit(self: *NullStore) void {
+        _ = self;
+    }
+
+    pub fn acquireConnection(self: *NullStore) !PooledConnection {
+        _ = self;
+        return PooledConnection{};
+    }
+
+    pub fn releaseConnection(self: *NullStore, pooled: *PooledConnection) void {
+        _ = self;
+        _ = pooled;
+    }
+
+    pub fn queryJson(self: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, raw_query: []const u8) ![]const u8 {
+        _ = self;
+        _ = gpa;
+        _ = pooled;
+        _ = raw_query;
+        return try gpa.dupe(u8, "{\"results\": [], \"count\": 0}");
+    }
+
+    pub fn storeBlock(self: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, block: *Block, transactions: []const *Transaction) !void {
+        _ = self;
+        _ = gpa;
+        _ = pooled;
+        _ = block;
+        _ = transactions;
+    }
+
+    pub fn isTransactionFinalized(self: *NullStore, pooled: *PooledConnection, id: [32]u8) bool {
+        _ = self;
+        _ = pooled;
+        _ = id;
+        return false;
+    }
+
+    pub fn getBlockSummaries(self: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const Block.Summary {
+        _ = self;
+        _ = gpa;
+        _ = pooled;
+        _ = offset;
+        _ = limit;
+        return try gpa.alloc(Block.Summary, 0);
+    }
+
+    pub fn getBlocks(_: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const *Block {
+        _ = gpa;
+        _ = pooled;
+        _ = offset;
+        _ = limit;
+        return try gpa.alloc(*Block, 0);
+    }
+
+    pub fn getTransactions(_: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const *Transaction {
+        _ = gpa;
+        _ = pooled;
+        _ = offset;
+        _ = limit;
+        return try gpa.alloc(*Transaction, 0);
+    }
+
+    pub fn getTransactionsByBlockHeight(_: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, block_height: u64, offset: usize, limit: usize) ![]const *Transaction {
+        _ = gpa;
+        _ = pooled;
+        _ = block_height;
+        _ = offset;
+        _ = limit;
+        return try gpa.alloc(*Transaction, 0);
+    }
+
+    pub fn getBlockById(_: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, block_id: [32]u8) !?*Block {
+        _ = gpa;
+        _ = pooled;
+        _ = block_id;
+        return null;
+    }
+
+    pub fn getBlockByHeight(_: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, height: u64) !?*Block {
+        _ = gpa;
+        _ = pooled;
+        _ = height;
+        return null;
+    }
+
+    pub fn getTransactionById(_: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, id: [32]u8) !?*Transaction {
+        _ = gpa;
+        _ = pooled;
+        _ = id;
+        return null;
+    }
+};
+
+pub const SqliteStore = struct {
+    const store_block_query = "insert into blocks(id, height, merkle_root, num_transaction_ids) values (?{[]const u8}, ?{u64}, ?{[]const u8}, ?{u16})";
+    const store_transaction_query = "insert into transactions(id, block_height, sender, signature, sender_nonce, created_at, tag, data) values (?{[]const u8}, ?{u64}, ?{[]const u8}, ?{[]const u8}, ?{u64}, ?{u64}, ?{[]const u8}, ?{[]const u8})";
+    const is_transaction_finalized_query = "select 1 from transactions where id = ?{[]const u8}";
+    const get_blocks_query = "select id, height, merkle_root from blocks order by height desc limit ?{usize} offset ?{usize}";
+    const get_block_summaries_query = "select id, height, merkle_root, num_transaction_ids from blocks order by height desc limit ?{usize} offset ?{usize}";
+    const get_block_by_id_query = "select height, merkle_root from blocks where id = ?{[]const u8}";
+    const get_block_by_height_query = "select id, merkle_root from blocks where height = ?{u64}";
+    const get_transactions_query = "select id, sender, signature, sender_nonce, created_at, tag, data from transactions order by block_height desc limit ?{usize} offset ?{usize}";
+    const get_transaction_by_id_query = "select id, sender, signature, sender_nonce, created_at, tag, data from transactions where id = ?";
+    const get_transaction_ids_by_block_height_query = "select id from transactions where block_height = ?{u64}";
+    const get_transactions_by_block_height_query = "select id, sender, signature, sender_nonce, created_at, tag, data from transactions where block_height = ?{u64} limit ?{usize} offset ?{usize}";
+
+    pub const PooledConnection = struct {
+        conn: sqlite.Db,
+
+        store_block: sqlite.Statement(.{}, sqlite.ParsedQuery.from(store_block_query)),
+        store_transaction: sqlite.Statement(.{}, sqlite.ParsedQuery.from(store_transaction_query)),
+        is_transaction_finalized: sqlite.Statement(.{}, sqlite.ParsedQuery.from(is_transaction_finalized_query)),
+        get_blocks: sqlite.Statement(.{}, sqlite.ParsedQuery.from(get_blocks_query)),
+        get_block_summaries: sqlite.Statement(.{}, sqlite.ParsedQuery.from(get_block_summaries_query)),
+        get_block_by_id: sqlite.Statement(.{}, sqlite.ParsedQuery.from(get_block_by_id_query)),
+        get_block_by_height: sqlite.Statement(.{}, sqlite.ParsedQuery.from(get_block_by_height_query)),
+        get_transactions: sqlite.Statement(.{}, sqlite.ParsedQuery.from(get_transactions_query)),
+        get_transaction_by_id: sqlite.Statement(.{}, sqlite.ParsedQuery.from(get_transaction_by_id_query)),
+        get_transaction_ids_by_block_height: sqlite.Statement(.{}, sqlite.ParsedQuery.from(get_transaction_ids_by_block_height_query)),
+        get_transactions_by_block_height: sqlite.Statement(.{}, sqlite.ParsedQuery.from(get_transactions_by_block_height_query)),
+
+        pub fn deinit(self: *PooledConnection) void {
+            self.store_block.deinit();
+            self.store_transaction.deinit();
+            self.is_transaction_finalized.deinit();
+            self.get_blocks.deinit();
+            self.get_block_summaries.deinit();
+            self.get_block_by_id.deinit();
+            self.get_block_by_height.deinit();
+            self.get_transactions.deinit();
+            self.get_transaction_by_id.deinit();
+            self.get_transaction_ids_by_block_height.deinit();
+            self.get_transactions_by_block_height.deinit();
+            self.conn.deinit();
+        }
+    };
+
+    const log = std.log.scoped(.sqlite);
+
+    pool: std.fifo.LinearFifo(PooledConnection, .Dynamic),
+    maybe_path: ?[]const u8,
+
+    pub fn init(gpa: *mem.Allocator, maybe_path: ?[]const u8) !SqliteStore {
+        var pooled = try createConnection(maybe_path);
+        errdefer pooled.deinit();
+
+        var pool = std.fifo.LinearFifo(PooledConnection, .Dynamic).init(gpa);
+        errdefer pool.deinit();
+
+        try pool.writeItem(pooled);
+
+        return SqliteStore{ .pool = pool, .maybe_path = maybe_path };
+    }
+
+    pub fn deinit(self: *SqliteStore) void {
+        while (self.pool.readItem()) |pooled_const| {
+            var pooled = pooled_const;
+            pooled.deinit();
         }
         self.pool.deinit();
     }
 
-    fn createConnection(maybe_path: ?[]const u8) !sqlite.Db {
+    fn createConnection(maybe_path: ?[]const u8) !PooledConnection {
         var diags: sqlite.Diagnostics = .{};
         errdefer |err| log.warn("failed to create sqlite connection to '{s}' ({}): {}", .{ maybe_path, err, diags });
 
-        var db: sqlite.Db = db: {
+        var conn: sqlite.Db = db: {
             const path = maybe_path orelse {
                 break :db try sqlite.Db.init(.{
                     .mode = .{ .File = "file:rheia?mode=memory&cache=shared" },
@@ -2965,7 +3155,17 @@ pub const Store = struct {
                 .diags = &diags,
             });
         };
-        errdefer db.deinit();
+        errdefer conn.deinit();
+
+        var error_message: [*c]u8 = null;
+        defer if (error_message) |error_message_ptr| {
+            log.warn("failed to init schema: {s}", .{error_message_ptr});
+            sqlite.c.sqlite3_free(error_message_ptr);
+        };
+
+        if (sqlite.c.sqlite3_exec(conn.db, @embedFile("schema.sql"), null, null, &error_message) != sqlite.c.SQLITE_OK) {
+            return error.SQLiteError;
+        }
 
         const Authorizer = struct {
             pub fn check(user_data: ?*c_void, action_code: c_int, param_1: ?[*:0]const u8, param_2: ?[*:0]const u8, param_3: ?[*:0]const u8, param_4: ?[*:0]const u8) callconv(.C) c_int {
@@ -2991,31 +3191,70 @@ pub const Store = struct {
             }
         };
 
-        if (sqlite.c.sqlite3_set_authorizer(db.db, Authorizer.check, null) != sqlite.c.SQLITE_OK) {
+        if (sqlite.c.sqlite3_set_authorizer(conn.db, Authorizer.check, null) != sqlite.c.SQLITE_OK) {
             return error.AuthorizerNotInitialized;
         }
 
-        _ = try db.pragma(void, .{}, "journal_mode", "WAL");
-        _ = try db.pragma(void, .{}, "read_uncommitted", "true");
-        _ = try db.pragma(void, .{}, "synchronous", "normal");
-        _ = try db.pragma(void, .{}, "temp_store", "memory");
+        _ = try conn.pragma(void, .{}, "page_size", "32768");
+        _ = try conn.pragma(void, .{}, "journal_mode", "WAL");
+        _ = try conn.pragma(void, .{}, "read_uncommitted", "true");
+        _ = try conn.pragma(void, .{}, "synchronous", "off");
+        _ = try conn.pragma(void, .{}, "temp_store", "memory");
+        _ = try conn.pragma(void, .{}, "mmap_size", "30000000000");
 
-        return db;
+        var pooled: PooledConnection = undefined;
+
+        pooled.conn = conn;
+
+        pooled.store_block = try pooled.conn.prepareWithDiags(store_block_query, .{ .diags = &diags });
+        errdefer pooled.store_block.deinit();
+
+        pooled.store_transaction = try pooled.conn.prepareWithDiags(store_transaction_query, .{ .diags = &diags });
+        errdefer pooled.store_transaction.deinit();
+
+        pooled.is_transaction_finalized = try pooled.conn.prepareWithDiags(is_transaction_finalized_query, .{ .diags = &diags });
+        errdefer pooled.is_transaction_finalized.deinit();
+
+        pooled.get_blocks = try pooled.conn.prepareWithDiags(get_blocks_query, .{ .diags = &diags });
+        errdefer pooled.get_blocks.deinit();
+
+        pooled.get_block_summaries = try pooled.conn.prepareWithDiags(get_block_summaries_query, .{ .diags = &diags });
+        errdefer pooled.get_block_summaries.deinit();
+
+        pooled.get_block_by_id = try pooled.conn.prepareWithDiags(get_block_by_id_query, .{ .diags = &diags });
+        errdefer pooled.get_block_by_id.deinit();
+
+        pooled.get_block_by_height = try pooled.conn.prepareWithDiags(get_block_by_height_query, .{ .diags = &diags });
+        errdefer pooled.get_block_by_height.deinit();
+
+        pooled.get_transactions = try pooled.conn.prepareWithDiags(get_transactions_query, .{ .diags = &diags });
+        errdefer pooled.get_transactions.deinit();
+
+        pooled.get_transaction_by_id = try pooled.conn.prepareWithDiags(get_transaction_by_id_query, .{ .diags = &diags });
+        errdefer pooled.get_transaction_by_id.deinit();
+
+        pooled.get_transaction_ids_by_block_height = try pooled.conn.prepareWithDiags(get_transaction_ids_by_block_height_query, .{ .diags = &diags });
+        errdefer pooled.get_transaction_ids_by_block_height.deinit();
+
+        pooled.get_transactions_by_block_height = try pooled.conn.prepareWithDiags(get_transactions_by_block_height_query, .{ .diags = &diags });
+        errdefer pooled.get_transactions_by_block_height.deinit();
+
+        return pooled;
     }
 
-    pub fn acquireConnection(self: *Store) !sqlite.Db {
+    pub fn acquireConnection(self: *SqliteStore) !PooledConnection {
         if (self.pool.readItem()) |conn| {
             return conn;
         }
         return try createConnection(self.maybe_path);
     }
 
-    pub fn releaseConnection(self: *Store, conn: *sqlite.Db) void {
+    pub fn releaseConnection(self: *SqliteStore, pooled: *PooledConnection) void {
         // Silently fail.
-        self.pool.writeItem(conn.*) catch conn.deinit();
+        self.pool.writeItem(pooled.*) catch pooled.deinit();
     }
 
-    fn execute(gpa: *mem.Allocator, conn: *sqlite.Db, raw_query: []const u8) !void {
+    fn execute(gpa: *mem.Allocator, pooled: *PooledConnection, raw_query: []const u8) !void {
         var error_message: [*c]u8 = null;
         defer if (error_message) |error_message_ptr| {
             log.warn("error while executing query: {s}", .{error_message_ptr});
@@ -3025,12 +3264,12 @@ pub const Store = struct {
         const query = try std.cstr.addNullByte(gpa, raw_query);
         defer gpa.free(query);
 
-        if (sqlite.c.sqlite3_exec(conn.db, query.ptr, null, null, &error_message) != sqlite.c.SQLITE_OK) {
+        if (sqlite.c.sqlite3_exec(pooled.conn.db, query.ptr, null, null, &error_message) != sqlite.c.SQLITE_OK) {
             return error.SQLiteError;
         }
     }
 
-    pub fn queryJson(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, raw_query: []const u8) ![]const u8 {
+    pub fn queryJson(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, raw_query: []const u8) ![]const u8 {
         var diags: sqlite.Diagnostics = .{};
         errdefer |err| log.warn("error while querying json ({}): {}", .{ diags, err });
 
@@ -3041,7 +3280,7 @@ pub const Store = struct {
 
         var stmt: ?*sqlite.c.sqlite3_stmt = undefined;
         var result = sqlite.c.sqlite3_prepare_v3(
-            conn.db,
+            pooled.conn.db,
             raw_query.ptr,
             @intCast(c_int, raw_query.len),
             0,
@@ -3049,7 +3288,7 @@ pub const Store = struct {
             null,
         );
         if (result != sqlite.c.SQLITE_OK) {
-            diags.err = conn.getDetailedError();
+            diags.err = pooled.conn.getDetailedError();
             return sqlite.errorFromResultCode(result);
         }
         defer _ = sqlite.c.sqlite3_finalize(stmt);
@@ -3071,7 +3310,7 @@ pub const Store = struct {
                 sqlite.c.SQLITE_DONE => break,
                 sqlite.c.SQLITE_ROW => {},
                 else => {
-                    diags.err = conn.getDetailedError();
+                    diags.err = pooled.conn.getDetailedError();
                     return sqlite.errorFromResultCode(result);
                 },
             }
@@ -3124,14 +3363,16 @@ pub const Store = struct {
         return buffer.toOwnedSlice();
     }
 
-    pub fn storeBlock(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, block: *Block, transactions: []const *Transaction) !void {
+    pub fn storeBlock(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, block: *Block, transactions: []const *Transaction) !void {
         var diags: sqlite.Diagnostics = .{};
         errdefer |err| log.warn("error while saving block ({}): {}", .{ diags, err });
 
-        try conn.exec("begin", .{ .diags = &diags }, .{});
-        errdefer conn.exec("rollback", .{ .diags = &diags }, .{}) catch {};
+        try pooled.conn.exec("begin", .{ .diags = &diags }, .{});
+        errdefer pooled.conn.exec("rollback", .{ .diags = &diags }, .{}) catch {};
 
-        try conn.exec("insert into blocks(id, height, merkle_root, num_transaction_ids) values (?{[]const u8}, ?{u64}, ?{[]const u8}, ?{u16})", .{ .diags = &diags }, .{
+        pooled.store_block.reset();
+
+        try pooled.store_block.exec(.{ .diags = &diags }, .{
             .id = @as([]const u8, &block.id),
             .height = block.height,
             .merkle_root = @as([]const u8, &block.merkle_root),
@@ -3139,8 +3380,9 @@ pub const Store = struct {
         });
 
         for (transactions) |tx| {
-            try conn.exec(
-                "insert into transactions(id, block_height, sender, signature, sender_nonce, created_at, tag, data) values (?{[]const u8}, ?{u64}, ?{[]const u8}, ?{[]const u8}, ?{u64}, ?{u64}, ?{[]const u8}, ?{[]const u8})",
+            pooled.store_transaction.reset();
+
+            try pooled.store_transaction.exec(
                 .{ .diags = &diags },
                 .{
                     .id = @as([]const u8, &tx.id),
@@ -3154,40 +3396,40 @@ pub const Store = struct {
                 },
             );
 
-            if (tx.tag == .stmt) {
-                execute(gpa, conn, tx.data[0..tx.data_len]) catch {};
+            switch (tx.tag) {
+                .no_op => {},
+                .stmt => execute(gpa, pooled, tx.data[0..tx.data_len]) catch {},
             }
         }
 
-        try conn.exec("commit", .{ .diags = &diags }, .{});
+        try pooled.conn.exec("commit", .{ .diags = &diags }, .{});
     }
 
-    pub fn isTransactionFinalized(_: *Store, conn: *sqlite.Db, id: [32]u8) bool {
+    pub fn isTransactionFinalized(_: *SqliteStore, pooled: *PooledConnection, id: [32]u8) bool {
         var diags: sqlite.Diagnostics = .{};
         errdefer log.warn("error while checking if transaction is finalized: {}", .{diags});
 
-        const result = conn.one(usize, "select 1 from transactions where id = ?{[]const u8}", .{ .diags = &diags }, .{ .id = @as([]const u8, &id) }) catch return false;
+        pooled.is_transaction_finalized.reset();
+
+        const result = pooled.is_transaction_finalized.one(usize, .{ .diags = &diags }, .{ .id = @as([]const u8, &id) }) catch return false;
         return result != null;
     }
 
-    fn getTransactionIdsByBlockHeight(gpa: *mem.Allocator, conn: *sqlite.Db, block_height: u64) ![]const [32]u8 {
-        var stmt = try conn.prepare("select id from transactions where block_height = ?{u64}");
-        defer stmt.deinit();
-
-        return try stmt.all([32]u8, gpa, .{}, .{ .block_height = block_height });
+    fn getTransactionIdsByBlockHeight(gpa: *mem.Allocator, pooled: *PooledConnection, block_height: u64) ![]const [32]u8 {
+        pooled.get_transaction_by_id.reset();
+        return try pooled.get_transaction_ids_by_block_height.all([32]u8, gpa, .{}, .{ .block_height = block_height });
     }
 
-    pub fn getBlockSummaries(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, offset: usize, limit: usize) ![]const Block.Summary {
+    pub fn getBlockSummaries(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const Block.Summary {
         var blocks: std.ArrayListUnmanaged(Block.Summary) = .{};
         defer blocks.deinit(gpa);
 
         var diags: sqlite.Diagnostics = .{};
         errdefer |err| log.warn("error while fetching block summaries ({}): {}", .{ diags, err });
 
-        var stmt = try conn.prepareWithDiags("select id, height, merkle_root, num_transaction_ids from blocks order by height desc limit ?{usize} offset ?{usize}", .{ .diags = &diags });
-        defer stmt.deinit();
+        pooled.get_block_summaries.reset();
 
-        var it = try stmt.iterator(Block.Summary, .{ limit, offset });
+        var it = try pooled.get_block_summaries.iterator(Block.Summary, .{ limit, offset });
         while (try it.next(.{ .diags = &diags })) |summary| {
             try blocks.append(gpa, summary);
         }
@@ -3195,7 +3437,7 @@ pub const Store = struct {
         return blocks.toOwnedSlice(gpa);
     }
 
-    pub fn getBlocks(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, offset: usize, limit: usize) ![]const *Block {
+    pub fn getBlocks(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const *Block {
         var blocks: std.ArrayListUnmanaged(*Block) = .{};
         defer {
             for (blocks.items) |block| {
@@ -3207,12 +3449,11 @@ pub const Store = struct {
         var diags: sqlite.Diagnostics = .{};
         errdefer |err| log.warn("error while fetching blocks ({}): {}", .{ diags, err });
 
-        var stmt = try conn.prepareWithDiags("select id, height, merkle_root from blocks order by height desc limit ?{usize} offset ?{usize}", .{ .diags = &diags });
-        defer stmt.deinit();
+        pooled.get_blocks.reset();
 
-        var it = try stmt.iterator(struct { id: [32]u8, height: u64, merkle_root: [32]u8 }, .{ limit, offset });
+        var it = try pooled.get_blocks.iterator(struct { id: [32]u8, height: u64, merkle_root: [32]u8 }, .{ limit, offset });
         while (try it.next(.{ .diags = &diags })) |header| {
-            const transaction_ids = try getTransactionIdsByBlockHeight(gpa, conn, header.height);
+            const transaction_ids = try getTransactionIdsByBlockHeight(gpa, pooled, header.height);
             defer gpa.free(transaction_ids);
 
             const block = try Block.from(gpa, .{
@@ -3229,7 +3470,7 @@ pub const Store = struct {
         return blocks.toOwnedSlice(gpa);
     }
 
-    pub fn getTransactions(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, offset: usize, limit: usize) ![]const *Transaction {
+    pub fn getTransactions(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const *Transaction {
         var transactions: std.ArrayListUnmanaged(*Transaction) = .{};
         defer {
             for (transactions.items) |tx| {
@@ -3241,10 +3482,9 @@ pub const Store = struct {
         var diags: sqlite.Diagnostics = .{};
         errdefer |err| log.warn("error while fetching transactions ({}): {}", .{ diags, err });
 
-        var stmt = try conn.prepareWithDiags("select id, sender, signature, sender_nonce, created_at, tag, data from transactions order by block_height desc limit ?{usize} offset ?{usize}", .{ .diags = &diags });
-        defer stmt.deinit();
+        pooled.get_transactions.reset();
 
-        var it = try stmt.iterator(Transaction.Data, .{ limit, offset });
+        var it = try pooled.get_transactions.iterator(Transaction.Data, .{ limit, offset });
         while (try it.nextAlloc(gpa, .{ .diags = &diags })) |format| {
             defer gpa.free(format.data);
 
@@ -3257,7 +3497,7 @@ pub const Store = struct {
         return transactions.toOwnedSlice(gpa);
     }
 
-    pub fn getTransactionsByBlockHeight(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, block_height: u64, offset: usize, limit: usize) ![]const *Transaction {
+    pub fn getTransactionsByBlockHeight(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, block_height: u64, offset: usize, limit: usize) ![]const *Transaction {
         var transactions: std.ArrayListUnmanaged(*Transaction) = .{};
         defer {
             for (transactions.items) |tx| {
@@ -3269,10 +3509,9 @@ pub const Store = struct {
         var diags: sqlite.Diagnostics = .{};
         errdefer |err| log.warn("error while fetching transactions ({}): {}", .{ diags, err });
 
-        var stmt = try conn.prepareWithDiags("select id, sender, signature, sender_nonce, created_at, tag, data from transactions where block_height = ?{u64} limit ?{usize} offset ?{usize}", .{ .diags = &diags });
-        defer stmt.deinit();
+        pooled.get_transactions_by_block_height.reset();
 
-        var it = try stmt.iterator(Transaction.Data, .{ block_height, limit, offset });
+        var it = try pooled.get_transactions_by_block_height.iterator(Transaction.Data, .{ block_height, limit, offset });
         while (try it.nextAlloc(gpa, .{ .diags = &diags })) |format| {
             defer gpa.free(format.data);
 
@@ -3285,16 +3524,18 @@ pub const Store = struct {
         return transactions.toOwnedSlice(gpa);
     }
 
-    pub fn getBlockById(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, block_id: [32]u8) !?*Block {
+    pub fn getBlockById(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, block_id: [32]u8) !?*Block {
         var diags: sqlite.Diagnostics = .{};
         errdefer |err| log.warn("error while fetching block by id ({}): {}", .{ diags, err });
 
-        const header = (try conn.one(struct {
+        pooled.get_block_by_id.reset();
+
+        const header = (try pooled.get_block_by_id.one(struct {
             height: u64,
             merkle_root: [32]u8,
-        }, "select height, merkle_root from blocks where id = ?{[]const u8}", .{ .diags = &diags }, .{ .id = @as([]const u8, &block_id) })) orelse return null;
+        }, .{ .diags = &diags }, .{ .id = @as([]const u8, &block_id) })) orelse return null;
 
-        const transaction_ids = try getTransactionIdsByBlockHeight(gpa, conn, header.height);
+        const transaction_ids = try getTransactionIdsByBlockHeight(gpa, pooled, header.height);
         defer gpa.free(transaction_ids);
 
         return try Block.from(gpa, .{
@@ -3305,16 +3546,18 @@ pub const Store = struct {
         });
     }
 
-    pub fn getBlockByHeight(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, height: u64) !?*Block {
+    pub fn getBlockByHeight(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, height: u64) !?*Block {
         var diags: sqlite.Diagnostics = .{};
         errdefer |err| log.warn("error while fetching block by height ({}): {}", .{ diags, err });
 
-        const header = (try conn.one(struct {
+        pooled.get_block_by_height.reset();
+
+        const header = (try pooled.get_block_by_height.one(struct {
             id: [32]u8,
             merkle_root: [32]u8,
-        }, "select id, merkle_root from blocks where height = ?{u64}", .{ .diags = &diags }, .{ .height = height })) orelse return null;
+        }, .{ .diags = &diags }, .{ .height = height })) orelse return null;
 
-        const transaction_ids = try getTransactionIdsByBlockHeight(gpa, conn, height);
+        const transaction_ids = try getTransactionIdsByBlockHeight(gpa, pooled, height);
         defer gpa.free(transaction_ids);
 
         return try Block.from(gpa, .{
@@ -3325,11 +3568,13 @@ pub const Store = struct {
         });
     }
 
-    pub fn getTransactionById(_: *Store, gpa: *mem.Allocator, conn: *sqlite.Db, id: [32]u8) !?*Transaction {
+    pub fn getTransactionById(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, id: [32]u8) !?*Transaction {
         var diags: sqlite.Diagnostics = .{};
         errdefer |err| log.warn("error while fetching transaction by id ({}): {}", .{ diags, err });
 
-        const format = (try conn.oneAlloc(Transaction.Data, gpa, "select id, sender, signature, sender_nonce, created_at, tag, data from transactions where id = ?", .{ .diags = &diags }, .{ .id = @as([]const u8, &id) })) orelse return null;
+        pooled.get_transaction_by_id.reset();
+
+        const format = (try pooled.get_transaction_by_id.oneAlloc(Transaction.Data, gpa, .{ .diags = &diags }, .{ .id = @as([]const u8, &id) })) orelse return null;
         defer gpa.free(format.data);
 
         return try Transaction.from(gpa, format);
