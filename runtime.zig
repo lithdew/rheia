@@ -12,6 +12,7 @@ const Socket = std.x.os.Socket;
 const Atomic = std.atomic.Atomic;
 
 const Pool = @import("Pool.zig");
+const SinglyLinkedDeque = @import("intrusive.zig").SinglyLinkedDeque;
 const DoublyLinkedDeque = @import("intrusive.zig").DoublyLinkedDeque;
 
 const panic = std.debug.panic;
@@ -81,7 +82,7 @@ pub fn accept(
     return instance.accept(ctx, socket, flags);
 }
 
-pub fn timeout(ctx: *Context, params: Timeout) !void {
+pub fn timeout(ctx: *Context, params: TimeoutParams) !void {
     return instance.timeout(ctx, params);
 }
 
@@ -112,7 +113,7 @@ pub fn getAllocator() *mem.Allocator {
     return instance.gpa;
 }
 
-pub const Timeout = struct {
+pub const TimeoutParams = struct {
     seconds: i64 = 0,
     nanoseconds: i64 = 0,
     mode: enum(u32) {
@@ -131,12 +132,41 @@ pub const Task = struct {
 };
 
 pub const Context = struct {
+    pub const Timeout = struct {
+        ctx: Context,
+        parent: *Context,
+        state: Context.Callback,
+        frame: @Frame(Context.Timeout.wait),
+
+        pub fn init(self: *Context.Timeout, parent: *Context, params: TimeoutParams) void {
+            self.ctx = .{};
+            self.parent = parent;
+            self.state = .{ .run = Context.Timeout.cancel };
+            self.frame = async self.wait(params);
+        }
+
+        pub fn deinit(self: *Context.Timeout) void {
+            self.ctx.cancel();
+            await self.frame catch {};
+        }
+
+        fn wait(self: *Context.Timeout, params: TimeoutParams) !void {
+            try runtime.timeout(&self.ctx, params);
+            self.parent.cancel();
+        }
+
+        fn cancel(state: *Context.Callback) void {
+            const callback = @fieldParentPtr(Context.Timeout, "state", state);
+            callback.ctx.cancel();
+        }
+    };
+
     pub const Callback = struct {
         pub const Deque = DoublyLinkedDeque(Context.Callback, .next, .prev);
 
         next: ?*Context.Callback = null,
         prev: ?*Context.Callback = null,
-        run: fn (*Context.Callback) callconv(.Async) void,
+        run: fn (*Context.Callback) void,
     };
 
     callbacks: Context.Callback.Deque = .{},
@@ -144,8 +174,7 @@ pub const Context = struct {
 
     pub fn register(self: *Context, callback: *Context.Callback) !void {
         if (self.cancelled) {
-            var frame: [1024]u8 align(@alignOf(anyframe)) = undefined;
-            await @asyncCall(&frame, {}, callback.run, .{callback});
+            callback.run(callback);
             return error.Cancelled;
         }
         self.callbacks.append(callback);
@@ -159,8 +188,7 @@ pub const Context = struct {
         self.cancelled = true;
 
         while (self.callbacks.popFirst()) |callback| {
-            var stack: [1024]u8 align(@alignOf(anyframe)) = undefined;
-            await @asyncCall(&stack, {}, callback.run, .{callback});
+            callback.run(callback);
         }
     }
 };
@@ -198,7 +226,10 @@ pub const Stream = struct {
 
 pub const Runtime = struct {
     pub const Syscall = struct {
+        pub const List = SinglyLinkedDeque(Syscall, .next);
+
         task: Task,
+        next: ?*Syscall = null,
         result: ?isize = null,
     };
 
@@ -216,7 +247,10 @@ pub const Runtime = struct {
     ring: os.linux.IO_Uring,
 
     closing: bool,
+
     pending_tasks: Task.Deque,
+    pending_cancellations: Syscall.List,
+
     incoming_tasks: Task.Stack,
     outgoing_tasks: Pool.Batch,
 
@@ -246,7 +280,10 @@ pub const Runtime = struct {
         errdefer self.ring.deinit();
 
         self.closing = false;
+
         self.pending_tasks = .{};
+        self.pending_cancellations = .{};
+
         self.incoming_tasks = .{};
         self.outgoing_tasks = .{};
     }
@@ -331,6 +368,14 @@ pub const Runtime = struct {
             while (self.incoming_tasks.pop()) |task| {
                 self.pending_tasks.append(task);
             }
+
+            var pending_cancellations: Syscall.List = .{};
+            while (self.pending_cancellations.popFirst()) |syscall| {
+                _ = ring_cancel(&self.ring, 0, @ptrToInt(syscall), 0) catch {
+                    pending_cancellations.append(syscall);
+                };
+            }
+            self.pending_cancellations = pending_cancellations;
 
             var tasks_resumed: usize = 0;
             while (self.pending_tasks.popFirst()) |task| : (tasks_resumed += 1) {
@@ -754,7 +799,7 @@ pub const Runtime = struct {
         }
     }
 
-    pub fn timeout(self: *Runtime, ctx: *Context, params: Timeout) !void {
+    pub fn timeout(self: *Runtime, ctx: *Context, params: TimeoutParams) !void {
         var syscall: Syscall = .{ .task = .{ .frame = @frame() } };
 
         var callback: struct {
@@ -811,37 +856,8 @@ pub const Runtime = struct {
         }
     }
 
-    pub fn cancel(self: *Runtime, target_syscall: *const Syscall) void {
-        var syscall: Syscall = .{ .task = .{ .frame = @frame() } };
-
-        while (true) {
-            var maybe_err: ?anyerror = null;
-
-            suspend {
-                maybe_err = maybe_err: {
-                    _ = ring_cancel(&self.ring, @ptrToInt(&syscall), @ptrToInt(target_syscall), 0) catch |err| {
-                        self.pending_tasks.append(&syscall.task);
-                        switch (err) {
-                            error.SubmissionQueueFull => {},
-                            else => break :maybe_err err,
-                        }
-                    };
-                    break :maybe_err null;
-                };
-            }
-
-            if (maybe_err) |err| panic("{}", .{err});
-
-            const result = syscall.result orelse continue;
-            if (result < 0) {
-                return switch (@intToEnum(os.E, -result)) {
-                    .NOENT => {},
-                    .ALREADY => {},
-                    else => |err| panic("{}", .{os.unexpectedErrno(err)}),
-                };
-            }
-            return;
-        }
+    fn cancel(self: *Runtime, target_syscall: *Syscall) void {
+        self.pending_cancellations.append(target_syscall);
     }
 };
 

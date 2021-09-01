@@ -158,6 +158,21 @@ pub const Packet = struct {
 };
 
 pub const RPC = struct {
+    pub const CancellationCallback = struct {
+        state: Context.Callback = .{ .run = @This().run },
+        rpc: *RPC,
+        nonce: u32,
+
+        pub fn from(rpc: *RPC, nonce: u32) CancellationCallback {
+            return CancellationCallback{ .rpc = rpc, .nonce = nonce };
+        }
+
+        pub fn run(state: *Context.Callback) void {
+            const callback = @fieldParentPtr(@This(), "state", state);
+            callback.rpc.pending.entries[callback.nonce & (callback.rpc.pending.entries.len - 1)] = null;
+        }
+    };
+
     pub const Response = struct {
         header: Packet,
         body: []const u8,
@@ -194,20 +209,6 @@ pub const RPC = struct {
         };
 
         self.pending.push(entry);
-
-        var callback: struct {
-            state: Context.Callback = .{ .run = @This().run },
-            self: *RPC,
-            nonce: u32,
-
-            pub fn run(state: *Context.Callback) void {
-                const callback = @fieldParentPtr(@This(), "state", state);
-                callback.self.pending.entries[callback.nonce & (callback.self.pending.entries.len - 1)] = null;
-            }
-        } = .{ .self = self, .nonce = nonce };
-
-        try ctx.register(&callback.state);
-        defer ctx.deregister(&callback.state);
 
         entry.response = async entry.parker.park(ctx);
 

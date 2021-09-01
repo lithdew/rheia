@@ -112,7 +112,7 @@ pub fn DoublyLinkedDeque(comptime T: type, comptime next_field: anytype, comptim
                 return false;
             }
 
-            if (self.head != value and @field(value, next) == null and @field(value, prev) == null) {
+            if (@field(value, next) == null and @field(value, prev) == null and self.head != value) {
                 return false;
             }
 

@@ -128,9 +128,9 @@ pub fn Parker(comptime T: type) type {
                     if (callback.self.waiters.remove(callback.waiter)) {
                         if (builtin.is_test) {
                             resume callback.waiter.frame;
-                            return;
+                        } else {
+                            runtime.schedule(callback.waiter);
                         }
-                        runtime.schedule(callback.waiter);
                     }
                 }
             } = .{ .self = self, .waiter = &waiter.task };
@@ -158,9 +158,9 @@ pub fn Parker(comptime T: type) type {
             waiter.result = result;
             if (builtin.is_test) {
                 resume task.frame;
-                return;
+            } else {
+                runtime.schedule(task);
             }
-            runtime.schedule(task);
         }
 
         pub fn broadcast(self: *Self, result: ?T) void {
@@ -169,9 +169,9 @@ pub fn Parker(comptime T: type) type {
                 waiter.result = result;
                 if (builtin.is_test) {
                     resume task.frame;
-                    continue;
+                } else {
+                    runtime.schedule(task);
                 }
-                runtime.schedule(task);
             }
         }
     };
@@ -194,9 +194,9 @@ pub const Mutex = struct {
                 if (callback.self.waiters.remove(callback.waiter)) {
                     if (builtin.is_test) {
                         resume callback.waiter.frame;
-                        return;
+                    } else {
+                        runtime.schedule(callback.waiter);
                     }
-                    runtime.schedule(callback.waiter);
                 }
             }
         } = .{ .self = self, .waiter = &waiter };
@@ -224,9 +224,9 @@ pub const Mutex = struct {
 
         if (builtin.is_test) {
             resume waiter.frame;
-            return;
+        } else {
+            runtime.schedule(waiter);
         }
-        runtime.schedule(waiter);
     }
 };
 
@@ -247,9 +247,9 @@ pub const WaitGroup = struct {
                 if (callback.self.waiters.remove(callback.waiter)) {
                     if (builtin.is_test) {
                         resume callback.waiter.frame;
-                        return;
+                    } else {
+                        runtime.schedule(callback.waiter);
                     }
-                    runtime.schedule(callback.waiter);
                 }
             }
         } = .{ .self = self, .waiter = &waiter };
@@ -273,9 +273,9 @@ pub const WaitGroup = struct {
         while (self.waiters.popFirst()) |waiter| {
             if (builtin.is_test) {
                 resume waiter.frame;
-                continue;
+            } else {
+                runtime.schedule(waiter);
             }
-            runtime.schedule(waiter);
         }
     }
 };

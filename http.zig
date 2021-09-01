@@ -35,9 +35,6 @@ pub fn Listener(comptime Handler: type) type {
         }
 
         pub fn runReadLoop(self: *Self, ctx: *Context, gpa: *mem.Allocator, conn: *net.Listener(Self).Connection) !void {
-            var stream: runtime.Stream = .{ .socket = conn.client.socket, .context = ctx };
-            var reader = stream.reader();
-
             var buffer = std.fifo.LinearFifo(u8, .Dynamic).init(gpa);
             defer buffer.deinit();
 
@@ -48,7 +45,7 @@ pub fn Listener(comptime Handler: type) type {
                     var ret_cnt: usize = 0;
                     while (true) {
                         const buf = try buffer.writableWithSize(65536);
-                        const num_bytes = try reader.read(buf);
+                        const num_bytes = try runtime.recv(ctx, conn.client.socket, buf, 0);
                         if (num_bytes == 0) return;
                         buffer.update(num_bytes);
 

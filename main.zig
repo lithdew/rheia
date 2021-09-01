@@ -275,7 +275,10 @@ pub fn run() !void {
     defer await stats_frame catch |err| log.warn("stats error: {}", .{err});
 
     for (options.bootstrap_addresses) |bootstrap_address| {
-        const client = try node.getOrCreateClient(&ctx, runtime.getAllocator(), bootstrap_address);
+        const client = node.getOrCreateClient(&ctx, runtime.getAllocator(), bootstrap_address) catch |err| {
+            log.warn("failed to bootstrap with {}: {}", .{ bootstrap_address, err });
+            continue;
+        };
         try client.ensureConnectionAvailable(&ctx, runtime.getAllocator());
     }
 
@@ -886,6 +889,256 @@ pub const Client = struct {
             gpa.free(frame);
         }
     }
+
+    pub fn sayHello(
+        self: *Client,
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        keys: Ed25519.KeyPair,
+        id: kademlia.ID,
+        timeout_params: runtime.TimeoutParams,
+    ) !kademlia.ID {
+        var rpc_ctx: Context = .{};
+        defer rpc_ctx.cancel();
+
+        var callback: struct {
+            state: Context.Callback = .{ .run = @This().run },
+            rpc_ctx: *Context,
+
+            pub fn run(state: *Context.Callback) void {
+                const callback = @fieldParentPtr(@This(), "state", state);
+                callback.rpc_ctx.cancel();
+            }
+        } = .{ .rpc_ctx = &rpc_ctx };
+
+        try ctx.register(&callback.state);
+        defer ctx.deregister(&callback.state);
+
+        var timeout: Context.Timeout = undefined;
+        timeout.init(&rpc_ctx, timeout_params);
+        defer timeout.deinit();
+
+        try rpc_ctx.register(&timeout.state);
+        defer rpc_ctx.deregister(&timeout.state);
+
+        var entry: net.RPC.Entry = .{};
+        var nonce = try self.rpc.register(&rpc_ctx, &entry);
+
+        var rpc_callback = net.RPC.CancellationCallback.from(&self.rpc, nonce);
+        try rpc_ctx.register(&rpc_callback.state);
+        defer rpc_ctx.deregister(&rpc_callback.state);
+
+        {
+            const writer = try self.acquireWriter(&rpc_ctx, gpa);
+            defer self.releaseWriter(writer);
+
+            try (net.Packet{
+                .len = id.size() + @sizeOf([64]u8),
+                .nonce = nonce,
+                .op = .request,
+                .tag = .hello,
+            }).write(writer);
+
+            try id.write(writer);
+
+            const signature = try crypto.sign(id, keys);
+            try writer.writeAll(&signature);
+        }
+
+        const response = try await entry.response;
+        defer response.deinit(gpa);
+
+        var body = io.fixedBufferStream(response.body);
+
+        return try kademlia.ID.read(body.reader());
+    }
+
+    pub fn pullBlock(
+        self: *Client,
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        block_height: u64,
+        cached_block_proposal_id: ?[32]u8,
+        timeout_params: runtime.TimeoutParams,
+    ) !*Block {
+        var rpc_ctx: Context = .{};
+        defer rpc_ctx.cancel();
+
+        var callback: struct {
+            state: Context.Callback = .{ .run = @This().run },
+            rpc_ctx: *Context,
+
+            pub fn run(state: *Context.Callback) void {
+                const callback = @fieldParentPtr(@This(), "state", state);
+                callback.rpc_ctx.cancel();
+            }
+        } = .{ .rpc_ctx = &rpc_ctx };
+
+        try ctx.register(&callback.state);
+        defer ctx.deregister(&callback.state);
+
+        var timeout: Context.Timeout = undefined;
+        timeout.init(&rpc_ctx, timeout_params);
+        defer timeout.deinit();
+
+        try rpc_ctx.register(&timeout.state);
+        defer rpc_ctx.deregister(&timeout.state);
+
+        var entry: net.RPC.Entry = .{};
+        var nonce = try self.rpc.register(&rpc_ctx, &entry);
+
+        var rpc_callback = net.RPC.CancellationCallback.from(&self.rpc, nonce);
+        try rpc_ctx.register(&rpc_callback.state);
+        defer rpc_ctx.deregister(&rpc_callback.state);
+
+        {
+            const writer = try self.acquireWriter(&rpc_ctx, gpa);
+            defer self.releaseWriter(writer);
+
+            try (net.Packet{
+                .len = @sizeOf(u64) + @as(u32, if (cached_block_proposal_id != null) @sizeOf([32]u8) else 0),
+                .nonce = nonce,
+                .op = .request,
+                .tag = .pull_block,
+            }).write(writer);
+
+            try writer.writeIntLittle(u64, block_height);
+            if (cached_block_proposal_id) |block_proposal_id| {
+                try writer.writeAll(&block_proposal_id);
+            }
+        }
+
+        const response = try await entry.response;
+        defer response.deinit(gpa);
+
+        var body = io.fixedBufferStream(response.body);
+
+        const exists = (try body.reader().readByte()) != 0;
+        if (!exists) return error.BlockNotExists;
+
+        return Block.read(gpa, body.reader()) catch |err| {
+            if (response.body.len == 1) {
+                return error.BlockPulledIsCached;
+            }
+            return err;
+        };
+    }
+
+    pub fn pullTransactions(
+        self: *Client,
+        ctx: *Context,
+        gpa: *mem.Allocator,
+        ids: []const [32]u8,
+        timeout_params: runtime.TimeoutParams,
+    ) ![]*Transaction {
+        var rpc_ctx: Context = .{};
+        defer rpc_ctx.cancel();
+
+        var callback: struct {
+            state: Context.Callback = .{ .run = @This().run },
+            rpc_ctx: *Context,
+
+            pub fn run(state: *Context.Callback) void {
+                const callback = @fieldParentPtr(@This(), "state", state);
+                callback.rpc_ctx.cancel();
+            }
+        } = .{ .rpc_ctx = &rpc_ctx };
+
+        try ctx.register(&callback.state);
+        defer ctx.deregister(&callback.state);
+
+        var timeout: Context.Timeout = undefined;
+        timeout.init(&rpc_ctx, timeout_params);
+        defer timeout.deinit();
+
+        try rpc_ctx.register(&timeout.state);
+        defer rpc_ctx.deregister(&timeout.state);
+
+        var entry: net.RPC.Entry = .{};
+        var nonce = try self.rpc.register(&rpc_ctx, &entry);
+
+        var rpc_callback = net.RPC.CancellationCallback.from(&self.rpc, nonce);
+        try rpc_ctx.register(&rpc_callback.state);
+        defer rpc_ctx.deregister(&rpc_callback.state);
+
+        {
+            const writer = try self.acquireWriter(&rpc_ctx, gpa);
+            defer self.releaseWriter(writer);
+
+            try (net.Packet{
+                .len = @intCast(u32, @sizeOf([32]u8) * ids.len),
+                .nonce = nonce,
+                .op = .request,
+                .tag = .pull_transaction,
+            }).write(writer);
+
+            for (ids) |id| {
+                try writer.writeAll(&id);
+            }
+        }
+
+        const response = try await entry.response;
+        defer response.deinit(gpa);
+
+        var body = io.fixedBufferStream(response.body);
+
+        var transactions: std.ArrayListUnmanaged(*Transaction) = .{};
+        defer transactions.deinit(gpa);
+
+        while (true) {
+            const tx = Transaction.read(gpa, body.reader()) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => continue,
+            };
+
+            transactions.append(gpa, tx) catch continue;
+        }
+
+        return transactions.toOwnedSlice(gpa);
+    }
+
+    pub fn pushTransactions(self: *Client, ctx: *Context, gpa: *mem.Allocator, transactions: []const *Transaction, timeout_params: runtime.TimeoutParams) !void {
+        var len: u32 = 0;
+        for (transactions) |tx| {
+            len += tx.size();
+        }
+
+        var rpc_ctx: Context = .{};
+        defer rpc_ctx.cancel();
+
+        var callback: struct {
+            state: Context.Callback = .{ .run = @This().run },
+            rpc_ctx: *Context,
+
+            pub fn run(state: *Context.Callback) void {
+                const callback = @fieldParentPtr(@This(), "state", state);
+                callback.rpc_ctx.cancel();
+            }
+        } = .{ .rpc_ctx = &rpc_ctx };
+
+        try ctx.register(&callback.state);
+        defer ctx.deregister(&callback.state);
+
+        var timeout: Context.Timeout = undefined;
+        timeout.init(&rpc_ctx, timeout_params);
+        defer timeout.deinit();
+
+        {
+            const writer = try self.acquireWriter(&rpc_ctx, gpa);
+            defer self.releaseWriter(writer);
+
+            try (net.Packet{
+                .len = len,
+                .nonce = 0,
+                .op = .command,
+                .tag = .push_transaction,
+            }).write(writer);
+
+            for (transactions) |tx| {
+                try tx.write(writer);
+            }
+        }
+    }
 };
 
 pub const Listener = struct {
@@ -999,20 +1252,22 @@ pub const Listener = struct {
                             return error.AlreadyHandshaked;
                         }
 
-                        const peer_id = try kademlia.ID.read(frame.reader());
-                        const signature = try frame.reader().readBytesNoEof(64);
-                        try crypto.verify(signature, peer_id, peer_id.public_key);
+                        if (packet.len > 0) {
+                            const peer_id = try kademlia.ID.read(frame.reader());
+                            const signature = try frame.reader().readBytesNoEof(64);
+                            try crypto.verify(signature, peer_id, peer_id.public_key);
 
-                        switch (self.node.table.put(peer_id)) {
-                            .full => log.info("incoming handshake from {} (peer ignored)", .{peer_id}),
-                            .updated => {
-                                log.info("incoming handshake from {} (peer updated)", .{peer_id});
-                                conn.id = peer_id;
-                            },
-                            .inserted => {
-                                log.info("incoming handshake from {} (peer registered)", .{peer_id});
-                                conn.id = peer_id;
-                            },
+                            switch (self.node.table.put(peer_id)) {
+                                .full => log.info("incoming handshake from {} (peer ignored)", .{peer_id}),
+                                .updated => {
+                                    log.info("incoming handshake from {} (peer updated)", .{peer_id});
+                                    conn.id = peer_id;
+                                },
+                                .inserted => {
+                                    log.info("incoming handshake from {} (peer registered)", .{peer_id});
+                                    conn.id = peer_id;
+                                },
+                            }
                         }
 
                         try (net.Packet{
@@ -1757,6 +2012,7 @@ pub const Node = struct {
 
         const result = try self.clients.getOrPut(gpa, address);
         if (!result.found_existing) {
+            errdefer |err| log.warn("failed to handshake with {}: {}", .{ address, err });
             errdefer assert(self.clients.remove(address));
 
             result.value_ptr.* = try gpa.create(Client);
@@ -1765,34 +2021,7 @@ pub const Node = struct {
             result.value_ptr.*.* = try Client.init(gpa, address);
             errdefer result.value_ptr.*.deinit(ctx, gpa) catch {};
 
-            const signature = try crypto.sign(self.id, self.keys);
-
-            try result.value_ptr.*.ensureConnectionAvailable(ctx, gpa);
-
-            var entry: net.RPC.Entry = .{};
-            var nonce = try result.value_ptr.*.rpc.register(ctx, &entry);
-
-            {
-                const writer = try result.value_ptr.*.acquireWriter(ctx, gpa);
-                defer result.value_ptr.*.releaseWriter(writer);
-
-                try (net.Packet{
-                    .len = self.id.size() + @sizeOf([64]u8),
-                    .nonce = nonce,
-                    .op = .request,
-                    .tag = .hello,
-                }).write(writer);
-
-                try self.id.write(writer);
-                try writer.writeAll(&signature);
-            }
-
-            const response = try await entry.response;
-            defer response.deinit(gpa);
-
-            var body = io.fixedBufferStream(response.body);
-
-            const peer_id = try kademlia.ID.read(body.reader());
+            const peer_id = try result.value_ptr.*.sayHello(ctx, gpa, self.keys, self.id, .{ .seconds = 5 });
             switch (self.table.put(peer_id)) {
                 .full => log.info("handshaked with {} (peer ignored)", .{peer_id}),
                 .updated => log.info("handshaked with {} (peer updated)", .{peer_id}),
@@ -2235,51 +2464,24 @@ pub fn Chain(comptime Store: type) type {
             const cached_block_proposal = if (self.block_proposal_cache.get(address)) |entry| entry.value.ref() else null;
             defer if (cached_block_proposal) |block_proposal| block_proposal.deinit(gpa);
 
-            var entry: net.RPC.Entry = .{};
-            var nonce = try client.rpc.register(ctx, &entry);
+            const cached_block_proposal_id = if (cached_block_proposal) |block_proposal| block_proposal.id else null;
 
-            {
-                const writer = try client.acquireWriter(ctx, gpa);
-                defer client.releaseWriter(writer);
+            const block = client.pullBlock(ctx, gpa, block_height, cached_block_proposal_id, .{ .seconds = 5 }) catch |err| switch (err) {
+                error.BlockPulledIsCached => {
+                    const block_proposal = cached_block_proposal orelse return err;
 
-                try (net.Packet{
-                    .len = @sizeOf(u64) + @as(u32, if (cached_block_proposal != null) @sizeOf([32]u8) else 0),
-                    .nonce = nonce,
-                    .op = .request,
-                    .tag = .pull_block,
-                }).write(writer);
+                    // it is possible that our cached block proposal response may have
+                    // been evicted by time we reach here, so an insertion may happen
+                    // yet again
 
-                try writer.writeIntLittle(u64, block_height);
-                if (cached_block_proposal) |block_proposal| {
-                    try writer.writeAll(&block_proposal.id);
-                }
-            }
-
-            const response = try await entry.response;
-            defer response.deinit(gpa);
-
-            var body = io.fixedBufferStream(response.body);
-
-            const exists = (try body.reader().readByte()) != 0;
-            if (!exists) return error.BlockNotExists;
-
-            const block = Block.read(gpa, body.reader()) catch |err| {
-                if (response.body.len > 1) {
-                    return err;
-                }
-
-                const block_proposal = cached_block_proposal orelse return err;
-
-                // it is possible that our cached block proposal response may have
-                // been evicted by time we reach here, so an insertion may happen
-                // yet again
-
-                switch (self.block_proposal_cache.update(address, block_proposal.ref())) {
-                    .inserted => {},
-                    .updated => |old_block| old_block.deinit(gpa),
-                    .evicted => |old_entry| old_entry.value.deinit(gpa),
-                }
-                return block_proposal;
+                    switch (self.block_proposal_cache.update(address, block_proposal.ref())) {
+                        .inserted => {},
+                        .updated => |old_block| old_block.deinit(gpa),
+                        .evicted => |old_entry| old_entry.value.deinit(gpa),
+                    }
+                    return block_proposal;
+                },
+                else => return err,
             };
             errdefer block.deinit(gpa);
 
@@ -2458,44 +2660,7 @@ pub const TransactionPuller = struct {
         defer wg.sub(1);
 
         const client = try self.node.getOrCreateClient(ctx, gpa, address);
-
-        var entry: net.RPC.Entry = .{};
-        var nonce = try client.rpc.register(ctx, &entry);
-
-        {
-            const writer = try client.acquireWriter(ctx, gpa);
-            defer client.releaseWriter(writer);
-
-            try (net.Packet{
-                .len = @intCast(u32, @sizeOf([32]u8) * ids.len),
-                .nonce = nonce,
-                .op = .request,
-                .tag = .pull_transaction,
-            }).write(writer);
-
-            for (ids) |id| {
-                try writer.writeAll(&id);
-            }
-        }
-
-        const response = try await entry.response;
-        defer response.deinit(gpa);
-
-        var body = io.fixedBufferStream(response.body);
-
-        var transactions: std.ArrayListUnmanaged(*Transaction) = .{};
-        defer transactions.deinit(gpa);
-
-        while (true) {
-            const tx = Transaction.read(gpa, body.reader()) catch |err| switch (err) {
-                error.EndOfStream => break,
-                else => continue,
-            };
-
-            transactions.append(gpa, tx) catch continue;
-        }
-
-        return transactions.toOwnedSlice(gpa);
+        return client.pullTransactions(ctx, gpa, ids, .{ .seconds = 5 });
     }
 };
 
@@ -2628,7 +2793,7 @@ pub const TransactionPusher = struct {
 
         self.num_bytes_pending = 0;
 
-        const frames = try gpa.alloc(@Frame(pushTransactions), peer_ids.len);
+        const frames = try gpa.alloc(@Frame(TransactionPusher.pushTransactions), peer_ids.len);
         defer gpa.free(frames);
 
         var frame_index: usize = 0;
@@ -2674,30 +2839,14 @@ pub const TransactionPusher = struct {
         wg.add(1);
         defer wg.sub(1);
 
-        defer gpa.free(transactions);
-
-        const writer = try self.node.acquireWriter(ctx, gpa, address);
-        defer self.node.releaseWriter(address, writer);
-
-        try (net.Packet{
-            .len = transactions_len,
-            .nonce = 0,
-            .op = .command,
-            .tag = .push_transaction,
-        }).write(writer);
-
-        var transaction_bytes: usize = 0;
-        var transaction_index: usize = 0;
         defer {
-            _ = pusher_bytes.fetchAdd(transaction_bytes, .Monotonic);
-            _ = pusher_count.fetchAdd(transaction_index, .Monotonic);
+            _ = pusher_count.fetchAdd(transactions.len, .Monotonic);
+            _ = pusher_bytes.fetchAdd(transactions_len, .Monotonic);
+            gpa.free(transactions);
         }
 
-        while (transaction_index < transactions.len) {
-            try transactions[transaction_index].write(writer);
-            transaction_bytes += transactions[transaction_index].size();
-            transaction_index += 1;
-        }
+        const client = try self.node.getOrCreateClient(ctx, gpa, address);
+        try client.pushTransactions(ctx, gpa, transactions, .{ .seconds = 5 });
     }
 };
 
