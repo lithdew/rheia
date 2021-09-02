@@ -48,8 +48,8 @@ const usage = fmt.comptimePrint(
     \\  -v, --version                             Show version.
     \\  -d, --database-path                       File path for storing all state and data. (env: DB_PATH)
     \\  -l, --listen-address ([<host>][:]<port>)  Address to listen for peers on. (env: LISTEN_ADDR) [default: 0.0.0.0:9000]
-    \\  -b, --http-address ([<host>][:]<port>)    Address to handle HTTP requests on. (env: HTTP_ADDR) [default: --listen-address]
-    \\  -n, --node-address ([<host>][:]<port>)    Address for peers to reach this node on. (env: NODE_ADDR) [default: 0.0.0.0:9000]
+    \\  -b, --http-address ([<host>][:]<port>)    Address to handle HTTP requests on. (env: HTTP_ADDR) [default: 0.0.0.0:8080]
+    \\  -n, --node-address ([<host>][:]<port>)    Address for peers to reach this node on. (env: NODE_ADDR) [default: --listen-address]
     \\  -s, --secret-key <secret key>             Hex-encoded Ed25519 secret key of this node. (env: SECRET_KEY) [default: randomly generated]
     \\
     \\To spawn and bootstrap a three-node Rheia cluster:
