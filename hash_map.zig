@@ -212,7 +212,7 @@ fn HashMapMixin(
 ) type {
     return struct {
         pub fn clearRetainingCapacity(self: *Self) void {
-            mem.set(Entry, self.slice(), .{});
+            mem.set(Self.Entry, self.slice(), .{});
             self.len = 0;
         }
 

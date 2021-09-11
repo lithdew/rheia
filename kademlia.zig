@@ -9,6 +9,7 @@ const ip = std.x.net.ip;
 const fmt = std.fmt;
 const mem = std.mem;
 const meta = std.meta;
+const testing = std.testing;
 
 const IPv4 = std.x.os.IPv4;
 const IPv6 = std.x.os.IPv6;

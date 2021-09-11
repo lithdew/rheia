@@ -93,20 +93,20 @@ pub fn waitForSignal(ctx: *Context, codes: anytype) !void {
     }
 
     var prev_set: os.sigset_t = undefined;
-    if (os.system.sigprocmask(os.SIG_BLOCK, &set, &prev_set) != 0) {
+    if (os.system.sigprocmask(os.SIG.BLOCK, &set, &prev_set) != 0) {
         return error.UnableToMaskSignals;
     }
-    defer if (os.system.sigprocmask(os.SIG_SETMASK, &prev_set, null) != 0) {
+    defer if (os.system.sigprocmask(os.SIG.SETMASK, &prev_set, null) != 0) {
         @panic("failed to unmask signals");
     };
 
-    const fd = try os.signalfd(-1, &set, os.O_CLOEXEC);
+    const fd = try os.signalfd(-1, &set, os.O.CLOEXEC);
     defer os.close(fd);
 
-    var info: os.signalfd_siginfo = undefined;
+    var info: os.linux.signalfd_siginfo = undefined;
 
     const num_bytes = try runtime.read(ctx, fd, mem.asBytes(&info), 0);
-    if (num_bytes < @sizeOf(os.signalfd_siginfo)) return error.ShortRead;
+    if (num_bytes < @sizeOf(os.linux.signalfd_siginfo)) return error.ShortRead;
 }
 
 pub fn getAllocator() *mem.Allocator {
@@ -118,7 +118,7 @@ pub const TimeoutParams = struct {
     nanoseconds: i64 = 0,
     mode: enum(u32) {
         relative = 0,
-        absolute = os.IORING_TIMEOUT_ABS,
+        absolute = os.linux.IORING_TIMEOUT_ABS,
     } = .relative,
 };
 
@@ -201,7 +201,7 @@ pub const Stream = struct {
     context: *Context,
 
     read_flags: u32 = 0,
-    write_flags: u32 = os.MSG_NOSIGNAL,
+    write_flags: u32 = os.MSG.NOSIGNAL,
 
     pub fn reader(self: Stream) Stream.Reader {
         return Stream.Reader{ .context = self };
@@ -270,7 +270,7 @@ pub const Runtime = struct {
         self.pool = Pool.init(.{ .max_threads = 7 });
         errdefer self.pool.deinit();
 
-        self.event = try os.eventfd(0, os.O_CLOEXEC);
+        self.event = try os.eventfd(0, os.O.CLOEXEC);
         errdefer os.close(self.event);
 
         self.event_count = math.maxInt(u64);
@@ -435,8 +435,8 @@ pub const Runtime = struct {
         var raw_flags: u32 = 0;
 
         const set = std.EnumSet(Socket.InitFlags).init(flags);
-        if (set.contains(.close_on_exec)) raw_flags |= os.SOCK_CLOEXEC;
-        if (set.contains(.nonblocking)) raw_flags |= os.SOCK_NONBLOCK;
+        if (set.contains(.close_on_exec)) raw_flags |= os.SOCK.CLOEXEC;
+        if (set.contains(.nonblocking)) raw_flags |= os.SOCK.NONBLOCK;
 
         while (true) {
             var maybe_err: ?anyerror = null;
@@ -821,7 +821,7 @@ pub const Runtime = struct {
             return;
         }
 
-        const timespec: os.__kernel_timespec = .{
+        const timespec: os.linux.kernel_timespec = .{
             .tv_sec = params.seconds,
             .tv_nsec = params.nanoseconds,
         };

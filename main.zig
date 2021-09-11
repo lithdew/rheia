@@ -284,7 +284,7 @@ pub fn run() !void {
 
     try bootstrapNodeWithPeers(&ctx, &node);
 
-    runtime.waitForSignal(&ctx, .{os.SIGINT}) catch {};
+    runtime.waitForSignal(&ctx, .{os.SIG.INT}) catch {};
     log.info("gracefully shutting down...", .{});
 
     ctx.cancel();

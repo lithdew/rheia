@@ -74,7 +74,7 @@ pub fn run() !void {
         frames[frame_index] = async runBenchmark(&ctx, keys, &client);
     }
 
-    runtime.waitForSignal(&ctx, .{os.SIGINT}) catch {};
+    runtime.waitForSignal(&ctx, .{os.SIG.INT}) catch {};
     log.info("gracefully shutting down...", .{});
 
     ctx.cancel();
