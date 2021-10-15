@@ -41,6 +41,14 @@ Rheia requires Zig nightly and an up-to-date Linux kernel (>= v5.13).
 
 ### rheia
 
+- Update the `zig-sqlite` submodule
+
+```console
+$ git submodule update --init --recursive
+```
+
+- Build rheia
+
 ```console
 $ zig build-exe main.zig zig-sqlite/c/sqlite3.c -I zig-sqlite/c --name rheia -lc -O ReleaseFast
 
