@@ -247,11 +247,11 @@ pub fn run() !void {
     var ctx: Context = .{};
     defer ctx.cancel();
 
-    // var store = try SqliteStore.init(runtime.getAllocator(), options.database_path);
-    // defer store.deinit();
-
-    var store = try NullStore.init(runtime.getAllocator(), options.database_path);
+    var store = try SqliteStore.init(runtime.getAllocator(), options.database_path);
     defer store.deinit();
+
+    // var store = try NullStore.init(runtime.getAllocator(), options.database_path);
+    // defer store.deinit();
 
     var node: Node = undefined;
     try node.init(runtime.getAllocator(), &store, options.keys, options.node_address);
@@ -1949,7 +1949,7 @@ pub const Node = struct {
     id: kademlia.ID,
     keys: Ed25519.KeyPair,
 
-    chain: Chain(NullStore),
+    chain: Chain(SqliteStore),
     pusher: TransactionPusher,
     puller: TransactionPuller,
     verifier: TransactionVerifier,
@@ -1965,11 +1965,11 @@ pub const Node = struct {
     table: kademlia.RoutingTable,
     closed: bool = false,
 
-    pub fn init(self: *Node, gpa: *mem.Allocator, store: *NullStore, keys: Ed25519.KeyPair, address: ip.Address) !void {
+    pub fn init(self: *Node, gpa: *mem.Allocator, store: *SqliteStore, keys: Ed25519.KeyPair, address: ip.Address) !void {
         self.keys = keys;
         self.id = .{ .public_key = keys.public_key, .address = address };
 
-        self.chain = try Chain(NullStore).init(gpa, store);
+        self.chain = try Chain(SqliteStore).init(gpa, store);
         errdefer self.chain.deinit(gpa);
 
         self.pusher = try TransactionPusher.init(gpa, self);
@@ -3438,7 +3438,7 @@ pub const SqliteStore = struct {
         );
         if (result != sqlite.c.SQLITE_OK) {
             diags.err = pooled.conn.getDetailedError();
-            return sqlite.errorFromResultCode(result);
+            return sqlite.errors.errorFromResultCode(result);
         }
         defer _ = sqlite.c.sqlite3_finalize(stmt);
 
@@ -3460,7 +3460,7 @@ pub const SqliteStore = struct {
                 sqlite.c.SQLITE_ROW => {},
                 else => {
                     diags.err = pooled.conn.getDetailedError();
-                    return sqlite.errorFromResultCode(result);
+                    return sqlite.errors.errorFromResultCode(result);
                 },
             }
 
