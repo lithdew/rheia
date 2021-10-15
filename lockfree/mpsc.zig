@@ -1,10 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const os = std.os;
 const mem = std.mem;
 const meta = std.meta;
 const atomic = std.atomic;
-const builtin = std.builtin;
 const testing = std.testing;
 
 const assert = std.debug.assert;

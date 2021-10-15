@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const lockfree = @import("lockfree.zig");
 
 const io = std.io;
@@ -6,7 +7,6 @@ const os = std.os;
 const mem = std.mem;
 const math = std.math;
 const heap = std.heap;
-const builtin = std.builtin;
 
 const Socket = std.x.os.Socket;
 const Atomic = std.atomic.Atomic;

@@ -1,11 +1,14 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
 const assert = std.debug.assert;
+
 const Atomic = std.atomic.Atomic;
 const Futex = std.Thread.Futex;
 
 const ThreadPool = @This();
 
-const cache_line_padding = switch (std.Target.current.cpu.arch) {
+const cache_line_padding = switch (builtin.target.cpu.arch) {
     .riscv64, .arm, .armeb, .thumb, .thumbeb, .mips, .mipsel, .mips64, .mips64el => 32,
     .x86_64, .powerpc64, .powerpc64le => 128,
     .s390x => 256,

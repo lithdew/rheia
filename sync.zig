@@ -1,10 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const runtime = @import("runtime.zig");
 
 const mem = std.mem;
 const meta = std.meta;
 const math = std.math;
-const builtin = std.builtin;
 
 const assert = std.debug.assert;
 

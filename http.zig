@@ -2,8 +2,11 @@ const std = @import("std");
 const net = @import("net.zig");
 const runtime = @import("runtime.zig");
 
+const fmt = std.fmt;
 const mem = std.mem;
 const tcp = std.x.net.tcp;
+const ascii = std.ascii;
+const json = std.json;
 
 const Context = runtime.Context;
 
@@ -85,7 +88,49 @@ pub fn Listener(comptime Handler: type) type {
                     try conn.write_parker.park(ctx);
                 }
 
-                try self.handler.handleHttpRequest(ctx, gpa, request, buffer.reader(), conn.buffer.writer());
+                self.handler.handleHttpRequest(ctx, gpa, request, buffer.reader(), conn.buffer.writer()) catch |err| if (conn.buffer.items.len == 0) {
+                    var buf: [1024]u8 = undefined;
+
+                    // make error name lower-cased
+
+                    var error_name_len: usize = 0;
+                    for (@errorName(err)) |character, i| {
+                        if (i != 0 and ascii.isUpper(character)) {
+                            buf[error_name_len] = '_';
+                            error_name_len += 1;
+                        }
+
+                        buf[error_name_len] = ascii.toLower(character);
+                        error_name_len += 1;
+                    }
+
+                    // create default error response json
+
+                    var body = std.ArrayList(u8).init(gpa);
+                    defer body.deinit();
+
+                    var stream = json.writeStream(body.writer(), 128);
+
+                    try stream.beginObject();
+                    try stream.objectField("error");
+                    try stream.emitString(buf[0..error_name_len]);
+                    try stream.endObject();
+
+                    // send default error response
+
+                    const response: http.Response = .{
+                        .status_code = 500,
+                        .message = "Internal Server Error",
+                        .headers = &[_]http.Header{
+                            .{ .name = "Content-Type", .value = "application/json" },
+                            .{ .name = "Content-Length", .value = fmt.bufPrintIntToSlice(&buf, body.items.len, 10, .lower, .{}) },
+                        },
+                        .num_headers = 2,
+                    };
+
+                    try conn.buffer.writer().print("{}", .{response});
+                    try conn.buffer.writer().print("{s}", .{body.items});
+                };
                 if (conn.buffer.items.len > 0) {
                     conn.writer_parker.notify({});
                 }
