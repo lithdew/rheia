@@ -1912,7 +1912,7 @@ pub const HttpHandler = struct {
         const tx = try Transaction.read(gpa, body.reader());
         defer tx.deinit(gpa);
 
-        self.node.addTransaction(ctx, gpa, tx.ref()) catch |err| {
+        self.node.verifier.push(ctx, gpa, tx.ref()) catch |err| {
             tx.deinit(gpa);
             return err;
         };
@@ -2632,7 +2632,7 @@ pub const TransactionPuller = struct {
                     continue;
                 }
 
-                self.node.addTransaction(ctx, gpa, tx) catch {
+                self.node.verifier.push(ctx, gpa, tx) catch {
                     tx.deinit(gpa);
                     continue;
                 };
