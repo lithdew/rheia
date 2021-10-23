@@ -448,7 +448,7 @@ pub fn Client(comptime Protocol: type) type {
             if (self.breaker.hasFailuresReported()) {
                 const delay_max: i64 = 3000 * time.ns_per_ms;
                 const delay_step: i64 = 10 * time.ns_per_ms;
-                const delay = math.min(delay_max, delay_step * math.shl(i64, 1, self.breaker.num_failed_attempts - 1));
+                const delay = math.min(delay_max, delay_step *| math.shl(i64, 1, self.breaker.num_failed_attempts - 1));
 
                 log.debug("{} [{}] attempt #{}: will attempt to reconnect in {} milliseconds", .{
                     self.address,
