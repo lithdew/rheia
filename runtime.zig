@@ -226,9 +226,10 @@ pub const Stream = struct {
 
 pub const Runtime = struct {
     pub const Syscall = struct {
-        pub const List = SinglyLinkedDeque(Syscall, .next);
+        pub const Deque = DoublyLinkedDeque(Syscall, .next, .prev);
 
         task: Task,
+        prev: ?*Syscall = null,
         next: ?*Syscall = null,
         result: ?isize = null,
     };
@@ -249,7 +250,7 @@ pub const Runtime = struct {
     closing: bool,
 
     pending_tasks: Task.Deque,
-    pending_cancellations: Syscall.List,
+    pending_cancellations: Syscall.Deque,
 
     incoming_tasks: Task.Stack,
     outgoing_tasks: Pool.Batch,
@@ -369,7 +370,7 @@ pub const Runtime = struct {
                 self.pending_tasks.append(task);
             }
 
-            var pending_cancellations: Syscall.List = .{};
+            var pending_cancellations: Syscall.Deque = .{};
             while (self.pending_cancellations.popFirst()) |syscall| {
                 _ = ring_cancel(&self.ring, 0, @ptrToInt(syscall), 0) catch {
                     pending_cancellations.append(syscall);
@@ -414,6 +415,7 @@ pub const Runtime = struct {
         flags: std.enums.EnumFieldStruct(Socket.InitFlags, bool, false),
     ) !Socket.Connection {
         var syscall: Syscall = .{ .task = .{ .frame = @frame() } };
+        defer _ = self.pending_cancellations.remove(&syscall);
 
         var callback: struct {
             state: Context.Callback = .{ .run = @This().run },
@@ -493,6 +495,7 @@ pub const Runtime = struct {
 
     pub fn recv(self: *Runtime, ctx: *Context, socket: Socket, buffer: []u8, flags: u32) !usize {
         var syscall: Syscall = .{ .task = .{ .frame = @frame() } };
+        defer _ = self.pending_cancellations.remove(&syscall);
 
         var callback: struct {
             state: Context.Callback = .{ .run = @This().run },
@@ -550,6 +553,7 @@ pub const Runtime = struct {
 
     pub fn send(self: *Runtime, ctx: *Context, socket: Socket, buffer: []const u8, flags: u32) !usize {
         var syscall: Syscall = .{ .task = .{ .frame = @frame() } };
+        defer _ = self.pending_cancellations.remove(&syscall);
 
         var callback: struct {
             state: Context.Callback = .{ .run = @This().run },
@@ -622,6 +626,7 @@ pub const Runtime = struct {
 
     pub fn connect(self: *Runtime, ctx: *Context, socket: Socket, address: Socket.Address) !void {
         var syscall: Syscall = .{ .task = .{ .frame = @frame() } };
+        defer _ = self.pending_cancellations.remove(&syscall);
 
         var callback: struct {
             state: Context.Callback = .{ .run = @This().run },
@@ -692,6 +697,7 @@ pub const Runtime = struct {
 
     pub fn pollAdd(self: *Runtime, ctx: *Context, fd: os.fd_t, poll_mask: u32) !void {
         var syscall: Syscall = .{ .task = .{ .frame = @frame() } };
+        defer _ = self.pending_cancellations.remove(&syscall);
 
         var callback: struct {
             state: Context.Callback = .{ .run = @This().run },
@@ -744,6 +750,7 @@ pub const Runtime = struct {
 
     pub fn read(self: *Runtime, ctx: *Context, fd: os.fd_t, buffer: []u8, offset: u64) !usize {
         var syscall: Syscall = .{ .task = .{ .frame = @frame() } };
+        defer _ = self.pending_cancellations.remove(&syscall);
 
         var callback: struct {
             state: Context.Callback = .{ .run = @This().run },
@@ -801,6 +808,7 @@ pub const Runtime = struct {
 
     pub fn timeout(self: *Runtime, ctx: *Context, params: TimeoutParams) !void {
         var syscall: Syscall = .{ .task = .{ .frame = @frame() } };
+        defer _ = self.pending_cancellations.remove(&syscall);
 
         var callback: struct {
             state: Context.Callback = .{ .run = @This().run },
