@@ -315,7 +315,7 @@ pub const Runtime = struct {
     }
 
     pub fn notify(self: *Runtime) void {
-        if (self.event_armed.compareAndSwap(true, false, .Monotonic, .Monotonic) != null) {
+        if (self.event_armed.compareAndSwap(true, false, .AcqRel, .Acquire) != null) {
             return;
         }
         const bytes_written = os.write(self.event, mem.asBytes(&@as(u64, 1))) catch 0;
@@ -345,14 +345,14 @@ pub const Runtime = struct {
     }
 
     fn rearm(self: *Runtime) bool {
-        if (self.event_armed.load(.Monotonic) or self.event_count == 0) {
+        if (self.event_armed.load(.Acquire) or self.event_count == 0) {
             return false;
         }
         if ((self.ring.read(0, self.event, mem.asBytes(&self.event_count), 0) catch null) == null) {
             return true; // return true so that the next call to rearm will attempt to re-submit a read()
         }
         self.event_count = 0;
-        self.event_armed.store(true, .Monotonic);
+        self.event_armed.store(true, .Release);
         return true;
     }
 
