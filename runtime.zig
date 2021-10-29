@@ -324,10 +324,10 @@ pub const Runtime = struct {
 
     pub fn startCpuBoundOperation(self: *Runtime) void {
         var callback: struct {
-            state: Pool.Runnable = .{ .runFn = @This().run },
+            state: Pool.Task = .{ .callback = @This().run },
             frame: anyframe,
 
-            fn run(state: *Pool.Runnable) void {
+            fn run(state: *Pool.Task) void {
                 const callback = @fieldParentPtr(@This(), "state", state);
                 resume callback.frame;
             }
