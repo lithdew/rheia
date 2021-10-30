@@ -371,24 +371,24 @@ test "ID: serialize and deserialize" {
         var rng = std.rand.DefaultPrng.init(seed);
 
         var public_key: [32]u8 = undefined;
-        rng.random.bytes(&public_key);
+        rng.random().bytes(&public_key);
 
         const address = address: {
-            switch (rng.random.boolean()) {
+            switch (rng.random().boolean()) {
                 true => {
                     var host_octets: [4]u8 = undefined;
-                    rng.random.bytes(&host_octets);
+                    rng.random().bytes(&host_octets);
 
                     const host = IPv4{ .octets = host_octets };
-                    const port = rng.random.int(u16);
+                    const port = rng.random().int(u16);
                     break :address ip.Address.initIPv4(host, port);
                 },
                 false => {
                     var host_octets: [16]u8 = undefined;
-                    rng.random.bytes(&host_octets);
+                    rng.random().bytes(&host_octets);
 
-                    const host = IPv6{ .octets = host_octets, .scope_id = rng.random.int(u32) };
-                    const port = rng.random.int(u16);
+                    const host = IPv6{ .octets = host_octets, .scope_id = rng.random().int(u32) };
+                    const port = rng.random().int(u16);
                     break :address ip.Address.initIPv6(host, port);
                 },
             }

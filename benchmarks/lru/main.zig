@@ -25,7 +25,7 @@ pub fn benchmarkListSmall() !void {
     defer gpa.free(keys);
 
     var rng = std.rand.DefaultPrng.init(0);
-    for (keys) |*key| key.* = rng.random.int(usize);
+    for (keys) |*key| key.* = rng.random().int(usize);
 
     var map = try lru.AutoHashMap(usize, usize, 50).initCapacity(gpa, 1 << 13);
     defer map.deinit(gpa);
@@ -63,7 +63,7 @@ pub fn benchmarkIntrusiveSmall() !void {
     defer gpa.free(keys);
 
     var rng = std.rand.DefaultPrng.init(0);
-    for (keys) |*key| key.* = rng.random.int(usize);
+    for (keys) |*key| key.* = rng.random().int(usize);
 
     var map = try lru.AutoIntrusiveHashMap(usize, usize, 50).initCapacity(gpa, 1 << 13);
     defer map.deinit(gpa);
@@ -101,7 +101,7 @@ pub fn benchmarkListSmallFull() !void {
     defer gpa.free(keys);
 
     var rng = std.rand.DefaultPrng.init(0);
-    for (keys) |*key| key.* = rng.random.int(usize);
+    for (keys) |*key| key.* = rng.random().int(usize);
 
     var map = try lru.AutoHashMap(usize, usize, 50).initCapacity(gpa, 1 << 12);
     defer map.deinit(gpa);
@@ -139,7 +139,7 @@ pub fn benchmarkIntrusiveSmallFull() !void {
     defer gpa.free(keys);
 
     var rng = std.rand.DefaultPrng.init(0);
-    for (keys) |*key| key.* = rng.random.int(usize);
+    for (keys) |*key| key.* = rng.random().int(usize);
 
     var map = try lru.AutoIntrusiveHashMap(usize, usize, 50).initCapacity(gpa, 1 << 12);
     defer map.deinit(gpa);
@@ -177,7 +177,7 @@ pub fn benchmarkList() !void {
     defer gpa.free(keys);
 
     var rng = std.rand.DefaultPrng.init(0);
-    for (keys) |*key| key.* = rng.random.int(usize);
+    for (keys) |*key| key.* = rng.random().int(usize);
 
     var map = try lru.AutoHashMap(usize, usize, 50).initCapacity(gpa, 1 << 21);
     defer map.deinit(gpa);
@@ -215,7 +215,7 @@ pub fn benchmarkIntrusive() !void {
     defer gpa.free(keys);
 
     var rng = std.rand.DefaultPrng.init(0);
-    for (keys) |*key| key.* = rng.random.int(usize);
+    for (keys) |*key| key.* = rng.random().int(usize);
 
     var map = try lru.AutoIntrusiveHashMap(usize, usize, 50).initCapacity(gpa, 1 << 21);
     defer map.deinit(gpa);
@@ -253,7 +253,7 @@ pub fn benchmarkListFull() !void {
     defer gpa.free(keys);
 
     var rng = std.rand.DefaultPrng.init(0);
-    for (keys) |*key| key.* = rng.random.int(usize);
+    for (keys) |*key| key.* = rng.random().int(usize);
 
     var map = try lru.AutoHashMap(usize, usize, 50).initCapacity(gpa, 1 << 20);
     defer map.deinit(gpa);
@@ -291,7 +291,7 @@ pub fn benchmarkIntrusiveFull() !void {
     defer gpa.free(keys);
 
     var rng = std.rand.DefaultPrng.init(0);
-    for (keys) |*key| key.* = rng.random.int(usize);
+    for (keys) |*key| key.* = rng.random().int(usize);
 
     var map = try lru.AutoIntrusiveHashMap(usize, usize, 50).initCapacity(gpa, 1 << 20);
     defer map.deinit(gpa);

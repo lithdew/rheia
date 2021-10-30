@@ -690,7 +690,7 @@ test "lru.HashMap: update, get, delete without eviction" {
         const keys = try testing.allocator.alloc(usize, 128);
         defer testing.allocator.free(keys);
 
-        for (keys) |*key| key.* = rng.random.int(usize);
+        for (keys) |*key| key.* = rng.random().int(usize);
 
         var map = try Cache.initCapacity(testing.allocator, 128);
         defer map.deinit(testing.allocator);
@@ -718,7 +718,7 @@ test "lru.HashMap: update, get, delete without eviction" {
 
         var key_index: usize = 0;
         while (key_index < keys.len / 2) : (key_index += 1) {
-            const index = rng.random.intRangeAtMost(usize, 1, keys.len - 1);
+            const index = rng.random().intRangeAtMost(usize, 1, keys.len - 1);
 
             const result = map.getOrPut(keys[index]);
             try testing.expect(result.found_existing);
@@ -811,7 +811,7 @@ test "lru.IntrusiveHashMap: update, get, delete without eviction" {
         const keys = try testing.allocator.alloc(usize, 128);
         defer testing.allocator.free(keys);
 
-        for (keys) |*key| key.* = rng.random.int(usize);
+        for (keys) |*key| key.* = rng.random().int(usize);
 
         var map = try Cache.initCapacity(testing.allocator, 128);
         defer map.deinit(testing.allocator);
@@ -832,7 +832,7 @@ test "lru.IntrusiveHashMap: update, get, delete without eviction" {
 
         var key_index: usize = 0;
         while (key_index < keys.len / 2) : (key_index += 1) {
-            const index = rng.random.intRangeAtMost(usize, 1, keys.len - 1);
+            const index = rng.random().intRangeAtMost(usize, 1, keys.len - 1);
             try testing.expectEqual(Cache.UpdateResult.updated, map.update(keys[index], index));
 
             try testing.expectEqual(keys[index], map.head.?.key);

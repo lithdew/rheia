@@ -38,7 +38,7 @@ fn benchmarkHashMap() !void {
 
     var rng = std.rand.DefaultPrng.init(0);
     for (keys) |*key| {
-        rng.random.bytes(key);
+        rng.random().bytes(key);
     }
 
     var map = try hash_map.HashMap(usize, 50).initCapacity(gpa, 1 << 21);
@@ -77,7 +77,7 @@ fn benchmarkBTree() !void {
 
     var rng = std.rand.DefaultPrng.init(0);
     for (keys) |*key| {
-        rng.random.bytes(key);
+        rng.random().bytes(key);
     }
 
     const tree = c.btree_new(@sizeOf([32]u8), std.mem.page_size / @sizeOf([32:0]u8), compareBTreeHash, null);
@@ -121,7 +121,7 @@ fn benchmarkRedBlackTree() !void {
 
     var rng = std.rand.DefaultPrng.init(0);
     for (nodes) |*node| {
-        rng.random.bytes(&node.key);
+        rng.random().bytes(&node.key);
     }
 
     var tree = rb.Tree.init(compareRedBlackHash);
@@ -159,7 +159,7 @@ fn benchmarkBinaryHeap() !void {
 
     var rng = std.rand.DefaultPrng.init(0);
     for (keys) |*key| {
-        rng.random.bytes(key);
+        rng.random().bytes(key);
     }
 
     var queue = std.PriorityQueue([32]u8).init(gpa, compareBinaryHeapHash);
@@ -203,7 +203,7 @@ fn benchmarkSkipList() !void {
 
     var rng = std.rand.DefaultPrng.init(0);
     for (keys) |*key| {
-        rng.random.bytes(key);
+        rng.random().bytes(key);
     }
 
     var list: skiplist.SkipList([32]u8) = .{};
@@ -226,7 +226,7 @@ fn benchmarkLibart() !void {
 
     var rng = std.rand.DefaultPrng.init(0);
     for (keys) |*key| {
-        rng.random.bytes(key);
+        rng.random().bytes(key);
     }
 
     var tree: c.art_tree = undefined;
@@ -266,7 +266,7 @@ fn benchmarkArtTravis() !void {
 
     var rng = std.rand.DefaultPrng.init(0);
     for (keys) |*key| {
-        rng.random.bytes(key);
+        rng.random().bytes(key);
         key[32] = 0;
     }
 
@@ -308,7 +308,7 @@ fn benchmarkArt() !void {
 
     var rng = std.rand.DefaultPrng.init(0);
     for (keys) |*key| {
-        rng.random.bytes(key);
+        rng.random().bytes(key);
     }
 
     var tree: art.Tree(*c_void) = .{};
@@ -347,7 +347,7 @@ fn benchmarkRax() !void {
 
     var rng = std.rand.DefaultPrng.init(0);
     for (keys) |*key| {
-        rng.random.bytes(key);
+        rng.random().bytes(key);
     }
 
     var tree = try rax.Trie.init(gpa);

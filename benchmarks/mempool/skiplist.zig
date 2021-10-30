@@ -50,7 +50,7 @@ pub fn SkipList(comptime T: type) type {
         }
 
         pub fn generateLevel(self: *Self, max_level: usize) usize {
-            const x = self.rng.random.int(u64) & ((@as(u64, 1) << @intCast(u6, max_level)) - 1);
+            const x = self.rng.random().int(u64) & ((@as(u64, 1) << @intCast(u6, max_level)) - 1);
             const zeroes = @ctz(u64, x);
             if (zeroes <= max_level) {
                 return zeroes;
@@ -263,6 +263,6 @@ test "stress insert" {
     var list: SkipList([32]u8) = .{};
     defer list.deinit(testing.allocator);
 
-    for (inputs) |*input| rng.random.bytes(input);
+    for (inputs) |*input| rng.random().bytes(input);
     for (inputs) |input| try list.insert(testing.allocator, input);
 }

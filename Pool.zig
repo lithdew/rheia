@@ -111,7 +111,7 @@ pub fn schedule(self: *ThreadPool, batch: Batch) void {
     } else {
         self.run_queue.push(list);
     }
-    
+
     // Try to notify a thread
     const is_waking = false;
     return self.notify(is_waking);
@@ -126,14 +126,13 @@ inline fn notify(self: *ThreadPool, is_waking: bool) void {
             return;
         }
     }
-    
+
     return self.notifySlow(is_waking);
 }
 
 noinline fn notifySlow(self: *ThreadPool, is_waking: bool) void {
     var sync = @bitCast(Sync, self.sync.load(.Monotonic));
     while (sync.state != .shutdown) {
-
         const can_wake = is_waking or (sync.state == .pending);
         if (is_waking) {
             assert(sync.state == .waking);
@@ -151,7 +150,7 @@ noinline fn notifySlow(self: *ThreadPool, is_waking: bool) void {
         } else if (sync.notified) { // nothing to update
             return;
         }
-        
+
         // Release barrier synchronizes with Acquire in wait()
         // to ensure pushes to run queues happen before observing a posted notification.
         sync = @bitCast(Sync, self.sync.tryCompareAndSwap(
@@ -190,13 +189,13 @@ noinline fn wait(self: *ThreadPool, _is_waking: bool) error{Shutdown}!bool {
         if (sync.notified) {
             var new_sync = sync;
             new_sync.notified = false;
-            if (is_idle) 
+            if (is_idle)
                 new_sync.idle -= 1;
             if (sync.state == .signaled)
                 new_sync.state = .waking;
 
-            // Acquire barrier synchronizes with notify() 
-            // to ensure that pushes to run queue are observed after wait() returns. 
+            // Acquire barrier synchronizes with notify()
+            // to ensure that pushes to run queue are observed after wait() returns.
             sync = @bitCast(Sync, self.sync.tryCompareAndSwap(
                 @bitCast(u32, sync),
                 @bitCast(u32, new_sync),
@@ -206,12 +205,12 @@ noinline fn wait(self: *ThreadPool, _is_waking: bool) error{Shutdown}!bool {
                 return is_waking or (sync.state == .signaled);
             });
 
-        // No notification to consume.
-        // Mark this thread as idle before sleeping on the idle_event.
+            // No notification to consume.
+            // Mark this thread as idle before sleeping on the idle_event.
         } else if (!is_idle) {
             var new_sync = sync;
             new_sync.idle += 1;
-            if (is_waking) 
+            if (is_waking)
                 new_sync.state = .pending;
 
             sync = @bitCast(Sync, self.sync.tryCompareAndSwap(
@@ -225,8 +224,8 @@ noinline fn wait(self: *ThreadPool, _is_waking: bool) error{Shutdown}!bool {
                 continue;
             });
 
-        // Wait for a signal by either notify() or shutdown() without wasting cpu cycles.
-        // TODO: Add I/O polling here.
+            // Wait for a signal by either notify() or shutdown() without wasting cpu cycles.
+            // TODO: Add I/O polling here.
         } else {
             self.idle_event.wait();
             sync = @bitCast(Sync, self.sync.load(.Monotonic));
@@ -318,7 +317,7 @@ const Thread = struct {
     join_event: Event = .{},
     run_queue: Node.Queue = .{},
     run_buffer: Node.Buffer = .{},
-    
+
     threadlocal var current: ?*Thread = null;
 
     /// Thread entry point which runs a worker for the ThreadPool
@@ -334,7 +333,7 @@ const Thread = struct {
             is_waking = thread_pool.wait(is_waking) catch return;
 
             while (self.pop(thread_pool)) |result| {
-                if (result.pushed or is_waking) 
+                if (result.pushed or is_waking)
                     thread_pool.notify(is_waking);
                 is_waking = false;
 
@@ -354,7 +353,7 @@ const Thread = struct {
                 .pushed = false,
             };
         }
-        
+
         // Then check our local queue
         if (self.run_buffer.consume(&self.run_queue)) |stole| {
             return stole;
@@ -366,7 +365,7 @@ const Thread = struct {
         }
 
         // TODO: add optimistic I/O polling here
-        
+
         // Then try work stealing from other threads
         var num_threads: u32 = @bitCast(Sync, thread_pool.sync.load(.Monotonic)).spawned;
         while (num_threads > 0) : (num_threads -= 1) {
@@ -450,7 +449,7 @@ const Event = struct {
             //
             // Acquiring to WAITING will make the next notify() or shutdown() wake a sleeping futex thread
             // who will either exit on SHUTDOWN or acquire with WAITING again, ensuring all threads are awoken.
-            // This unfortunately results in the last notify() or shutdown() doing an extra futex wake but that's fine. 
+            // This unfortunately results in the last notify() or shutdown() doing an extra futex wake but that's fine.
             std.Thread.Futex.wait(&self.state, WAITING, null) catch unreachable;
             state = self.state.load(.Monotonic);
             acquire_with = WAITING;
@@ -527,7 +526,7 @@ const Node = struct {
             }
         }
 
-        fn tryAcquireConsumer(self: *Queue) error{Empty, Contended}!?*Node {
+        fn tryAcquireConsumer(self: *Queue) error{ Empty, Contended }!?*Node {
             var stack = self.stack.load(.Monotonic);
             while (true) {
                 if (stack & IS_CONSUMING != 0)
@@ -585,7 +584,7 @@ const Node = struct {
             stack = self.stack.swap(HAS_CACHE | IS_CONSUMING, .Acquire);
             assert(stack & IS_CONSUMING != 0);
             assert(stack & PTR_MASK != 0);
-            
+
             const node = @intToPtr(*Node, stack & PTR_MASK);
             consumer_ref.* = node.next;
             return node;
@@ -608,11 +607,11 @@ const Node = struct {
         fn push(noalias self: *Buffer, noalias list: *List) error{Overflow}!void {
             var head = self.head.load(.Monotonic);
             var tail = self.tail.loadUnchecked(); // we're the only thread that can change this
-            
+
             while (true) {
                 var size = tail -% head;
                 assert(size <= capacity);
-                
+
                 // Push nodes from the list to the buffer if it's not empty..
                 if (size < capacity) {
                     var nodes: ?*Node = list.head;
@@ -659,7 +658,7 @@ const Node = struct {
                     list.tail.next = null;
 
                     // Return the migrated nodes + the original list as overflowed
-                    list.head = first; 
+                    list.head = first;
                     return error.Overflow;
                 };
             }

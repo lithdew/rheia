@@ -843,7 +843,7 @@ test "stress insert" {
     defer testing.allocator.free(keys);
 
     for (keys) |*key| {
-        for (key) |*c| c.* = rng.random.intRangeAtMost(u8, 'A', 'z');
+        for (key) |*c| c.* = rng.random().intRangeAtMost(u8, 'A', 'z');
         key[32] = 0;
     }
 

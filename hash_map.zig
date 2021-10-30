@@ -564,7 +564,7 @@ test "StaticHashMap: put, get, delete, grow" {
         const keys = try testing.allocator.alloc(usize, 512);
         defer testing.allocator.free(keys);
 
-        for (keys) |*key| key.* = rng.random.int(usize);
+        for (keys) |*key| key.* = rng.random().int(usize);
 
         try testing.expectEqual(@as(u6, 55), map.shift);
 
@@ -594,7 +594,7 @@ test "HashMap: put, get, delete, grow" {
         const keys = try testing.allocator.alloc(usize, 512);
         defer testing.allocator.free(keys);
 
-        for (keys) |*key| key.* = rng.random.int(usize);
+        for (keys) |*key| key.* = rng.random().int(usize);
 
         var map = try AutoHashMap(usize, usize, 50).initCapacity(testing.allocator, 16);
         defer map.deinit(testing.allocator);
@@ -642,7 +642,7 @@ test "SortedHashMap: put, get, delete, grow" {
         const keys = try testing.allocator.alloc([32]u8, 512);
         defer testing.allocator.free(keys);
 
-        for (keys) |*key| rng.random.bytes(key);
+        for (keys) |*key| rng.random().bytes(key);
 
         var map = try SortedHashMap(usize, 50).initCapacity(testing.allocator, 16);
         defer map.deinit(testing.allocator);

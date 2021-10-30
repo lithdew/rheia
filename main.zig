@@ -2266,7 +2266,7 @@ pub fn Chain(comptime Store: type) type {
                 }
 
                 if (max_block_proposal) |block_proposal| {
-                    if (!mem.eql(u8, &preferred_block.id, &block_proposal.id) and ((self.sampler.stalled >= Sampler.default_beta and rng.random.boolean()) or block_proposal.num_transaction_ids > preferred_block.num_transaction_ids)) {
+                    if (!mem.eql(u8, &preferred_block.id, &block_proposal.id) and ((self.sampler.stalled >= Sampler.default_beta and rng.random().boolean()) or block_proposal.num_transaction_ids > preferred_block.num_transaction_ids)) {
                         log.debug("moved from block {} (height: {}, {} transaction(s)) to block {} (height: {}, {} transaction(s))", .{
                             fmt.fmtSliceHexLower(&preferred_block.id),
                             preferred_block.height,
