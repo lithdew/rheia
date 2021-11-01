@@ -3565,7 +3565,7 @@ pub const SqliteStore = struct {
     }
 
     fn getTransactionIdsByBlockHeight(gpa: *mem.Allocator, pooled: *PooledConnection, block_height: u64) ![]const [32]u8 {
-        pooled.get_transaction_by_id.reset();
+        pooled.get_transaction_ids_by_block_height.reset();
         return try pooled.get_transaction_ids_by_block_height.all([32]u8, gpa, .{}, .{ .block_height = block_height });
     }
 
