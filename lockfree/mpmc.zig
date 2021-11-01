@@ -25,7 +25,7 @@ pub fn Ring(comptime T: type, comptime capacity: comptime_int) type {
 
     const mask = capacity - 1;
 
-    return struct {
+    return extern struct {
         const Self = @This();
 
         prod_head: Atomic(u32) = .{ .value = 0 },

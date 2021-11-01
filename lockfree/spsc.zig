@@ -21,7 +21,7 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: comptime_int) type {
 
     const mask = capacity - 1;
 
-    return struct {
+    return extern struct {
         const Self = @This();
 
         buffer: *[capacity]T align(cache_line_length),
@@ -58,10 +58,10 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: comptime_int) type {
 }
 
 pub fn UnboundedQueue(comptime T: type) type {
-    return struct {
+    return extern struct {
         const Self = @This();
 
-        pub const Node = struct {
+        pub const Node = extern struct {
             next: ?*Self.Node,
             value: T,
         };

@@ -21,7 +21,7 @@ pub const cache_line_length = switch (builtin.cpu.arch) {
 pub fn UnboundedStack(comptime T: type, comptime next_field: meta.FieldEnum(T)) type {
     const next = meta.fieldInfo(T, next_field).name;
 
-    return struct {
+    return extern struct {
         const Self = @This();
 
         stack: ?*T align(cache_line_length) = null,
@@ -66,7 +66,7 @@ pub fn UnboundedStack(comptime T: type, comptime next_field: meta.FieldEnum(T)) 
 pub fn UnboundedQueue(comptime T: type, comptime next_field: meta.FieldEnum(T)) type {
     const next = meta.fieldInfo(T, next_field).name;
 
-    return struct {
+    return extern struct {
         const Self = @This();
 
         pub const Batch = struct {

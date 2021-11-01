@@ -224,6 +224,13 @@ pub const Stream = struct {
     }
 };
 
+pub const cache_line_length = switch (builtin.cpu.arch) {
+    .x86_64, .aarch64, .powerpc64 => 128,
+    .arm, .mips, .mips64, .riscv64 => 32,
+    .s390x => 256,
+    else => 64,
+};
+
 pub const Runtime = struct {
     pub const Syscall = struct {
         pub const Deque = DoublyLinkedDeque(Syscall, .next, .prev);
@@ -241,9 +248,11 @@ pub const Runtime = struct {
 
     pool: Pool,
 
-    event: os.fd_t,
-    event_count: u64,
-    event_armed: Atomic(u8),
+    event: extern struct {
+        fd: os.fd_t,
+        count: u64,
+        armed: Atomic(bool) align(cache_line_length),
+    },
 
     ring: os.linux.IO_Uring,
 
@@ -271,11 +280,13 @@ pub const Runtime = struct {
         self.pool = Pool.init(.{ .max_threads = 7 });
         errdefer self.pool.deinit();
 
-        self.event = try os.eventfd(0, os.O.CLOEXEC);
-        errdefer os.close(self.event);
+        self.event = .{
+            .fd = try os.eventfd(0, os.O.CLOEXEC),
+            .count = math.maxInt(u64),
+            .armed = .{ .value = false },
+        };
 
-        self.event_count = math.maxInt(u64);
-        self.event_armed = .{ .value = 0 };
+        errdefer os.close(self.event.fd);
 
         self.ring = try os.linux.IO_Uring.init(512, 0);
         errdefer self.ring.deinit();
@@ -293,7 +304,7 @@ pub const Runtime = struct {
         // defer log.debug("runtime freed", .{});
 
         self.ring.deinit();
-        os.close(self.event);
+        os.close(self.event.fd);
 
         self.pool.shutdown();
         self.pool.deinit();
@@ -315,10 +326,10 @@ pub const Runtime = struct {
     }
 
     pub fn notify(self: *Runtime) void {
-        if (self.event_armed.compareAndSwap(1, 0, .AcqRel, .Acquire) != null) {
+        if (self.event.armed.compareAndSwap(true, false, .AcqRel, .Acquire) != null) {
             return;
         }
-        const bytes_written = os.write(self.event, mem.asBytes(&@as(u64, 1))) catch 0;
+        const bytes_written = os.write(self.event.fd, mem.asBytes(&@as(u64, 1))) catch 0;
         assert(bytes_written == @sizeOf(u64));
     }
 
@@ -345,14 +356,14 @@ pub const Runtime = struct {
     }
 
     fn rearm(self: *Runtime) bool {
-        if (self.event_armed.load(.Acquire) != 0 or self.event_count == 0) {
+        if (self.event.armed.load(.Acquire) or self.event.count == 0) {
             return false;
         }
-        if ((self.ring.read(0, self.event, mem.asBytes(&self.event_count), 0) catch null) == null) {
+        if ((self.ring.read(0, self.event.fd, mem.asBytes(&self.event.count), 0) catch null) == null) {
             return true; // return true so that the next call to rearm will attempt to re-submit a read()
         }
-        self.event_count = 0;
-        self.event_armed.store(1, .Release);
+        self.event.count = 0;
+        self.event.armed.store(true, .Release);
         return true;
     }
 
