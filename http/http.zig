@@ -498,7 +498,7 @@ fn isComplete(buf_const: [*]const u8, buf_end: [*]const u8, last_len: usize) ![*
     }
 }
 
-inline fn parseInt(buf_const: [*]const u8, result: *usize, multiplier: u8) ![*]const u8 {
+inline fn parseInt(buf_const: [*]const u8, result: *usize, multiplier: usize) ![*]const u8 {
     var buf = buf_const;
     if (buf[0] < '0' or buf[0] > '9') {
         return error.UnexpectedCharacter;
