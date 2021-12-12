@@ -28,7 +28,7 @@ pub fn Listener(comptime Handler: type) type {
             return Self{ .handler = handler };
         }
 
-        pub fn serve(ctx: *Context, gpa: *mem.Allocator, net_listener: *net.Listener(Self), listener: tcp.Listener) !void {
+        pub fn serve(ctx: *Context, gpa: mem.Allocator, net_listener: *net.Listener(Self), listener: tcp.Listener) !void {
             const bind_address = try listener.getLocalAddress();
 
             log.info("listening for requests on: {}", .{bind_address});
@@ -37,7 +37,7 @@ pub fn Listener(comptime Handler: type) type {
             return net_listener.serve(ctx, gpa, listener);
         }
 
-        pub fn runReadLoop(self: *Self, ctx: *Context, gpa: *mem.Allocator, conn: *net.Listener(Self).Connection) !void {
+        pub fn runReadLoop(self: *Self, ctx: *Context, gpa: mem.Allocator, conn: *net.Listener(Self).Connection) !void {
             var buffer = std.fifo.LinearFifo(u8, .Dynamic).init(gpa);
             defer buffer.deinit();
 
@@ -137,7 +137,7 @@ pub fn Listener(comptime Handler: type) type {
             }
         }
 
-        pub fn runWriteLoop(self: *Self, ctx: *Context, gpa: *mem.Allocator, conn: *net.Listener(Self).Connection) !void {
+        pub fn runWriteLoop(self: *Self, ctx: *Context, gpa: mem.Allocator, conn: *net.Listener(Self).Connection) !void {
             _ = self;
             _ = gpa;
 

@@ -8,7 +8,7 @@ pub fn Art(comptime T: type) type {
     return struct {
         root: ?*Node,
         size: usize,
-        allocator: *std.mem.Allocator,
+        allocator: std.mem.Allocator,
 
         const Tree = @This();
         const max_prefix_len = 10;
@@ -99,7 +99,7 @@ pub fn Art(comptime T: type) type {
             };
         };
 
-        pub fn init(a: *std.mem.Allocator) Tree {
+        pub fn init(a: std.mem.Allocator) Tree {
             return .{ .root = null, .size = 0, .allocator = a };
         }
         pub fn deinit(t: *Tree) void {

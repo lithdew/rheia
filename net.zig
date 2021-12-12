@@ -177,7 +177,7 @@ pub const RPC = struct {
         header: Packet,
         body: []const u8,
 
-        pub fn deinit(self: RPC.Response, gpa: *mem.Allocator) void {
+        pub fn deinit(self: RPC.Response, gpa: mem.Allocator) void {
             gpa.free(self.body);
         }
     };
@@ -190,13 +190,13 @@ pub const RPC = struct {
     pending: DynamicRingBuffer(?*RPC.Entry, u32),
     request_parker: sync.Parker(void) = .{},
 
-    pub fn init(gpa: *mem.Allocator, capacity: usize) !RPC {
+    pub fn init(gpa: mem.Allocator, capacity: usize) !RPC {
         const pending = try DynamicRingBuffer(?*RPC.Entry, u32).initCapacity(gpa, capacity);
         mem.set(?*RPC.Entry, pending.entries, null);
         return RPC{ .pending = pending };
     }
 
-    pub fn deinit(self: *RPC, gpa: *mem.Allocator) void {
+    pub fn deinit(self: *RPC, gpa: mem.Allocator) void {
         self.pending.deinit(gpa);
     }
 
@@ -332,7 +332,7 @@ pub fn Client(comptime Protocol: type) type {
         write_parker: sync.Parker(void) = .{},
         writer_parker: sync.Parker(void) = .{},
 
-        pub fn init(gpa: *mem.Allocator, address: ip.Address) !Self {
+        pub fn init(gpa: mem.Allocator, address: ip.Address) !Self {
             return Self{
                 .address = address,
                 .buffer = std.ArrayList(u8).init(gpa),
@@ -345,7 +345,7 @@ pub fn Client(comptime Protocol: type) type {
             self.buffer.deinit();
         }
 
-        pub fn acquireWriter(self: *Self, ctx: *Context, gpa: *mem.Allocator) !std.ArrayList(u8).Writer {
+        pub fn acquireWriter(self: *Self, ctx: *Context, gpa: mem.Allocator) !std.ArrayList(u8).Writer {
             try self.ensureConnectionAvailable(ctx, gpa);
 
             while (self.buffer.items.len > 65536) {
@@ -363,7 +363,7 @@ pub fn Client(comptime Protocol: type) type {
             self.writer_parker.notify({});
         }
 
-        pub fn ensureConnectionAvailable(self: *Self, ctx: *Context, gpa: *mem.Allocator) !void {
+        pub fn ensureConnectionAvailable(self: *Self, ctx: *Context, gpa: mem.Allocator) !void {
             if (self.ctx.cancelled) return error.Closed;
 
             if (self.wg.len == 0 or (!self.breaker.hasFailuresReported() and self.buffer.items.len > 0 and self.wg.len < self.capacity)) {
@@ -380,7 +380,7 @@ pub fn Client(comptime Protocol: type) type {
             return try self.connect_parker.park(ctx);
         }
 
-        fn serveConnection(self: *Self, gpa: *mem.Allocator, conn: *Self.Connection) !void {
+        fn serveConnection(self: *Self, gpa: mem.Allocator, conn: *Self.Connection) !void {
             self.wg.add(1);
 
             defer {
@@ -480,7 +480,7 @@ pub fn Client(comptime Protocol: type) type {
             return client;
         }
 
-        fn closeConnection(self: *Self, gpa: *mem.Allocator, conn: *Self.Connection) void {
+        fn closeConnection(self: *Self, gpa: mem.Allocator, conn: *Self.Connection) void {
             gpa.destroy(conn);
             self.wg.sub(1);
         }
@@ -511,7 +511,7 @@ pub fn Listener(comptime Protocol: type) type {
             try self.wg.wait(ctx);
         }
 
-        pub fn serve(self: *Self, ctx: *Context, gpa: *mem.Allocator, listener: tcp.Listener) !void {
+        pub fn serve(self: *Self, ctx: *Context, gpa: mem.Allocator, listener: tcp.Listener) !void {
             var callback: struct {
                 state: Context.Callback = .{ .run = @This().run },
                 listener: tcp.Listener,
@@ -536,7 +536,7 @@ pub fn Listener(comptime Protocol: type) type {
             }
         }
 
-        fn acceptConnection(self: *Self, ctx: *Context, gpa: *mem.Allocator, listener: tcp.Listener) !void {
+        fn acceptConnection(self: *Self, ctx: *Context, gpa: mem.Allocator, listener: tcp.Listener) !void {
             const conn = tcp.Connection.from(try runtime.accept(ctx, listener.socket, .{ .close_on_exec = true }));
             errdefer conn.client.deinit();
 
@@ -550,12 +550,12 @@ pub fn Listener(comptime Protocol: type) type {
             frame.* = async self.serveConnection(ctx, gpa, conn);
         }
 
-        fn closeConnection(self: *Self, gpa: *mem.Allocator, frame: *@Frame(Self.serveConnection)) void {
+        fn closeConnection(self: *Self, gpa: mem.Allocator, frame: *@Frame(Self.serveConnection)) void {
             gpa.destroy(frame);
             self.wg.sub(1);
         }
 
-        fn serveConnection(self: *Self, ctx: *Context, gpa: *mem.Allocator, conn: tcp.Connection) !void {
+        fn serveConnection(self: *Self, ctx: *Context, gpa: mem.Allocator, conn: tcp.Connection) !void {
             self.wg.add(1);
 
             defer {

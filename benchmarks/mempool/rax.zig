@@ -25,7 +25,7 @@ pub const Node = packed struct {
     is_compressed: bool = false,
     size: u29,
 
-    pub fn init(gpa: *mem.Allocator, num_children: u29, holds_data: bool) !*Node {
+    pub fn init(gpa: mem.Allocator, num_children: u29, holds_data: bool) !*Node {
         var size: usize = mem.alignForward(@sizeOf(Node) + num_children, @alignOf(*c_void)) + @sizeOf(*Node) * num_children;
         if (holds_data) size += @sizeOf(Data);
 
@@ -34,7 +34,7 @@ pub const Node = packed struct {
         return node;
     }
 
-    pub fn initCompressed(gpa: *mem.Allocator, num_children: u29, holds_data: bool) !*Node {
+    pub fn initCompressed(gpa: mem.Allocator, num_children: u29, holds_data: bool) !*Node {
         var size: usize = mem.alignForward(@sizeOf(Node) + num_children, @alignOf(*c_void)) + @sizeOf(*Node);
         if (holds_data) size += @sizeOf(Data);
 
@@ -43,18 +43,18 @@ pub const Node = packed struct {
         return node;
     }
 
-    pub fn deinit(self: *Node, gpa: *mem.Allocator) void {
+    pub fn deinit(self: *Node, gpa: mem.Allocator) void {
         gpa.free(@ptrCast([*]u8, self)[0..self.length()]);
     }
 
-    pub fn deallocate(self: *Node, gpa: *mem.Allocator) void {
+    pub fn deallocate(self: *Node, gpa: mem.Allocator) void {
         for (self.children()) |child| {
             child.deallocate(gpa);
         }
         self.deinit(gpa);
     }
 
-    pub fn reallocForData(self: *Node, gpa: *mem.Allocator, value: ?Data) !*Node {
+    pub fn reallocForData(self: *Node, gpa: mem.Allocator, value: ?Data) !*Node {
         if (value == null) return self;
 
         assert(!self.is_key or self.is_null);
@@ -65,7 +65,7 @@ pub const Node = packed struct {
         return @ptrCast(*Node, bytes);
     }
 
-    pub fn addChild(self: *Node, gpa: *mem.Allocator, character: u8, child: **Node, parent_link: ***Node) !*Node {
+    pub fn addChild(self: *Node, gpa: mem.Allocator, character: u8, child: **Node, parent_link: ***Node) !*Node {
         assert(!self.is_compressed);
 
         const current_len = self.length();
@@ -124,7 +124,7 @@ pub const Node = packed struct {
         return new_node;
     }
 
-    pub fn removeChild(self: *Node, gpa: *mem.Allocator, child: *Node) *Node {
+    pub fn removeChild(self: *Node, gpa: mem.Allocator, child: *Node) *Node {
         if (self.is_compressed) {
             const parent_data = if (self.is_key and !self.is_null) self.data().* else null;
 
@@ -173,7 +173,7 @@ pub const Node = packed struct {
         return &self.children()[child_index];
     }
 
-    pub fn compress(self: *Node, gpa: *mem.Allocator, node_path: []const u8, child: **Node) !*Node {
+    pub fn compress(self: *Node, gpa: mem.Allocator, node_path: []const u8, child: **Node) !*Node {
         assert(self.size == 0 and !self.is_compressed);
 
         child.* = try Node.init(gpa, 0, false);
@@ -245,17 +245,17 @@ pub const Trie = struct {
     num_nodes: usize = 1,
     num_elements: usize = 0,
 
-    pub fn init(gpa: *mem.Allocator) !Trie {
+    pub fn init(gpa: mem.Allocator) !Trie {
         const head = try Node.init(gpa, 0, false);
         return Trie{ .head = head };
     }
 
-    pub fn deinit(self: *Trie, gpa: *mem.Allocator) void {
+    pub fn deinit(self: *Trie, gpa: mem.Allocator) void {
         self.deallocate(gpa, self.head);
         assert(self.num_nodes == 0);
     }
 
-    pub fn deallocate(self: *Trie, gpa: *mem.Allocator, node: *Node) void {
+    pub fn deallocate(self: *Trie, gpa: mem.Allocator, node: *Node) void {
         for (node.children()) |child| {
             self.deallocate(gpa, child);
         }
@@ -372,7 +372,7 @@ pub const Trie = struct {
         overwrite: bool = false,
     };
 
-    pub fn insert(self: *Trie, gpa: *mem.Allocator, key: []const u8, value: ?Data, params: InsertParams) !bool {
+    pub fn insert(self: *Trie, gpa: mem.Allocator, key: []const u8, value: ?Data, params: InsertParams) !bool {
         var head: *Node = undefined;
         var parent_link: **Node = undefined;
         var j: usize = 0;
@@ -586,7 +586,7 @@ pub const Trie = struct {
         return true;
     }
 
-    pub fn remove(self: *Trie, gpa: *mem.Allocator, key: []const u8, old: ?*?Data) !bool {
+    pub fn remove(self: *Trie, gpa: mem.Allocator, key: []const u8, old: ?*?Data) !bool {
         var stack = Stack.init(gpa);
         defer stack.deinit();
 
@@ -711,10 +711,10 @@ pub const Trie = struct {
 
 pub const Stack = struct {
     // sfa: heap.StackFallbackAllocator(32),
-    gpa: *mem.Allocator,
+    gpa: mem.Allocator,
     entries: std.ArrayListUnmanaged(*Node) = .{},
 
-    pub fn init(gpa: *mem.Allocator) Stack {
+    pub fn init(gpa: mem.Allocator) Stack {
         // return Stack{ .sfa = heap.stackFallback(32, gpa) };
         return Stack{ .gpa = gpa };
     }

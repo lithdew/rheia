@@ -28,12 +28,12 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: comptime_int) type {
         head: usize align(cache_line_length),
         tail: usize align(cache_line_length),
 
-        pub fn init(gpa: *mem.Allocator) !Self {
+        pub fn init(gpa: mem.Allocator) !Self {
             const buffer = try gpa.create([capacity]T);
             return Self{ .buffer = buffer, .head = 0, .tail = 0 };
         }
 
-        pub fn deinit(self: *Self, gpa: *mem.Allocator) void {
+        pub fn deinit(self: *Self, gpa: mem.Allocator) void {
             gpa.destroy(self.buffer);
         }
 
@@ -71,7 +71,7 @@ pub fn UnboundedQueue(comptime T: type) type {
         first_: *Self.Node,
         tail_copy_: *Self.Node,
 
-        pub fn init(gpa: *mem.Allocator) !Self {
+        pub fn init(gpa: mem.Allocator) !Self {
             const node = try gpa.create(Self.Node);
             node.next = null;
 
@@ -84,7 +84,7 @@ pub fn UnboundedQueue(comptime T: type) type {
             return self;
         }
 
-        pub fn deinit(self: *Self, gpa: *mem.Allocator) void {
+        pub fn deinit(self: *Self, gpa: mem.Allocator) void {
             var it: ?*Self.Node = self.first_;
             while (it) |node| {
                 it = node.next;
@@ -92,7 +92,7 @@ pub fn UnboundedQueue(comptime T: type) type {
             }
         }
 
-        pub fn push(self: *Self, gpa: *mem.Allocator, value: T) !void {
+        pub fn push(self: *Self, gpa: mem.Allocator, value: T) !void {
             const node = try self.createNode(gpa);
             node.* = .{ .next = null, .value = value };
 
@@ -116,7 +116,7 @@ pub fn UnboundedQueue(comptime T: type) type {
             return null;
         }
 
-        fn createNode(self: *Self, gpa: *mem.Allocator) !*Self.Node {
+        fn createNode(self: *Self, gpa: mem.Allocator) !*Self.Node {
             if (self.first_ != self.tail_copy_) {
                 const node = self.first_;
                 self.first_ = self.first_.next.?;
@@ -220,7 +220,7 @@ test "spsc/unboundeded_queue: fifo behavior" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
     const Context = struct {
-        gpa: *mem.Allocator,
+        gpa: mem.Allocator,
         queue: *spsc.UnboundedQueue(usize),
 
         pub fn runProducer(self: @This()) !void {

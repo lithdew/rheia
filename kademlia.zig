@@ -97,11 +97,11 @@ pub const NodeFinder = struct {
     visited: SortedHashMap(void, 50),
     pool: sync.BoundedTaskPool(visit) = .{ .capacity = 16 },
 
-    pub fn init(gpa: *mem.Allocator, node: *rheia.Node) !NodeFinder {
+    pub fn init(gpa: mem.Allocator, node: *rheia.Node) !NodeFinder {
         return NodeFinder{ .node = node, .visited = try SortedHashMap(void, 50).initCapacity(gpa, 16) };
     }
 
-    pub fn deinit(self: *NodeFinder, ctx: *Context, gpa: *mem.Allocator) void {
+    pub fn deinit(self: *NodeFinder, ctx: *Context, gpa: mem.Allocator) void {
         self.pool.deinit(ctx, gpa) catch |err| log.warn("error while shutting down: {}", .{err});
         self.visited.deinit(gpa);
     }
@@ -109,7 +109,7 @@ pub const NodeFinder = struct {
     pub fn find(
         self: *NodeFinder,
         ctx: *Context,
-        gpa: *mem.Allocator,
+        gpa: mem.Allocator,
         dst: []ID,
         public_key: [32]u8,
     ) !usize {
@@ -134,7 +134,7 @@ pub const NodeFinder = struct {
     pub fn visit(
         self: *NodeFinder,
         ctx: *Context,
-        gpa: *mem.Allocator,
+        gpa: mem.Allocator,
         wg: *sync.WaitGroup,
         dst: []ID,
         count: *usize,

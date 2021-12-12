@@ -45,7 +45,7 @@ pub fn build(comptime Handler: type, routes: anytype) type {
     }
 
     return struct {
-        pub fn handleHttpRequest(handler: Handler, ctx: *Context, gpa: *mem.Allocator, request: http.Request, reader: anytype, writer: anytype) !void {
+        pub fn handleHttpRequest(handler: Handler, ctx: *Context, gpa: mem.Allocator, request: http.Request, reader: anytype, writer: anytype) !void {
             const method = http.Method.from(request.method);
             if (method == .unknown) {
                 return error.UnknownMethod;

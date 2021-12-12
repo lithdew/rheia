@@ -29,12 +29,12 @@ pub fn DynamicRingBuffer(comptime T: type, comptime Counter: type) type {
 
         pub usingnamespace Mixin(Self, T, Counter);
 
-        pub fn initCapacity(gpa: *mem.Allocator, capacity: usize) !Self {
+        pub fn initCapacity(gpa: mem.Allocator, capacity: usize) !Self {
             assert(math.isPowerOfTwo(capacity));
             return Self{ .entries = try gpa.alloc(T, capacity) };
         }
 
-        pub fn deinit(self: *Self, gpa: *mem.Allocator) void {
+        pub fn deinit(self: *Self, gpa: mem.Allocator) void {
             gpa.free(self.entries);
         }
     };

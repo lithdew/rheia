@@ -37,7 +37,7 @@ pub fn SkipList(comptime T: type) type {
 
         rng: std.rand.DefaultPrng = std.rand.DefaultPrng.init(0),
 
-        pub fn deinit(self: *Self, gpa: *mem.Allocator) void {
+        pub fn deinit(self: *Self, gpa: mem.Allocator) void {
             var it = self.start_levels[0];
             while (it) |node| {
                 it = node.next[0];
@@ -98,7 +98,7 @@ pub fn SkipList(comptime T: type) type {
             }
         }
 
-        pub fn insert(self: *Self, gpa: *mem.Allocator, value: T) !void {
+        pub fn insert(self: *Self, gpa: mem.Allocator, value: T) !void {
             const element = try gpa.create(Element);
             errdefer gpa.destroy(element);
 

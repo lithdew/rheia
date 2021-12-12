@@ -109,7 +109,7 @@ pub fn waitForSignal(ctx: *Context, codes: anytype) !void {
     if (num_bytes < @sizeOf(os.linux.signalfd_siginfo)) return error.ShortRead;
 }
 
-pub fn getAllocator() *mem.Allocator {
+pub fn getAllocator() mem.Allocator {
     return instance.gpa;
 }
 
@@ -244,7 +244,7 @@ pub const Runtime = struct {
     const log = std.log.scoped(.runtime);
 
     gpa_instance: heap.GeneralPurposeAllocator(.{}),
-    gpa: *mem.Allocator,
+    gpa: mem.Allocator,
 
     pool: Pool,
 

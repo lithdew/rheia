@@ -26,7 +26,7 @@ const std = @import("std");
 /// - `Spec` is the configuration of the arguments.
 /// - `allocator` is the allocator that is used to allocate all required memory
 /// - `error_handling` defines how parser errors will be handled.
-pub fn parseForCurrentProcess(comptime Spec: type, allocator: *std.mem.Allocator, error_handling: ErrorHandling) !ParseArgsResult(Spec) {
+pub fn parseForCurrentProcess(comptime Spec: type, allocator: std.mem.Allocator, error_handling: ErrorHandling) !ParseArgsResult(Spec) {
     var args = std.process.args();
 
     const executable_name = try (args.next(allocator) orelse {
@@ -54,7 +54,7 @@ pub fn parseForCurrentProcess(comptime Spec: type, allocator: *std.mem.Allocator
 /// - `error_handling` defines how parser errors will be handled.
 ///
 /// Note that `.executable_name` in the result will not be set!
-pub fn parse(comptime Spec: type, args: *std.process.ArgIterator, allocator: *std.mem.Allocator, error_handling: ErrorHandling) !ParseArgsResult(Spec) {
+pub fn parse(comptime Spec: type, args: *std.process.ArgIterator, allocator: std.mem.Allocator, error_handling: ErrorHandling) !ParseArgsResult(Spec) {
     var result = ParseArgsResult(Spec){
         .arena = std.heap.ArenaAllocator.init(allocator),
         .options = Spec{},
@@ -68,7 +68,7 @@ pub fn parse(comptime Spec: type, args: *std.process.ArgIterator, allocator: *st
 
     var last_error: ?anyerror = null;
 
-    while (args.next(&result.arena.allocator)) |item_or_error| {
+    while (args.next(result.arena.allocator())) |item_or_error| {
         const item = try item_or_error;
 
         if (std.mem.startsWith(u8, item, "--")) {
@@ -163,7 +163,7 @@ pub fn parse(comptime Spec: type, args: *std.process.ArgIterator, allocator: *st
 
     // This will consume the rest of the arguments as positional ones.
     // Only executes when the above loop is broken.
-    while (args.next(&result.arena.allocator)) |item_or_error| {
+    while (args.next(result.arena.allocator())) |item_or_error| {
         const item = try item_or_error;
         try arglist.append(item);
     }
@@ -345,7 +345,7 @@ fn parseOption(
         val // use the literal value
     else if (requiresArg(field_type))
         // fetch from parser
-        try (args.next(&result.arena.allocator) orelse {
+        try (args.next(result.arena.allocator()) orelse {
             last_error.* = error.MissingArgument;
             try error_handling.process(error.MissingArgument, Error{
                 .option = "--" ++ name,
@@ -376,7 +376,7 @@ pub const ErrorCollection = struct {
     arena: std.heap.ArenaAllocator,
     list: std.ArrayList(Error),
 
-    pub fn init(allocator: *std.mem.Allocator) Self {
+    pub fn init(allocator: std.mem.Allocator) Self {
         return Self{
             .arena = std.heap.ArenaAllocator.init(allocator),
             .list = std.ArrayList(Error).init(allocator),
@@ -397,10 +397,10 @@ pub const ErrorCollection = struct {
     /// Appends an error to the collection
     fn insert(self: *Self, err: Error) !void {
         var dupe = Error{
-            .option = try self.arena.allocator.dupe(u8, err.option),
+            .option = try self.arena.allocator().dupe(u8, err.option),
             .kind = switch (err.kind) {
                 .invalid_value => |v| Error.Kind{
-                    .invalid_value = try self.arena.allocator.dupe(u8, v),
+                    .invalid_value = try self.arena.allocator().dupe(u8, v),
                 },
                 // flat copy
                 .unknown,

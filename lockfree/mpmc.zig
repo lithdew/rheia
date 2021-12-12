@@ -36,11 +36,11 @@ pub fn Ring(comptime T: type, comptime capacity: comptime_int) type {
 
         entries: *[capacity]T align(cache_line_length),
 
-        pub fn init(gpa: *mem.Allocator) !Self {
+        pub fn init(gpa: mem.Allocator) !Self {
             return Self{ .entries = try gpa.create([capacity]T) };
         }
 
-        pub fn deinit(self: *Self, gpa: *mem.Allocator) void {
+        pub fn deinit(self: *Self, gpa: mem.Allocator) void {
             gpa.destroy(self.entries);
         }
 

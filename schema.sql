@@ -16,5 +16,9 @@ create table if not exists transactions (
     data text
 ) without rowid;
 
+create table if not exists whitelist (
+    public_key blob primary key
+) without rowid;
+
 create unique index if not exists blocks_by_height on blocks(height);
 create index if not exists transactions_by_block_height on transactions(block_height);

@@ -28,7 +28,7 @@ pub fn Tree(comptime V: type) type {
         pub fn RemoveChildMixin(comptime N: type) type {
             return if (N.num_keys == 0 and N.num_children == 256)
                 struct {
-                    pub fn removeChild(self: *N, gpa: *mem.Allocator, ref: *usize, character: u8) void {
+                    pub fn removeChild(self: *N, gpa: mem.Allocator, ref: *usize, character: u8) void {
                         self.children[character] = 0;
                         self.metadata.num_children -= 1;
 
@@ -56,7 +56,7 @@ pub fn Tree(comptime V: type) type {
                 }
             else if (N.num_keys == 256 and N.num_children == 48)
                 struct {
-                    pub fn removeChild(self: *N, gpa: *mem.Allocator, ref: *usize, character: u8) void {
+                    pub fn removeChild(self: *N, gpa: mem.Allocator, ref: *usize, character: u8) void {
                         self.children[self.keys[character] - 1] = 0;
                         self.keys[character] = 0;
 
@@ -87,7 +87,7 @@ pub fn Tree(comptime V: type) type {
                 }
             else if (N.num_keys == 16 and N.num_children == 16)
                 struct {
-                    pub fn removeChild(self: *N, gpa: *mem.Allocator, ref: *usize, leaf: *usize) void {
+                    pub fn removeChild(self: *N, gpa: mem.Allocator, ref: *usize, leaf: *usize) void {
                         const pos = (@ptrToInt(leaf) - @ptrToInt(&self.children)) / @sizeOf(usize);
                         mem.copy(u8, self.keys[pos..], self.keys[pos + 1 ..][0 .. self.metadata.num_children - 1 - pos]);
                         mem.copy(usize, self.children[pos..], self.children[pos + 1 ..][0 .. self.metadata.num_children - 1 - pos]);
@@ -111,7 +111,7 @@ pub fn Tree(comptime V: type) type {
                 }
             else if (N.num_keys == 4 and N.num_children == 4)
                 struct {
-                    pub fn removeChild(self: *N, gpa: *mem.Allocator, ref: *usize, leaf: *usize) void {
+                    pub fn removeChild(self: *N, gpa: mem.Allocator, ref: *usize, leaf: *usize) void {
                         const pos = (@ptrToInt(leaf) - @ptrToInt(&self.children)) / @sizeOf(usize);
                         mem.copy(u8, self.keys[pos..], self.keys[pos + 1 ..][0 .. self.metadata.num_children - 1 - pos]);
                         mem.copy(usize, self.children[pos..], self.children[pos + 1 ..][0 .. self.metadata.num_children - 1 - pos]);
@@ -147,7 +147,7 @@ pub fn Tree(comptime V: type) type {
         pub fn AddChildMixin(comptime N: type) type {
             return if (N.num_keys == 0 and N.num_children == 256)
                 struct {
-                    pub fn addChild(self: *N, gpa: *mem.Allocator, ref: *usize, character: u8, child: usize) !void {
+                    pub fn addChild(self: *N, gpa: mem.Allocator, ref: *usize, character: u8, child: usize) !void {
                         _ = gpa;
                         _ = ref;
                         self.children[character] = child;
@@ -156,7 +156,7 @@ pub fn Tree(comptime V: type) type {
                 }
             else if (N.num_keys == 256 and N.num_children == 48)
                 struct {
-                    pub fn addChild(self: *N, gpa: *mem.Allocator, ref: *usize, character: u8, child: usize) !void {
+                    pub fn addChild(self: *N, gpa: mem.Allocator, ref: *usize, character: u8, child: usize) !void {
                         if (self.metadata.num_children < self.children.len) {
                             const pos = @intCast(u8, mem.indexOfScalar(usize, &self.children, 0).?);
                             self.children[pos] = child;
@@ -186,7 +186,7 @@ pub fn Tree(comptime V: type) type {
                 }
             else if (N.num_keys == 16 and N.num_children == 16)
                 struct {
-                    pub fn addChild(self: *N, gpa: *mem.Allocator, ref: *usize, character: u8, child: usize) !void {
+                    pub fn addChild(self: *N, gpa: mem.Allocator, ref: *usize, character: u8, child: usize) !void {
                         if (self.metadata.num_children < self.children.len) {
                             const cmp = @splat(16, character) < @as(Vector(16, u8), self.keys);
                             const mask = (@as(u17, 1) << @intCast(u5, self.metadata.num_children)) - 1;
@@ -230,7 +230,7 @@ pub fn Tree(comptime V: type) type {
                 }
             else if (N.num_keys == 4 and N.num_children == 4)
                 struct {
-                    pub fn addChild(self: *N, gpa: *mem.Allocator, ref: *usize, character: u8, child: usize) !void {
+                    pub fn addChild(self: *N, gpa: mem.Allocator, ref: *usize, character: u8, child: usize) !void {
                         if (self.metadata.num_children < self.children.len) {
                             const idx = for (self.keys[0..self.metadata.num_children]) |key, i| {
                                 if (character < key) break i;
@@ -286,7 +286,7 @@ pub fn Tree(comptime V: type) type {
             num_children: u9 = 0,
             partial: [max_prefix_len]u8 = undefined,
 
-            pub fn init(gpa: *mem.Allocator, node_type: NodeType) !*Metadata {
+            pub fn init(gpa: mem.Allocator, node_type: NodeType) !*Metadata {
                 switch (node_type) {
                     .node_4 => {
                         const node = try gpa.create(Node4);
@@ -311,7 +311,7 @@ pub fn Tree(comptime V: type) type {
                 }
             }
 
-            pub fn deinit(self: *Metadata, gpa: *mem.Allocator) void {
+            pub fn deinit(self: *Metadata, gpa: mem.Allocator) void {
                 @setEvalBranchQuota(10_000);
 
                 switch (self.node_type) {
@@ -372,7 +372,7 @@ pub fn Tree(comptime V: type) type {
                 }
             }
 
-            pub fn addChild(self: *Metadata, gpa: *mem.Allocator, ref: *usize, character: u8, child: usize) !void {
+            pub fn addChild(self: *Metadata, gpa: mem.Allocator, ref: *usize, character: u8, child: usize) !void {
                 return switch (self.node_type) {
                     .node_4 => @fieldParentPtr(Node4, "metadata", self).addChild(gpa, ref, character, child),
                     .node_16 => @fieldParentPtr(Node16, "metadata", self).addChild(gpa, ref, character, child),
@@ -381,7 +381,7 @@ pub fn Tree(comptime V: type) type {
                 };
             }
 
-            pub fn removeChild(self: *Metadata, gpa: *mem.Allocator, ref: *usize, character: u8, leaf: *usize) void {
+            pub fn removeChild(self: *Metadata, gpa: mem.Allocator, ref: *usize, character: u8, leaf: *usize) void {
                 return switch (self.node_type) {
                     .node_4 => @fieldParentPtr(Node4, "metadata", self).removeChild(gpa, ref, leaf),
                     .node_16 => @fieldParentPtr(Node16, "metadata", self).removeChild(gpa, ref, leaf),
@@ -513,7 +513,7 @@ pub fn Tree(comptime V: type) type {
                 }
             }
 
-            pub fn delete(self: usize, gpa: *mem.Allocator, ref: *usize, key: []const u8, depth_const: usize) ?*Leaf {
+            pub fn delete(self: usize, gpa: mem.Allocator, ref: *usize, key: []const u8, depth_const: usize) ?*Leaf {
                 if (self == 0) {
                     return null;
                 }
@@ -549,7 +549,7 @@ pub fn Tree(comptime V: type) type {
                 return Metadata.delete(child.*, gpa, child, key, depth + 1);
             }
 
-            pub fn insert(self: usize, gpa: *mem.Allocator, ref: *usize, key: []const u8, value: V, depth: usize, old: *bool, replace: bool) !if (V == void) V else ?V {
+            pub fn insert(self: usize, gpa: mem.Allocator, ref: *usize, key: []const u8, value: V, depth: usize, old: *bool, replace: bool) !if (V == void) V else ?V {
                 if (self == 0) {
                     const leaf_node = try Leaf.init(gpa, key, value);
                     ref.* = @ptrToInt(leaf_node) | 1;
@@ -624,7 +624,7 @@ pub fn Tree(comptime V: type) type {
                 return node.insertRecursiveSearch(gpa, ref, key, value, depth, old, replace);
             }
 
-            fn insertRecursiveSearch(self: *Metadata, gpa: *mem.Allocator, ref: *usize, key: []const u8, value: V, depth: usize, old: *bool, replace: bool) anyerror!if (V == void) V else ?V {
+            fn insertRecursiveSearch(self: *Metadata, gpa: mem.Allocator, ref: *usize, key: []const u8, value: V, depth: usize, old: *bool, replace: bool) anyerror!if (V == void) V else ?V {
                 if (self.findChild(keyAt(key, depth))) |child| {
                     return Metadata.insert(child.*, gpa, child, key, value, depth + 1, old, replace);
                 }
@@ -642,7 +642,7 @@ pub fn Tree(comptime V: type) type {
             value: V,
             key_len: u32,
 
-            pub fn init(gpa: *mem.Allocator, key: []const u8, value: V) !*Leaf {
+            pub fn init(gpa: mem.Allocator, key: []const u8, value: V) !*Leaf {
                 const bytes = try gpa.allocAdvanced(u8, @alignOf(Leaf), @sizeOf(Leaf) + key.len, .exact);
                 mem.copy(u8, bytes[@sizeOf(Leaf)..], key);
 
@@ -659,7 +659,7 @@ pub fn Tree(comptime V: type) type {
                 return null;
             }
 
-            pub fn deinit(self: *Leaf, gpa: *mem.Allocator) void {
+            pub fn deinit(self: *Leaf, gpa: mem.Allocator) void {
                 const bytes = @ptrCast([*]u8, self)[0 .. @sizeOf(Leaf) + self.key_len];
                 return gpa.free(bytes);
             }
@@ -679,7 +679,7 @@ pub fn Tree(comptime V: type) type {
         root: usize = 0,
         size: u64 = 0,
 
-        pub fn deinit(self: *const Self, gpa: *mem.Allocator) void {
+        pub fn deinit(self: *const Self, gpa: mem.Allocator) void {
             if (self.root == 0) return;
             if (Leaf.from(self.root)) |leaf_node| return leaf_node.deinit(gpa);
             return @intToPtr(*Metadata, self.root).deinit(gpa);
@@ -723,14 +723,14 @@ pub fn Tree(comptime V: type) type {
             return null;
         }
 
-        pub fn insert(self: *Self, gpa: *mem.Allocator, key: []const u8, value: V) !if (V == void) V else ?V {
+        pub fn insert(self: *Self, gpa: mem.Allocator, key: []const u8, value: V) !if (V == void) V else ?V {
             var is_old = false;
             const old = try Metadata.insert(self.root, gpa, &self.root, key, value, 0, &is_old, true);
             if (!is_old) self.size += 1;
             return old;
         }
 
-        pub fn delete(self: *Self, gpa: *mem.Allocator, key: []const u8) if (V == void) V else ?V {
+        pub fn delete(self: *Self, gpa: mem.Allocator, key: []const u8) if (V == void) V else ?V {
             if (Metadata.delete(self.root, gpa, &self.root, key, 0)) |leaf_node| {
                 self.size -= 1;
                 const value = leaf_node.value;

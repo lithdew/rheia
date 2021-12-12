@@ -46,7 +46,7 @@ pub fn HashMap(
         get_probe_count: usize = 0,
         del_probe_count: usize = 0,
 
-        pub fn initCapacity(gpa: *mem.Allocator, capacity: u64) !Self {
+        pub fn initCapacity(gpa: mem.Allocator, capacity: u64) !Self {
             assert(math.isPowerOfTwo(capacity));
 
             const shift = 63 - math.log2_int(u64, capacity) + 1;
@@ -72,7 +72,7 @@ pub fn HashMap(
             };
         }
 
-        pub fn deinit(self: *Self, gpa: *mem.Allocator) void {
+        pub fn deinit(self: *Self, gpa: mem.Allocator) void {
             const capacity = @as(u64, 1) << (63 - self.shift + 1);
             const overflow = capacity / 10 + (63 - @as(usize, self.shift) + 1) << 1;
             gpa.free(self.entries[0..@intCast(usize, capacity + overflow)]);
@@ -332,7 +332,7 @@ pub fn IntrusiveHashMap(
         get_probe_count: usize = 0,
         del_probe_count: usize = 0,
 
-        pub fn initCapacity(gpa: *mem.Allocator, capacity: u64) !Self {
+        pub fn initCapacity(gpa: mem.Allocator, capacity: u64) !Self {
             assert(math.isPowerOfTwo(capacity));
 
             const shift = 63 - math.log2_int(u64, capacity) + 1;
@@ -347,7 +347,7 @@ pub fn IntrusiveHashMap(
             };
         }
 
-        pub fn deinit(self: *Self, gpa: *mem.Allocator) void {
+        pub fn deinit(self: *Self, gpa: mem.Allocator) void {
             gpa.free(self.slice());
         }
 

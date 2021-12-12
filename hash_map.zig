@@ -124,7 +124,7 @@ pub fn HashMap(comptime K: type, comptime V: type, comptime Context: type, compt
 
         pub usingnamespace HashMapMixin(Self, K, V, Context);
 
-        pub fn initCapacity(gpa: *mem.Allocator, capacity: u64) !Self {
+        pub fn initCapacity(gpa: mem.Allocator, capacity: u64) !Self {
             assert(math.isPowerOfTwo(capacity));
 
             const shift = 63 - math.log2_int(u64, capacity) + 1;
@@ -139,15 +139,15 @@ pub fn HashMap(comptime K: type, comptime V: type, comptime Context: type, compt
             };
         }
 
-        pub fn deinit(self: *Self, gpa: *mem.Allocator) void {
+        pub fn deinit(self: *Self, gpa: mem.Allocator) void {
             gpa.free(self.slice());
         }
 
-        pub fn ensureUnusedCapacity(self: *Self, gpa: *mem.Allocator, count: usize) !void {
+        pub fn ensureUnusedCapacity(self: *Self, gpa: mem.Allocator, count: usize) !void {
             try self.ensureTotalCapacity(gpa, self.len + count);
         }
 
-        pub fn ensureTotalCapacity(self: *Self, gpa: *mem.Allocator, count: usize) !void {
+        pub fn ensureTotalCapacity(self: *Self, gpa: mem.Allocator, count: usize) !void {
             while (true) {
                 const capacity = @as(u64, 1) << (63 - self.shift + 1);
                 if (count <= capacity * max_load_percentage / 100) {
@@ -157,7 +157,7 @@ pub fn HashMap(comptime K: type, comptime V: type, comptime Context: type, compt
             }
         }
 
-        fn grow(self: *Self, gpa: *mem.Allocator) !void {
+        fn grow(self: *Self, gpa: mem.Allocator) !void {
             const capacity = @as(u64, 1) << (63 - self.shift + 1);
             const overflow = capacity / 10 + (63 - @as(usize, self.shift) + 1) << 1;
             const end = self.entries + @intCast(usize, capacity + overflow);
@@ -184,20 +184,20 @@ pub fn HashMap(comptime K: type, comptime V: type, comptime Context: type, compt
             self.shift = map.shift;
         }
 
-        pub fn put(self: *Self, gpa: *mem.Allocator, key: K, value: V) !void {
+        pub fn put(self: *Self, gpa: mem.Allocator, key: K, value: V) !void {
             try self.putContext(gpa, key, value, undefined);
         }
 
-        pub fn putContext(self: *Self, gpa: *mem.Allocator, key: K, value: V, ctx: Context) !void {
+        pub fn putContext(self: *Self, gpa: mem.Allocator, key: K, value: V, ctx: Context) !void {
             try self.ensureUnusedCapacity(gpa, 1);
             self.putAssumeCapacityContext(key, value, ctx);
         }
 
-        pub fn getOrPut(self: *Self, gpa: *mem.Allocator, key: K) !GetOrPutResult {
+        pub fn getOrPut(self: *Self, gpa: mem.Allocator, key: K) !GetOrPutResult {
             return try self.getOrPutContext(gpa, key, undefined);
         }
 
-        pub fn getOrPutContext(self: *Self, gpa: *mem.Allocator, key: K, ctx: Context) !GetOrPutResult {
+        pub fn getOrPutContext(self: *Self, gpa: mem.Allocator, key: K, ctx: Context) !GetOrPutResult {
             try self.ensureUnusedCapacity(gpa, 1);
             return self.getOrPutAssumeCapacityContext(key, ctx);
         }
@@ -350,11 +350,11 @@ pub fn SortedHashMap(comptime V: type, comptime max_load_percentage: comptime_in
         get_probe_count: usize = 0,
         del_probe_count: usize = 0,
 
-        pub fn init(gpa: *mem.Allocator) !Self {
+        pub fn init(gpa: mem.Allocator) !Self {
             return Self.initCapacity(gpa, 16);
         }
 
-        pub fn initCapacity(gpa: *mem.Allocator, capacity: u64) !Self {
+        pub fn initCapacity(gpa: mem.Allocator, capacity: u64) !Self {
             assert(math.isPowerOfTwo(capacity));
 
             const shift = 63 - math.log2_int(u64, capacity) + 1;
@@ -369,7 +369,7 @@ pub fn SortedHashMap(comptime V: type, comptime max_load_percentage: comptime_in
             };
         }
 
-        pub fn deinit(self: *Self, gpa: *mem.Allocator) void {
+        pub fn deinit(self: *Self, gpa: mem.Allocator) void {
             gpa.free(self.slice());
         }
 
@@ -416,11 +416,11 @@ pub fn SortedHashMap(comptime V: type, comptime max_load_percentage: comptime_in
             return self.entries[0..@intCast(usize, capacity + overflow)];
         }
 
-        pub fn ensureUnusedCapacity(self: *Self, gpa: *mem.Allocator, count: usize) !void {
+        pub fn ensureUnusedCapacity(self: *Self, gpa: mem.Allocator, count: usize) !void {
             try self.ensureTotalCapacity(gpa, self.len + count);
         }
 
-        pub fn ensureTotalCapacity(self: *Self, gpa: *mem.Allocator, count: usize) !void {
+        pub fn ensureTotalCapacity(self: *Self, gpa: mem.Allocator, count: usize) !void {
             while (true) {
                 const capacity = @as(u64, 1) << (63 - self.shift + 1);
                 if (count <= capacity * max_load_percentage / 100) {
@@ -430,7 +430,7 @@ pub fn SortedHashMap(comptime V: type, comptime max_load_percentage: comptime_in
             }
         }
 
-        fn grow(self: *Self, gpa: *mem.Allocator) !void {
+        fn grow(self: *Self, gpa: mem.Allocator) !void {
             const capacity = @as(u64, 1) << (63 - self.shift + 1);
             const overflow = capacity / 10 + (63 - @as(usize, self.shift) + 1) << 1;
             const end = self.entries + @intCast(usize, capacity + overflow);
@@ -457,7 +457,7 @@ pub fn SortedHashMap(comptime V: type, comptime max_load_percentage: comptime_in
             self.shift = map.shift;
         }
 
-        pub fn put(self: *Self, gpa: *mem.Allocator, key: [32]u8, value: V) !void {
+        pub fn put(self: *Self, gpa: mem.Allocator, key: [32]u8, value: V) !void {
             try self.ensureUnusedCapacity(gpa, 1);
             self.putAssumeCapacity(key, value);
         }
@@ -472,7 +472,7 @@ pub fn SortedHashMap(comptime V: type, comptime max_load_percentage: comptime_in
             found_existing: bool,
         };
 
-        pub fn getOrPut(self: *Self, gpa: *mem.Allocator, key: [32]u8) !GetOrPutResult {
+        pub fn getOrPut(self: *Self, gpa: mem.Allocator, key: [32]u8) !GetOrPutResult {
             try self.ensureUnusedCapacity(gpa, 1);
             return self.getOrPutAssumeCapacity(key);
         }

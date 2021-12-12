@@ -23,7 +23,7 @@ pub fn BoundedTaskPool(comptime F: anytype) type {
         pub const Metadata = struct {
             next: ?*Metadata = null,
 
-            pub fn create(gpa: *mem.Allocator) !*Metadata {
+            pub fn create(gpa: mem.Allocator) !*Metadata {
                 const bytes = try gpa.alignedAlloc(
                     u8,
                     math.max(@alignOf(Metadata), @alignOf(anyframe)),
@@ -33,7 +33,7 @@ pub fn BoundedTaskPool(comptime F: anytype) type {
                 return @ptrCast(*Metadata, bytes.ptr);
             }
 
-            pub fn deinit(self: *Metadata, gpa: *mem.Allocator) void {
+            pub fn deinit(self: *Metadata, gpa: mem.Allocator) void {
                 const bytes = @ptrCast([*]u8, self)[0 .. @sizeOf(Metadata) + @frameSize(Self.run)];
                 gpa.free(bytes);
             }
@@ -51,7 +51,7 @@ pub fn BoundedTaskPool(comptime F: anytype) type {
         parker: Parker(void) = .{},
         free_list: SinglyLinkedList(Metadata, .next) = .{},
 
-        pub fn deinit(self: *Self, ctx: *Context, gpa: *mem.Allocator) !void {
+        pub fn deinit(self: *Self, ctx: *Context, gpa: mem.Allocator) !void {
             const result = self.wg.wait(ctx);
             while (self.free_list.popFirst()) |metadata| {
                 metadata.deinit(gpa);
@@ -63,7 +63,7 @@ pub fn BoundedTaskPool(comptime F: anytype) type {
             Cancelled,
         };
 
-        pub fn spawn(self: *Self, ctx: *Context, gpa: *mem.Allocator, args: meta.ArgsTuple(@TypeOf(F))) SpawnError!void {
+        pub fn spawn(self: *Self, ctx: *Context, gpa: mem.Allocator, args: meta.ArgsTuple(@TypeOf(F))) SpawnError!void {
             _ = ctx;
 
             // while (self.wg.len == self.capacity) {

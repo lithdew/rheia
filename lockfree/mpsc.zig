@@ -207,7 +207,7 @@ test "mpsc/unbounded_stack: push and pop batch" {
     };
 
     const Context = struct {
-        gpa: *mem.Allocator,
+        gpa: mem.Allocator,
         stack: *mpsc.UnboundedStack(Node, .next),
 
         pub fn runProducer(self: @This()) !void {
@@ -269,7 +269,7 @@ test "mpsc/unbounded_stack: push and pop" {
     };
 
     const Context = struct {
-        gpa: *mem.Allocator,
+        gpa: mem.Allocator,
         stack: *mpsc.UnboundedStack(Node, .next),
 
         pub fn runProducer(self: @This()) !void {
@@ -329,7 +329,7 @@ test "mpsc/unbounded_queue: push and pop" {
     };
 
     const Context = struct {
-        gpa: *mem.Allocator,
+        gpa: mem.Allocator,
         queue: *mpsc.UnboundedQueue(Node, .next),
 
         pub fn runProducer(self: @This()) !void {

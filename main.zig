@@ -25,6 +25,7 @@ const Context = runtime.Context;
 const Atomic = std.atomic.Atomic;
 const Blake3 = std.crypto.hash.Blake3;
 const Ed25519 = std.crypto.sign.Ed25519;
+const AutoHashMap = @import("hash_map.zig").AutoHashMap;
 const SortedHashMap = @import("hash_map.zig").SortedHashMap;
 const StaticRingBuffer = @import("ring_buffer.zig").StaticRingBuffer;
 
@@ -95,7 +96,7 @@ pub const Arguments = struct {
         .s = "secret-key",
     };
 
-    pub fn parse(gpa: *mem.Allocator) !args.ParseArgsResult(Arguments) {
+    pub fn parse(gpa: mem.Allocator) !args.ParseArgsResult(Arguments) {
         return args.parseForCurrentProcess(Arguments, gpa, .print);
     }
 };
@@ -108,7 +109,7 @@ pub const Options = struct {
     bootstrap_addresses: []const ip.Address,
     keys: Ed25519.KeyPair,
 
-    pub fn parse(gpa: *mem.Allocator) !Options {
+    pub fn parse(gpa: mem.Allocator) !Options {
         errdefer {
             if (@errorReturnTrace()) |stack_trace| {
                 std.debug.dumpStackTrace(stack_trace.*);
@@ -210,7 +211,7 @@ pub const Options = struct {
         };
     }
 
-    pub fn deinit(self: Options, gpa: *mem.Allocator) void {
+    pub fn deinit(self: Options, gpa: mem.Allocator) void {
         if (self.database_path) |text| {
             gpa.free(text);
         }
@@ -439,7 +440,7 @@ pub const Block = struct {
     num_transaction_ids: u16,
     transaction_ids: [*][32]u8,
 
-    pub fn create(gpa: *mem.Allocator, params: Block.Params) !*Block {
+    pub fn create(gpa: mem.Allocator, params: Block.Params) !*Block {
         const bytes_len = @sizeOf(Block) + params.transaction_ids.len * @sizeOf([32]u8);
         const bytes = try gpa.alignedAlloc(u8, math.max(@alignOf(Block), @alignOf([32]u8)), bytes_len);
         errdefer gpa.free(bytes);
@@ -463,7 +464,7 @@ pub const Block = struct {
         return block;
     }
 
-    pub fn from(gpa: *mem.Allocator, format: Block.Data) !*Block {
+    pub fn from(gpa: mem.Allocator, format: Block.Data) !*Block {
         const bytes_len = @sizeOf(Block) + format.transaction_ids.len * @sizeOf([32]u8);
         const bytes = try gpa.alignedAlloc(u8, math.max(@alignOf(Block), @alignOf([32]u8)), bytes_len);
         errdefer gpa.free(bytes);
@@ -483,7 +484,7 @@ pub const Block = struct {
         return block;
     }
 
-    pub fn deinit(self: *Block, gpa: *mem.Allocator) void {
+    pub fn deinit(self: *Block, gpa: mem.Allocator) void {
         self.refs -= 1;
         if (self.refs == 0) {
             const bytes_len = @sizeOf(Block) + @as(usize, self.num_transaction_ids) * @sizeOf([32]u8);
@@ -508,7 +509,7 @@ pub const Block = struct {
         return Block.header_size + @as(u32, self.num_transaction_ids) * @sizeOf([32]u8);
     }
 
-    pub fn read(gpa: *mem.Allocator, reader: anytype) !*Block {
+    pub fn read(gpa: mem.Allocator, reader: anytype) !*Block {
         var block = try gpa.create(Block);
         errdefer gpa.destroy(block);
 
@@ -600,7 +601,7 @@ pub const Transaction = struct {
     tag: Tag,
     data: [*]u8,
 
-    pub fn create(gpa: *mem.Allocator, keys: Ed25519.KeyPair, params: Transaction.Params) !*Transaction {
+    pub fn create(gpa: mem.Allocator, keys: Ed25519.KeyPair, params: Transaction.Params) !*Transaction {
         const bytes = try gpa.alignedAlloc(u8, math.max(@alignOf(Transaction), @alignOf(u8)), @sizeOf(Transaction) + params.data.len);
         errdefer gpa.free(bytes);
 
@@ -630,7 +631,7 @@ pub const Transaction = struct {
         return tx;
     }
 
-    pub fn from(gpa: *mem.Allocator, format: Transaction.Data) !*Transaction {
+    pub fn from(gpa: mem.Allocator, format: Transaction.Data) !*Transaction {
         const bytes = try gpa.alignedAlloc(u8, math.max(@alignOf(Transaction), @alignOf(u8)), @sizeOf(Transaction) + format.data.len);
         errdefer gpa.free(bytes);
 
@@ -653,7 +654,7 @@ pub const Transaction = struct {
         return tx;
     }
 
-    pub fn deinit(self: *Transaction, gpa: *mem.Allocator) void {
+    pub fn deinit(self: *Transaction, gpa: mem.Allocator) void {
         self.refs -= 1;
         if (self.refs == 0) {
             gpa.free(@ptrCast([*]const u8, self)[0 .. @sizeOf(Transaction) + self.data_len]);
@@ -684,7 +685,7 @@ pub const Transaction = struct {
         return Transaction.header_size + self.data_len;
     }
 
-    pub fn read(gpa: *mem.Allocator, reader: anytype) !*Transaction {
+    pub fn read(gpa: mem.Allocator, reader: anytype) !*Transaction {
         var tx = try gpa.create(Transaction);
         errdefer gpa.destroy(tx);
 
@@ -804,20 +805,20 @@ pub const Client = struct {
     base: net.Client(Client),
     rpc: net.RPC,
 
-    pub fn init(gpa: *mem.Allocator, address: ip.Address) !Client {
+    pub fn init(gpa: mem.Allocator, address: ip.Address) !Client {
         var rpc = try net.RPC.init(gpa, 65536);
         errdefer rpc.deinit(gpa);
 
         return Client{ .base = try net.Client(Client).init(gpa, address), .rpc = rpc };
     }
 
-    pub fn deinit(self: *Client, ctx: *Context, gpa: *mem.Allocator) !void {
+    pub fn deinit(self: *Client, ctx: *Context, gpa: mem.Allocator) !void {
         const result = self.base.deinit(ctx);
         self.rpc.deinit(gpa);
         return result;
     }
 
-    pub fn acquireWriter(self: *Client, ctx: *Context, gpa: *mem.Allocator) !std.ArrayList(u8).Writer {
+    pub fn acquireWriter(self: *Client, ctx: *Context, gpa: mem.Allocator) !std.ArrayList(u8).Writer {
         return self.base.acquireWriter(ctx, gpa);
     }
 
@@ -825,11 +826,11 @@ pub const Client = struct {
         return self.base.releaseWriter(writer);
     }
 
-    pub fn ensureConnectionAvailable(self: *Client, ctx: *Context, gpa: *mem.Allocator) !void {
+    pub fn ensureConnectionAvailable(self: *Client, ctx: *Context, gpa: mem.Allocator) !void {
         return self.base.ensureConnectionAvailable(ctx, gpa);
     }
 
-    pub fn runWriteLoop(self: *Client, ctx: *Context, gpa: *mem.Allocator, client: tcp.Client) !void {
+    pub fn runWriteLoop(self: *Client, ctx: *Context, gpa: mem.Allocator, client: tcp.Client) !void {
         var stream: runtime.Stream = .{ .socket = client.socket, .context = ctx };
         var writer = stream.writer();
 
@@ -846,7 +847,7 @@ pub const Client = struct {
         }
     }
 
-    pub fn runReadLoop(self: *Client, ctx: *Context, gpa: *mem.Allocator, conn_id: usize, client: tcp.Client) !void {
+    pub fn runReadLoop(self: *Client, ctx: *Context, gpa: mem.Allocator, conn_id: usize, client: tcp.Client) !void {
         var stream: runtime.Stream = .{ .socket = client.socket, .context = ctx };
         var reader = stream.reader();
 
@@ -893,7 +894,7 @@ pub const Client = struct {
     pub fn sayHello(
         self: *Client,
         ctx: *Context,
-        gpa: *mem.Allocator,
+        gpa: mem.Allocator,
         keys: Ed25519.KeyPair,
         id: kademlia.ID,
         timeout_params: runtime.TimeoutParams,
@@ -956,7 +957,7 @@ pub const Client = struct {
     pub fn pullBlock(
         self: *Client,
         ctx: *Context,
-        gpa: *mem.Allocator,
+        gpa: mem.Allocator,
         block_height: u64,
         cached_block_proposal_id: ?[32]u8,
         timeout_params: runtime.TimeoutParams,
@@ -1027,7 +1028,7 @@ pub const Client = struct {
     pub fn pullTransactions(
         self: *Client,
         ctx: *Context,
-        gpa: *mem.Allocator,
+        gpa: mem.Allocator,
         ids: []const [32]u8,
         timeout_params: runtime.TimeoutParams,
     ) ![]*Transaction {
@@ -1097,7 +1098,7 @@ pub const Client = struct {
         return transactions.toOwnedSlice(gpa);
     }
 
-    pub fn pushTransactions(self: *Client, ctx: *Context, gpa: *mem.Allocator, transactions: []const *Transaction, timeout_params: runtime.TimeoutParams) !void {
+    pub fn pushTransactions(self: *Client, ctx: *Context, gpa: mem.Allocator, transactions: []const *Transaction, timeout_params: runtime.TimeoutParams) !void {
         var len: u32 = 0;
         for (transactions) |tx| {
             len += tx.size();
@@ -1151,7 +1152,7 @@ pub const Listener = struct {
 
     node: *Node,
 
-    pub fn serve(ctx: *Context, gpa: *mem.Allocator, net_listener: *net.Listener(Listener), listener: tcp.Listener) !void {
+    pub fn serve(ctx: *Context, gpa: mem.Allocator, net_listener: *net.Listener(Listener), listener: tcp.Listener) !void {
         const bind_address = try listener.getLocalAddress();
 
         log.info("listening for peers: {}", .{bind_address});
@@ -1160,7 +1161,7 @@ pub const Listener = struct {
         return net_listener.serve(ctx, gpa, listener);
     }
 
-    pub fn runReadLoop(self: Listener, ctx: *Context, gpa: *mem.Allocator, base: *net.Listener(Listener).Connection) !void {
+    pub fn runReadLoop(self: Listener, ctx: *Context, gpa: mem.Allocator, base: *net.Listener(Listener).Connection) !void {
         var conn: Listener.Connection = .{ .base = base };
 
         var stream: runtime.Stream = .{ .socket = conn.base.client.socket, .context = ctx };
@@ -1198,7 +1199,7 @@ pub const Listener = struct {
         }
     }
 
-    pub fn runWriteLoop(self: Listener, ctx: *Context, gpa: *mem.Allocator, conn: *net.Listener(Listener).Connection) !void {
+    pub fn runWriteLoop(self: Listener, ctx: *Context, gpa: mem.Allocator, conn: *net.Listener(Listener).Connection) !void {
         _ = self;
         _ = gpa;
 
@@ -1221,7 +1222,7 @@ pub const Listener = struct {
     fn process(
         self: Listener,
         ctx: *Context,
-        gpa: *mem.Allocator,
+        gpa: mem.Allocator,
         conn: *Listener.Connection,
         packet: net.Packet,
         frame: anytype,
@@ -1462,7 +1463,7 @@ pub const HttpHandler = struct {
     pub fn index(
         self: HttpHandler,
         ctx: *Context,
-        gpa: *mem.Allocator,
+        gpa: mem.Allocator,
         request: http.Request,
         reader: anytype,
         writer: anytype,
@@ -1538,7 +1539,7 @@ pub const HttpHandler = struct {
     pub fn getBlocks(
         self: HttpHandler,
         ctx: *Context,
-        gpa: *mem.Allocator,
+        gpa: mem.Allocator,
         request: http.Request,
         reader: anytype,
         writer: anytype,
@@ -1684,7 +1685,7 @@ pub const HttpHandler = struct {
     pub fn getTransactions(
         self: HttpHandler,
         ctx: *Context,
-        gpa: *mem.Allocator,
+        gpa: mem.Allocator,
         request: http.Request,
         reader: anytype,
         writer: anytype,
@@ -1841,7 +1842,7 @@ pub const HttpHandler = struct {
     pub fn queryDatabase(
         self: HttpHandler,
         ctx: *Context,
-        gpa: *mem.Allocator,
+        gpa: mem.Allocator,
         request: http.Request,
         reader: anytype,
         writer: anytype,
@@ -1888,7 +1889,7 @@ pub const HttpHandler = struct {
     pub fn submitTransaction(
         self: HttpHandler,
         ctx: *Context,
-        gpa: *mem.Allocator,
+        gpa: mem.Allocator,
         request: http.Request,
         reader: anytype,
         writer: anytype,
@@ -1965,7 +1966,7 @@ pub const Node = struct {
     table: kademlia.RoutingTable,
     closed: bool = false,
 
-    pub fn init(self: *Node, gpa: *mem.Allocator, store: *SqliteStore, keys: Ed25519.KeyPair, address: ip.Address) !void {
+    pub fn init(self: *Node, gpa: mem.Allocator, store: *SqliteStore, keys: Ed25519.KeyPair, address: ip.Address) !void {
         self.keys = keys;
         self.id = .{ .public_key = keys.public_key, .address = address };
 
@@ -1980,7 +1981,7 @@ pub const Node = struct {
         self.table = .{ .public_key = keys.public_key };
     }
 
-    pub fn deinit(self: *Node, ctx: *Context, gpa: *mem.Allocator) void {
+    pub fn deinit(self: *Node, ctx: *Context, gpa: mem.Allocator) void {
         log.info("shutting down...", .{});
 
         self.closed = true;
@@ -2007,7 +2008,7 @@ pub const Node = struct {
         log.info("successfully shut down", .{});
     }
 
-    pub fn getOrCreateClient(self: *Node, ctx: *Context, gpa: *mem.Allocator, address: ip.Address) !*Client {
+    pub fn getOrCreateClient(self: *Node, ctx: *Context, gpa: mem.Allocator, address: ip.Address) !*Client {
         if (self.closed) return error.Closed;
 
         const result = try self.clients.getOrPut(gpa, address);
@@ -2032,7 +2033,7 @@ pub const Node = struct {
         return result.value_ptr.*;
     }
 
-    pub fn acquireWriter(self: *Node, ctx: *Context, gpa: *mem.Allocator, address: ip.Address) !std.ArrayList(u8).Writer {
+    pub fn acquireWriter(self: *Node, ctx: *Context, gpa: mem.Allocator, address: ip.Address) !std.ArrayList(u8).Writer {
         const client = try self.getOrCreateClient(ctx, gpa, address);
         return client.acquireWriter(ctx, gpa);
     }
@@ -2042,7 +2043,7 @@ pub const Node = struct {
         return client.releaseWriter(writer);
     }
 
-    pub fn run(self: *Node, ctx: *Context, gpa: *mem.Allocator) !void {
+    pub fn run(self: *Node, ctx: *Context, gpa: mem.Allocator) !void {
         var pusher_frame = async self.pusher.run(ctx, gpa);
         defer await pusher_frame catch |err| if (err != error.Cancelled) log.warn("transaction pusher error: {}", .{err});
 
@@ -2056,7 +2057,7 @@ pub const Node = struct {
         defer await chain_frame catch |err| if (err != error.Cancelled) log.warn("chain error: {}", .{err});
     }
 
-    pub fn addTransaction(self: *Node, ctx: *Context, gpa: *mem.Allocator, tx: *Transaction) !void {
+    pub fn addTransaction(self: *Node, ctx: *Context, gpa: mem.Allocator, tx: *Transaction) !void {
         _ = self.chain.missing.delete(tx.id);
 
         if (self.chain.finalized.get(tx.id) != null or slow_path: {
@@ -2125,7 +2126,7 @@ pub fn Chain(comptime Store: type) type {
         propose_delay: i64 = propose_delay_min,
         connected_delay: i64 = connected_delay_min,
 
-        pub fn init(gpa: *mem.Allocator, store: *Store) !Self {
+        pub fn init(gpa: mem.Allocator, store: *Store) !Self {
             var sampler = try Sampler.init(gpa);
             errdefer sampler.deinit(gpa);
 
@@ -2182,7 +2183,7 @@ pub fn Chain(comptime Store: type) type {
             };
         }
 
-        pub fn deinit(self: *Self, gpa: *mem.Allocator) void {
+        pub fn deinit(self: *Self, gpa: mem.Allocator) void {
             log.info("shutting down...", .{});
 
             var it = self.block_proposal_cache.head;
@@ -2210,7 +2211,7 @@ pub fn Chain(comptime Store: type) type {
             log.info("successfully shut down", .{});
         }
 
-        pub fn run(self: *Self, ctx: *Context, gpa: *mem.Allocator, node: *Node) !void {
+        pub fn run(self: *Self, ctx: *Context, gpa: mem.Allocator, node: *Node) !void {
             // TODO: cleanup error handling in this function
 
             var transaction_ids: std.ArrayListUnmanaged([32]u8) = .{};
@@ -2371,7 +2372,7 @@ pub fn Chain(comptime Store: type) type {
         fn proposeBlock(
             self: *Self,
             ctx: *Context,
-            gpa: *mem.Allocator,
+            gpa: mem.Allocator,
             transaction_ids: *std.ArrayListUnmanaged([32]u8),
         ) !void {
             if (self.pending.len == 0) {
@@ -2413,7 +2414,7 @@ pub fn Chain(comptime Store: type) type {
         fn pullBlockProposals(
             self: *Self,
             ctx: *Context,
-            gpa: *mem.Allocator,
+            gpa: mem.Allocator,
             node: *Node,
             maybe_block_proposals: ?*BlockProposalMap,
             peer_ids: []const kademlia.ID,
@@ -2450,7 +2451,7 @@ pub fn Chain(comptime Store: type) type {
         fn pullBlock(
             self: *Self,
             ctx: *Context,
-            gpa: *mem.Allocator,
+            gpa: mem.Allocator,
             wg: *sync.WaitGroup,
             node: *Node,
             address: ip.Address,
@@ -2555,7 +2556,7 @@ pub const TransactionPuller = struct {
         log.info("successfully shut down", .{});
     }
 
-    pub fn run(self: *TransactionPuller, ctx: *Context, gpa: *mem.Allocator) !void {
+    pub fn run(self: *TransactionPuller, ctx: *Context, gpa: mem.Allocator) !void {
         var peer_ids: [16]kademlia.ID = undefined;
 
         while (true) {
@@ -2584,7 +2585,7 @@ pub const TransactionPuller = struct {
         }
     }
 
-    pub fn pullMissingTransactions(self: *TransactionPuller, ctx: *Context, gpa: *mem.Allocator, peer_ids: []const kademlia.ID) !void {
+    pub fn pullMissingTransactions(self: *TransactionPuller, ctx: *Context, gpa: mem.Allocator, peer_ids: []const kademlia.ID) !void {
         assert(self.node.chain.missing.len > 0);
         assert(peer_ids.len > 0);
 
@@ -2651,7 +2652,7 @@ pub const TransactionPuller = struct {
     pub fn pullTransactionsFromPeer(
         self: *TransactionPuller,
         ctx: *Context,
-        gpa: *mem.Allocator,
+        gpa: mem.Allocator,
         wg: *sync.WaitGroup,
         address: ip.Address,
         ids: []const [32]u8,
@@ -2714,14 +2715,14 @@ pub const TransactionPusher = struct {
     pending: std.ArrayListUnmanaged(*Transaction) = .{},
     pool: sync.BoundedTaskPool(gossipTransactions) = .{ .capacity = 128 },
 
-    pub fn init(gpa: *mem.Allocator, node: *Node) !TransactionPusher {
+    pub fn init(gpa: mem.Allocator, node: *Node) !TransactionPusher {
         var cache = try Cache.initCapacity(gpa, 1 << 20);
         errdefer cache.deinit(gpa);
 
         return TransactionPusher{ .node = node, .cache = cache };
     }
 
-    pub fn deinit(self: *TransactionPusher, ctx: *Context, gpa: *mem.Allocator) void {
+    pub fn deinit(self: *TransactionPusher, ctx: *Context, gpa: mem.Allocator) void {
         log.info("shutting down...", .{});
 
         self.pool.deinit(ctx, gpa) catch |err| log.warn("error while shutting down: {}", .{err});
@@ -2736,7 +2737,7 @@ pub const TransactionPusher = struct {
         log.info("successfully shut down", .{});
     }
 
-    pub fn push(self: *TransactionPusher, ctx: *Context, gpa: *mem.Allocator, tx: *Transaction) !void {
+    pub fn push(self: *TransactionPusher, ctx: *Context, gpa: mem.Allocator, tx: *Transaction) !void {
         const tx_size = tx.size();
         if (self.num_bytes_pending + tx_size >= max_num_bytes_per_batch) {
             try self.flush(ctx, gpa);
@@ -2746,7 +2747,7 @@ pub const TransactionPusher = struct {
         self.num_bytes_pending += tx_size;
     }
 
-    pub fn run(self: *TransactionPusher, ctx: *Context, gpa: *mem.Allocator) !void {
+    pub fn run(self: *TransactionPusher, ctx: *Context, gpa: mem.Allocator) !void {
         while (true) {
             if (self.num_bytes_pending == 0 or time.milliTimestamp() - self.last_flush_time < flush_delay_min / time.ns_per_ms) {
                 try runtime.timeout(ctx, .{ .nanoseconds = self.flush_delay });
@@ -2763,7 +2764,7 @@ pub const TransactionPusher = struct {
         }
     }
 
-    pub fn flush(self: *TransactionPusher, ctx: *Context, gpa: *mem.Allocator) !void {
+    pub fn flush(self: *TransactionPusher, ctx: *Context, gpa: mem.Allocator) !void {
         // TODO: randomly sample peer ids from routing table instead
         var peer_ids: [16]kademlia.ID = undefined;
 
@@ -2782,7 +2783,7 @@ pub const TransactionPusher = struct {
         return self.cache.update(.{ .address = address, .transaction_id = transaction_id }, {}) == .updated;
     }
 
-    fn gossipTransactions(self: *TransactionPusher, ctx: *Context, gpa: *mem.Allocator, peer_ids: []const kademlia.ID) !void {
+    fn gossipTransactions(self: *TransactionPusher, ctx: *Context, gpa: mem.Allocator, peer_ids: []const kademlia.ID) !void {
         const transactions = self.pending.toOwnedSlice(gpa);
         defer {
             for (transactions) |tx| {
@@ -2830,7 +2831,7 @@ pub const TransactionPusher = struct {
     fn pushTransactions(
         self: *TransactionPusher,
         ctx: *Context,
-        gpa: *mem.Allocator,
+        gpa: mem.Allocator,
         wg: *sync.WaitGroup,
         address: ip.Address,
         transactions: []const *Transaction,
@@ -2869,7 +2870,7 @@ pub const TransactionVerifier = struct {
         return TransactionVerifier{ .node = node };
     }
 
-    pub fn deinit(self: *TransactionVerifier, ctx: *Context, gpa: *mem.Allocator) void {
+    pub fn deinit(self: *TransactionVerifier, ctx: *Context, gpa: mem.Allocator) void {
         log.info("shutting down...", .{});
 
         self.pool.deinit(ctx, gpa) catch |err| log.warn("error while shutting down: {}", .{err});
@@ -2882,7 +2883,7 @@ pub const TransactionVerifier = struct {
         log.info("successfully shut down", .{});
     }
 
-    pub fn push(self: *TransactionVerifier, ctx: *Context, gpa: *mem.Allocator, tx: *Transaction) !void {
+    pub fn push(self: *TransactionVerifier, ctx: *Context, gpa: mem.Allocator, tx: *Transaction) !void {
         try self.entries.append(gpa, tx);
 
         if (self.entries.items.len == max_signature_batch_size) {
@@ -2890,7 +2891,7 @@ pub const TransactionVerifier = struct {
         }
     }
 
-    pub fn run(self: *TransactionVerifier, ctx: *Context, gpa: *mem.Allocator) !void {
+    pub fn run(self: *TransactionVerifier, ctx: *Context, gpa: mem.Allocator) !void {
         var flush_delay: i64 = flush_delay_min;
 
         while (true) {
@@ -2906,12 +2907,12 @@ pub const TransactionVerifier = struct {
         }
     }
 
-    fn flush(self: *TransactionVerifier, ctx: *Context, gpa: *mem.Allocator) !void {
+    fn flush(self: *TransactionVerifier, ctx: *Context, gpa: mem.Allocator) !void {
         try self.pool.spawn(ctx, gpa, .{ self, ctx, gpa, self.entries.toOwnedSlice(gpa) });
         self.last_flush_time = time.milliTimestamp();
     }
 
-    fn verifyTransactionBatch(gpa: *mem.Allocator, entries: []*Transaction) usize {
+    fn verifyTransactionBatch(gpa: mem.Allocator, entries: []*Transaction) usize {
         runtime.startCpuBoundOperation();
         defer runtime.endCpuBoundOperation();
 
@@ -2953,7 +2954,7 @@ pub const TransactionVerifier = struct {
         return num_valid;
     }
 
-    fn verifyTransactions(self: *TransactionVerifier, ctx: *Context, gpa: *mem.Allocator, entries: []*Transaction) void {
+    fn verifyTransactions(self: *TransactionVerifier, ctx: *Context, gpa: mem.Allocator, entries: []*Transaction) void {
         const num_valid = verifyTransactionBatch(gpa, entries);
         defer gpa.free(entries);
 
@@ -2999,14 +3000,14 @@ pub const Sampler = struct {
     preferred: ?*Block = null,
     last: ?*Block = null,
 
-    pub fn init(gpa: *mem.Allocator) !Sampler {
+    pub fn init(gpa: mem.Allocator) !Sampler {
         var counts = try SortedHashMap(usize, 50).init(gpa);
         errdefer counts.deinit(gpa);
 
         return Sampler{ .counts = counts };
     }
 
-    pub fn deinit(self: *Sampler, gpa: *mem.Allocator) void {
+    pub fn deinit(self: *Sampler, gpa: mem.Allocator) void {
         self.counts.deinit(gpa);
         if (self.preferred) |preferred| {
             preferred.deinit(gpa);
@@ -3016,7 +3017,7 @@ pub const Sampler = struct {
         }
     }
 
-    pub fn reset(self: *Sampler, gpa: *mem.Allocator) void {
+    pub fn reset(self: *Sampler, gpa: mem.Allocator) void {
         self.counts.clearRetainingCapacity();
         self.count = 0;
         self.stalled = 0;
@@ -3032,14 +3033,14 @@ pub const Sampler = struct {
         self.last = null;
     }
 
-    pub fn prefer(self: *Sampler, gpa: *mem.Allocator, block: *Block) void {
+    pub fn prefer(self: *Sampler, gpa: mem.Allocator, block: *Block) void {
         if (self.preferred) |preferred| {
             preferred.deinit(gpa);
         }
         self.preferred = block;
     }
 
-    pub fn update(self: *Sampler, gpa: *mem.Allocator, votes: []const Vote) !?*Block {
+    pub fn update(self: *Sampler, gpa: mem.Allocator, votes: []const Vote) !?*Block {
         try self.counts.ensureUnusedCapacity(gpa, 1);
 
         if (votes.len == 0) return null;
@@ -3107,16 +3108,23 @@ const fs = std.fs;
 pub const NullStore = struct {
     const PooledConnection = struct {};
 
+    gpa: mem.Allocator,
     maybe_path: ?[]const u8,
+    whitelist: AutoHashMap([32]u8, void, 50),
 
-    pub fn init(gpa: *mem.Allocator, maybe_path: ?[]const u8) !NullStore {
-        _ = gpa;
-        _ = maybe_path;
-        return NullStore{ .maybe_path = maybe_path };
+    pub fn init(gpa: mem.Allocator, maybe_path: ?[]const u8) !NullStore {
+        var whitelist = try AutoHashMap([32]u8, void, 50).initCapacity(gpa, 16);
+        errdefer whitelist.deinit(gpa);
+
+        return NullStore{
+            .gpa = gpa,
+            .maybe_path = maybe_path,
+            .whitelist = whitelist,
+        };
     }
 
     pub fn deinit(self: *NullStore) void {
-        _ = self;
+        self.whitelist.deinit(self.gpa);
     }
 
     pub fn acquireConnection(self: *NullStore) !PooledConnection {
@@ -3129,7 +3137,7 @@ pub const NullStore = struct {
         _ = pooled;
     }
 
-    pub fn queryJson(self: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, raw_query: []const u8) ![]const u8 {
+    pub fn queryJson(self: *NullStore, gpa: mem.Allocator, pooled: *PooledConnection, raw_query: []const u8) ![]const u8 {
         _ = self;
         _ = gpa;
         _ = pooled;
@@ -3137,7 +3145,7 @@ pub const NullStore = struct {
         return try gpa.dupe(u8, "{\"results\": [], \"count\": 0}");
     }
 
-    pub fn storeBlock(self: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, block: *Block, transactions: []const *Transaction) !void {
+    pub fn storeBlock(self: *NullStore, gpa: mem.Allocator, pooled: *PooledConnection, block: *Block, transactions: []const *Transaction) !void {
         _ = self;
         _ = gpa;
         _ = pooled;
@@ -3152,7 +3160,7 @@ pub const NullStore = struct {
         return false;
     }
 
-    pub fn getBlockSummaries(self: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const Block.Summary {
+    pub fn getBlockSummaries(self: *NullStore, gpa: mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const Block.Summary {
         _ = self;
         _ = gpa;
         _ = pooled;
@@ -3161,7 +3169,7 @@ pub const NullStore = struct {
         return try gpa.alloc(Block.Summary, 0);
     }
 
-    pub fn getBlocks(_: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const *Block {
+    pub fn getBlocks(_: *NullStore, gpa: mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const *Block {
         _ = gpa;
         _ = pooled;
         _ = offset;
@@ -3169,7 +3177,7 @@ pub const NullStore = struct {
         return try gpa.alloc(*Block, 0);
     }
 
-    pub fn getTransactions(_: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const *Transaction {
+    pub fn getTransactions(_: *NullStore, gpa: mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const *Transaction {
         _ = gpa;
         _ = pooled;
         _ = offset;
@@ -3177,7 +3185,7 @@ pub const NullStore = struct {
         return try gpa.alloc(*Transaction, 0);
     }
 
-    pub fn getTransactionsByBlockHeight(_: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, block_height: u64, offset: usize, limit: usize) ![]const *Transaction {
+    pub fn getTransactionsByBlockHeight(_: *NullStore, gpa: mem.Allocator, pooled: *PooledConnection, block_height: u64, offset: usize, limit: usize) ![]const *Transaction {
         _ = gpa;
         _ = pooled;
         _ = block_height;
@@ -3186,25 +3194,43 @@ pub const NullStore = struct {
         return try gpa.alloc(*Transaction, 0);
     }
 
-    pub fn getBlockById(_: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, block_id: [32]u8) !?*Block {
+    pub fn getBlockById(_: *NullStore, gpa: mem.Allocator, pooled: *PooledConnection, block_id: [32]u8) !?*Block {
         _ = gpa;
         _ = pooled;
         _ = block_id;
         return null;
     }
 
-    pub fn getBlockByHeight(_: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, height: u64) !?*Block {
+    pub fn getBlockByHeight(_: *NullStore, gpa: mem.Allocator, pooled: *PooledConnection, height: u64) !?*Block {
         _ = gpa;
         _ = pooled;
         _ = height;
         return null;
     }
 
-    pub fn getTransactionById(_: *NullStore, gpa: *mem.Allocator, pooled: *PooledConnection, id: [32]u8) !?*Transaction {
+    pub fn getTransactionById(_: *NullStore, gpa: mem.Allocator, pooled: *PooledConnection, id: [32]u8) !?*Transaction {
         _ = gpa;
         _ = pooled;
         _ = id;
         return null;
+    }
+
+    pub fn isPublicKeyWhitelisted(self: *NullStore, pooled: *PooledConnection, public_key: [32]u8) bool {
+        _ = pooled;
+        if (self.whitelist.len == 0) {
+            return true;
+        }
+        return self.whitelist.get(public_key) != null;
+    }
+
+    pub fn addPublicKeyToWhitelist(self: *NullStore, pooled: *PooledConnection, public_key: [32]u8) !void {
+        _ = pooled;
+        return self.whitelist.put(self.gpa, public_key, {});
+    }
+
+    pub fn removePublicKeyFromWhitelist(self: *NullStore, pooled: *PooledConnection, public_key: [32]u8) bool {
+        _ = pooled;
+        return self.whitelist.delete(public_key) != null;
     }
 };
 
@@ -3220,6 +3246,10 @@ pub const SqliteStore = struct {
     const get_transaction_by_id_query = "select id, sender, signature, sender_nonce, created_at, tag, data from transactions where id = ?";
     const get_transaction_ids_by_block_height_query = "select id from transactions where block_height = ?{u64}";
     const get_transactions_by_block_height_query = "select id, sender, signature, sender_nonce, created_at, tag, data from transactions where block_height = ?{u64} limit ?{usize} offset ?{usize}";
+    const is_whitelist_filled_query = "select 1 from whitelist";
+    const is_public_key_whitelisted_query = "select 1 from whitelist where public_key = ?{[]const u8} or exists(select 1 from whitelist)";
+    const add_public_key_to_whitelist_query = "insert into whitelist(public_key) values (?{[]const u8})";
+    const remove_public_key_from_whitelist_query = "delete from whitelist where public_key = ?{[]const u8}";
 
     pub const PooledConnection = struct {
         conn: sqlite.Db,
@@ -3235,6 +3265,10 @@ pub const SqliteStore = struct {
         get_transaction_by_id: sqlite.Statement(.{}, sqlite.ParsedQuery.from(get_transaction_by_id_query)),
         get_transaction_ids_by_block_height: sqlite.Statement(.{}, sqlite.ParsedQuery.from(get_transaction_ids_by_block_height_query)),
         get_transactions_by_block_height: sqlite.Statement(.{}, sqlite.ParsedQuery.from(get_transactions_by_block_height_query)),
+        is_whitelist_filled: sqlite.Statement(.{}, sqlite.ParsedQuery.from(is_whitelist_filled_query)),
+        is_public_key_whitelisted: sqlite.Statement(.{}, sqlite.ParsedQuery.from(is_public_key_whitelisted_query)),
+        add_public_key_to_whitelist: sqlite.Statement(.{}, sqlite.ParsedQuery.from(add_public_key_to_whitelist_query)),
+        remove_public_key_from_whitelist: sqlite.Statement(.{}, sqlite.ParsedQuery.from(remove_public_key_from_whitelist_query)),
 
         pub fn deinit(self: *PooledConnection) void {
             self.store_block.deinit();
@@ -3248,6 +3282,10 @@ pub const SqliteStore = struct {
             self.get_transaction_by_id.deinit();
             self.get_transaction_ids_by_block_height.deinit();
             self.get_transactions_by_block_height.deinit();
+            self.is_whitelist_filled.deinit();
+            self.is_public_key_whitelisted.deinit();
+            self.add_public_key_to_whitelist.deinit();
+            self.remove_public_key_from_whitelist.deinit();
             self.conn.deinit();
         }
     };
@@ -3257,7 +3295,7 @@ pub const SqliteStore = struct {
     pool: std.fifo.LinearFifo(PooledConnection, .Dynamic),
     maybe_path: ?[]const u8,
 
-    pub fn init(gpa: *mem.Allocator, maybe_path: ?[]const u8) !SqliteStore {
+    pub fn init(gpa: mem.Allocator, maybe_path: ?[]const u8) !SqliteStore {
         var pooled = try createConnection(maybe_path);
         errdefer pooled.deinit();
 
@@ -3329,7 +3367,7 @@ pub const SqliteStore = struct {
                     sqlite.c.SQLITE_DROP_TABLE,
                     => {
                         const table_name = mem.sliceTo(param_1 orelse return sqlite.c.SQLITE_OK, 0);
-                        if (mem.eql(u8, table_name, "blocks") or mem.eql(u8, table_name, "transactions")) {
+                        if (mem.eql(u8, table_name, "blocks") or mem.eql(u8, table_name, "transactions") or mem.eql(u8, table_name, "whitelist")) {
                             return sqlite.c.SQLITE_DENY;
                         }
                     },
@@ -3388,6 +3426,18 @@ pub const SqliteStore = struct {
         pooled.get_transactions_by_block_height = try pooled.conn.prepareWithDiags(get_transactions_by_block_height_query, .{ .diags = &diags });
         errdefer pooled.get_transactions_by_block_height.deinit();
 
+        pooled.is_whitelist_filled = try pooled.conn.prepareWithDiags(is_whitelist_filled_query, .{ .diags = &diags });
+        errdefer pooled.is_whitelist_filled.deinit();
+
+        pooled.is_public_key_whitelisted = try pooled.conn.prepareWithDiags(is_public_key_whitelisted_query, .{ .diags = &diags });
+        errdefer pooled.is_public_key_whitelisted.deinit();
+
+        pooled.add_public_key_to_whitelist = try pooled.conn.prepareWithDiags(add_public_key_to_whitelist_query, .{ .diags = &diags });
+        errdefer pooled.add_public_key_to_whitelist.deinit();
+
+        pooled.remove_public_key_from_whitelist = try pooled.conn.prepareWithDiags(remove_public_key_from_whitelist_query, .{ .diags = &diags });
+        errdefer pooled.remove_public_key_from_whitelist.deinit();
+
         return pooled;
     }
 
@@ -3403,7 +3453,7 @@ pub const SqliteStore = struct {
         self.pool.writeItem(pooled.*) catch pooled.deinit();
     }
 
-    fn execute(gpa: *mem.Allocator, pooled: *PooledConnection, raw_query: []const u8) !void {
+    fn execute(gpa: mem.Allocator, pooled: *PooledConnection, raw_query: []const u8) !void {
         var error_message: [*c]u8 = null;
         defer if (error_message) |error_message_ptr| {
             log.warn("error while executing query: {s}", .{error_message_ptr});
@@ -3418,7 +3468,7 @@ pub const SqliteStore = struct {
         }
     }
 
-    pub fn queryJson(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, raw_query: []const u8) ![]const u8 {
+    pub fn queryJson(_: *SqliteStore, gpa: mem.Allocator, pooled: *PooledConnection, raw_query: []const u8) ![]const u8 {
         var diags: sqlite.Diagnostics = .{};
         errdefer |err| log.warn("error while querying json ({}): {}", .{ diags, err });
 
@@ -3512,7 +3562,7 @@ pub const SqliteStore = struct {
         return buffer.toOwnedSlice();
     }
 
-    pub fn storeBlock(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, block: *Block, transactions: []const *Transaction) !void {
+    pub fn storeBlock(_: *SqliteStore, gpa: mem.Allocator, pooled: *PooledConnection, block: *Block, transactions: []const *Transaction) !void {
         var diags: sqlite.Diagnostics = .{};
         errdefer |err| log.warn("error while saving block ({}): {}", .{ diags, err });
 
@@ -3564,12 +3614,12 @@ pub const SqliteStore = struct {
         return result != null;
     }
 
-    fn getTransactionIdsByBlockHeight(gpa: *mem.Allocator, pooled: *PooledConnection, block_height: u64) ![]const [32]u8 {
+    fn getTransactionIdsByBlockHeight(gpa: mem.Allocator, pooled: *PooledConnection, block_height: u64) ![]const [32]u8 {
         pooled.get_transaction_ids_by_block_height.reset();
         return try pooled.get_transaction_ids_by_block_height.all([32]u8, gpa, .{}, .{ .block_height = block_height });
     }
 
-    pub fn getBlockSummaries(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const Block.Summary {
+    pub fn getBlockSummaries(_: *SqliteStore, gpa: mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const Block.Summary {
         var blocks: std.ArrayListUnmanaged(Block.Summary) = .{};
         defer blocks.deinit(gpa);
 
@@ -3586,7 +3636,7 @@ pub const SqliteStore = struct {
         return blocks.toOwnedSlice(gpa);
     }
 
-    pub fn getBlocks(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const *Block {
+    pub fn getBlocks(_: *SqliteStore, gpa: mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const *Block {
         var blocks: std.ArrayListUnmanaged(*Block) = .{};
         defer {
             for (blocks.items) |block| {
@@ -3619,7 +3669,7 @@ pub const SqliteStore = struct {
         return blocks.toOwnedSlice(gpa);
     }
 
-    pub fn getTransactions(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const *Transaction {
+    pub fn getTransactions(_: *SqliteStore, gpa: mem.Allocator, pooled: *PooledConnection, offset: usize, limit: usize) ![]const *Transaction {
         var transactions: std.ArrayListUnmanaged(*Transaction) = .{};
         defer {
             for (transactions.items) |tx| {
@@ -3646,7 +3696,7 @@ pub const SqliteStore = struct {
         return transactions.toOwnedSlice(gpa);
     }
 
-    pub fn getTransactionsByBlockHeight(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, block_height: u64, offset: usize, limit: usize) ![]const *Transaction {
+    pub fn getTransactionsByBlockHeight(_: *SqliteStore, gpa: mem.Allocator, pooled: *PooledConnection, block_height: u64, offset: usize, limit: usize) ![]const *Transaction {
         var transactions: std.ArrayListUnmanaged(*Transaction) = .{};
         defer {
             for (transactions.items) |tx| {
@@ -3673,7 +3723,7 @@ pub const SqliteStore = struct {
         return transactions.toOwnedSlice(gpa);
     }
 
-    pub fn getBlockById(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, block_id: [32]u8) !?*Block {
+    pub fn getBlockById(_: *SqliteStore, gpa: mem.Allocator, pooled: *PooledConnection, block_id: [32]u8) !?*Block {
         var diags: sqlite.Diagnostics = .{};
         errdefer |err| log.warn("error while fetching block by id ({}): {}", .{ diags, err });
 
@@ -3695,7 +3745,7 @@ pub const SqliteStore = struct {
         });
     }
 
-    pub fn getBlockByHeight(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, height: u64) !?*Block {
+    pub fn getBlockByHeight(_: *SqliteStore, gpa: mem.Allocator, pooled: *PooledConnection, height: u64) !?*Block {
         var diags: sqlite.Diagnostics = .{};
         errdefer |err| log.warn("error while fetching block by height ({}): {}", .{ diags, err });
 
@@ -3717,7 +3767,7 @@ pub const SqliteStore = struct {
         });
     }
 
-    pub fn getTransactionById(_: *SqliteStore, gpa: *mem.Allocator, pooled: *PooledConnection, id: [32]u8) !?*Transaction {
+    pub fn getTransactionById(_: *SqliteStore, gpa: mem.Allocator, pooled: *PooledConnection, id: [32]u8) !?*Transaction {
         var diags: sqlite.Diagnostics = .{};
         errdefer |err| log.warn("error while fetching transaction by id ({}): {}", .{ diags, err });
 
@@ -3727,5 +3777,48 @@ pub const SqliteStore = struct {
         defer gpa.free(format.data);
 
         return try Transaction.from(gpa, format);
+    }
+
+    pub fn isPublicKeyWhitelisted(_: *SqliteStore, pooled: *PooledConnection, public_key: [32]u8) bool {
+        var diags: sqlite.Diagnostics = .{};
+        errdefer log.warn("error while checking if public key is whitelisted: {}", .{diags});
+
+        pooled.is_whitelist_filled.reset();
+
+        if ((pooled.is_whitelist_filled.one(usize, .{ .diags = &diags }, .{}) catch return false) == null) {
+            return true;
+        }
+
+        pooled.is_public_key_whitelisted.reset();
+
+        if ((pooled.is_public_key_whitelisted.one(usize, .{ .diags = &diags }, .{ .public_key = @as([]const u8, &public_key) }) catch return false) != null) {
+            return true;
+        }
+
+        return false;
+    }
+
+    pub fn addPublicKeyToWhitelist(_: *SqliteStore, pooled: *PooledConnection, public_key: [32]u8) !void {
+        var diags: sqlite.Diagnostics = .{};
+        errdefer log.warn("error while adding public key to whitelist: {}", .{diags});
+
+        pooled.add_public_key_to_whitelist.reset();
+
+        try pooled.add_public_key_to_whitelist.exec(
+            .{ .diags = &diags },
+            .{ .public_key = @as([]const u8, &public_key) },
+        );
+    }
+
+    pub fn removePublicKeyFromWhitelist(_: *SqliteStore, pooled: *PooledConnection, public_key: [32]u8) bool {
+        var diags: sqlite.Diagnostics = .{};
+        errdefer log.warn("error while removing public key from whitelist: {}", .{diags});
+
+        pooled.remove_public_key_from_whitelist.reset();
+
+        try pooled.remove_public_key_from_whitelist.exec(
+            .{ .diags = &diags },
+            .{ .public_key = @as([]const u8, &public_key) },
+        );
     }
 };
