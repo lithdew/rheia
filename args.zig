@@ -29,7 +29,7 @@ const std = @import("std");
 pub fn parseForCurrentProcess(comptime Spec: type, allocator: std.mem.Allocator, error_handling: ErrorHandling) !ParseArgsResult(Spec) {
     var args = std.process.args();
 
-    const executable_name = try (args.next(allocator) orelse {
+    const executable_name = (try args.next(allocator)) orelse {
         try error_handling.process(error.NoExecutableName, Error{
             .option = "",
             .kind = .missing_executable_name,
@@ -37,7 +37,7 @@ pub fn parseForCurrentProcess(comptime Spec: type, allocator: std.mem.Allocator,
 
         // we do not assume any more arguments appear here anyways...
         return error.NoExecutableName;
-    });
+    };
     errdefer allocator.free(executable_name);
 
     var result = try parse(Spec, &args, allocator, error_handling);
@@ -68,9 +68,7 @@ pub fn parse(comptime Spec: type, args: *std.process.ArgIterator, allocator: std
 
     var last_error: ?anyerror = null;
 
-    while (args.next(result.arena.allocator())) |item_or_error| {
-        const item = try item_or_error;
-
+    while (try args.next(result.arena.allocator())) |item| {
         if (std.mem.startsWith(u8, item, "--")) {
             if (std.mem.eql(u8, item, "--")) {
                 // double hyphen is considered 'everything from here now is positional'
@@ -163,8 +161,7 @@ pub fn parse(comptime Spec: type, args: *std.process.ArgIterator, allocator: std
 
     // This will consume the rest of the arguments as positional ones.
     // Only executes when the above loop is broken.
-    while (args.next(result.arena.allocator())) |item_or_error| {
-        const item = try item_or_error;
+    while (try args.next(result.arena.allocator())) |item| {
         try arglist.append(item);
     }
 
@@ -345,14 +342,14 @@ fn parseOption(
         val // use the literal value
     else if (requiresArg(field_type))
         // fetch from parser
-        try (args.next(result.arena.allocator()) orelse {
+        (try args.next(result.arena.allocator())) orelse {
             last_error.* = error.MissingArgument;
             try error_handling.process(error.MissingArgument, Error{
                 .option = "--" ++ name,
                 .kind = .missing_argument,
             });
             return;
-        })
+        }
     else
         // argument is "empty"
         "";

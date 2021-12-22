@@ -1,2 +1,8 @@
 zig-cache/
 .vscode/
+
+rheia
+rheia_bench
+
+*.php
+*.json

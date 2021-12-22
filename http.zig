@@ -82,7 +82,9 @@ pub fn Listener(comptime Handler: type) type {
 
                 var headers: [100]http.Header = undefined;
                 var request: http.Request = .{ .headers = &headers };
-                assert((try http.readRequest(frame, &request, 0)) == num_bytes_read);
+                if ((try http.readRequest(frame, &request, 0)) != num_bytes_read) {
+                    return error.ShortBuffer;
+                }
 
                 while (conn.buffer.items.len > 65536) {
                     try conn.write_parker.park(ctx);

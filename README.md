@@ -5,18 +5,21 @@ A blockchain written in [Zig](https://ziglang.org).
 ## design
 
 ### concurrency
+
 - thread-per-core architecture (thread pool for cpu-bound work)
 - async disk and network i/o using io_uring (single-threaded event loop)
 - (s/m)psc lock-free queues for cross-thread communication
 - eventfd for cross-thread notifications
 
 ### consensus
+
 - probabilistic finality of blocks and transactions
   - batching transactions into blocks increases transaction throughput
 - sampling-based leaderless consensus
   - allows for voting-based consensus, proof-of-work-based consensus by providing custom sampling weight functions
 
 ### database
+
 - sstables for on-disk storage format
 - memtable for keeping track of blockchain state (robin hood hash table?)
 - robin-hood hash tables for keeping track of pending transactions
@@ -25,14 +28,17 @@ A blockchain written in [Zig](https://ziglang.org).
 - upon finality of a block, flush all state changes and finalized transactions to sstable
 
 ### transaction gossip
+
 - push/pull protocol (push out transactions, pull in transactions)
   - able to tune better latency vs. throughput per node
   - pull transactions more often than push, as push is a concern for dos attacks
 
 ### block sampling
+
 - pull-based sampling protocol (pull in both finalized blocks and proposed blocks)
 
 ### smart contracts
+
 - ebpf? webassembly?
 
 ## getting started
@@ -162,17 +168,39 @@ Execute a read-only SQL query against the nodes' latest state.
 
 ### POST /transactions
 
-Submit a new transaction. The transaction's contents is expected to be in the HTTP request's body in binary format. The binary format is as follows:
+Submit a new transaction. The transaction's contents is expected to be in the HTTP request's body in binary format. If there are no public keys previously whitelisted, then transactions may be freely submitted by any user. Otherwise, only transactions created by whitelisted users may be submitted. The binary format of a transaction is as follows:
 
-| Name              | Size        | Description                                                                                                                                                                                                         |
-|-------------------|-------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Sender Public Key | 32 bytes    | The public key of the creator of the transaction.                                                                                                                                                                   |
-| Signature         | 64 bytes    | An Ed25519 signature of the transaction's contents. The transaction's contents is denoted to be all bytes after the 'data length' transaction field.                                                                |
-| Data Length       | 4 bytes     | An unsigned 32-bit little-endian integer denoting the total number of bytes that make up the 'data' transaction field.                                                                                              |
-| Sender Nonce      | 8 bytes     | An unsigned 64-bit little-endian integer which may be randomly generated to prevent transactions with identical fields from yielding the same cryptographic ID.                                                     |
-| Created At        | 8 bytes     | An unsigned 64-bit little-endian integer denoting the last-known block height the creator of the transaction is aware of. Ignored for the time being.                                                               |
+| Name              | Size        | Description                                                                                                                                                                                                                   |
+| ----------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Sender Public Key | 32 bytes    | The public key of the creator of the transaction.                                                                                                                                                                             |
+| Signature         | 64 bytes    | An Ed25519 signature of the transaction's contents. The transaction's contents is denoted to be all bytes after the 'data length' transaction field.                                                                          |
+| Data Length       | 4 bytes     | An unsigned 32-bit little-endian integer denoting the total number of bytes that make up the 'data' transaction field.                                                                                                        |
+| Sender Nonce      | 8 bytes     | An unsigned 64-bit little-endian integer which may be randomly generated to prevent transactions with identical fields from yielding the same cryptographic ID.                                                               |
+| Created At        | 8 bytes     | An unsigned 64-bit little-endian integer denoting the last-known block height the creator of the transaction is aware of. Ignored for the time being.                                                                         |
 | Tag               | 1 byte      | An unsigned 8-bit little-endian integer denoting what operation this transaction is meant to perform. A tag of 0 denotes a no-op transaction. A tag of 1 denotes a write-only SQL transaction which mutates blockchain state. |
-| Data              | Data Length | If the 'tag' transaction field is 0, then 'data' is nothing. If the 'tag' transaction field is 1, then 'data' is a write-only SQL statement that is to be executed once this transaction is finalized.                         |
+| Data              | Data Length | If the 'tag' transaction field is 0, then 'data' is nothing. If the 'tag' transaction field is 1, then 'data' is a write-only SQL statement that is to be executed once this transaction is finalized.                        |
+
+### PUT /whitelist
+
+Whitelists a public key. If there are no public keys previously whitelisted, then no whitelist is enforced. Otherwise, the user that makes this request must have been previously whitelisted.
+
+| Name              | Description                                                                                                          |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------- |
+| public_key        | The public key that was used to sign this request in hex.                                                            |
+| signature         | An Ed25519 signature of 'timestamp' encoded as a little-endian signed 64-bit integer in hex.                         |
+| target_public_key | The public key that is to be whitelisted.                                                                            |
+| timestamp         | A Unix timestamp in seconds. The timestamp must not be older than 10 minutes, or 10 minutes farther into the future. |
+
+### DELETE /whitelist
+
+Removes a public key from the whitelist. If there are no public keys previously whitelisted, then no whitelist is enforced. Otherwise, the user that makes this request must have been previously whitelisted.
+
+| Name              | Description                                                                                                          |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------- |
+| public_key        | The public key that was used to sign this request in hex.                                                            |
+| signature         | An Ed25519 signature of 'timestamp' encoded as a little-endian signed 64-bit integer in hex.                         |
+| target_public_key | The public key that is to be removed from the whitelist.                                                             |
+| timestamp         | A Unix timestamp in seconds. The timestamp must not be older than 10 minutes, or 10 minutes farther into the future. |
 
 ## research
 
@@ -182,7 +210,7 @@ Rheia makes heavy use of LRU caches to keep track of unbounded sets of data that
 
 [Rheia's LRU cache](lru.zig) is an amalgamation of both a Robin Hood Hash Table and a Doubly-linked Deque. The idea of meshing a hash table and doubly-linked deque together to construct a LRU cache is inspired by [this blog post](https://medium.com/@udaysagar.2177/fastest-lru-cache-in-java-c22262de42ad).
 
-An alternative LRU cache implementation was also experimented with, where deque entries and hash table entries were separately allocated. Such an implementation only yielded better overall throughput in comparison to Rheia's existing LRU cache implementation however when the cache's capacity is small and the maximum load factor is 50%. 
+An alternative LRU cache implementation was also experimented with, where deque entries and hash table entries were separately allocated. Such an implementation only yielded better overall throughput in comparison to Rheia's existing LRU cache implementation however when the cache's capacity is small and the maximum load factor is 50%.
 
 On my laptop, using Rheia's LRU cache with a max load factor of 50%, roughly:
 
@@ -231,7 +259,7 @@ info(intrusive lru w/ load factor 100% (1 million elements)): put: 974504, get: 
 ### mempool
 
 One of the most critical data structures required by Rheia is a main-memory index that is meant to keep track of all transactions that have yet to be finalized under Rheia's consensus protocol (or in other words, a mempool).
-    
+
 A mempool in general maps transactions by their ID's to their contents. The ID of a transaction is the checksum of its contents. In Rheia's case, the checksum or ID of a transaction is computed using the BLAKE3 hash function with an output size of 256 bits.
 
 There are two important things to look out for when it comes to figuring out the right data structure for Rheia's mempool given Rheia's choice of consensus protocol.
@@ -244,14 +272,14 @@ A lot of different data structures were benchmarked, and the final data structur
 To make the decision, the following data structures were benchmarked:
 
 1. Robin Hood Hash Table ([lithdew/rheia](benchmarks/mempool/hash_map.zig))
-1. B-Tree ([tidwall/btree.c](https://github.com/tidwall/btree.c))
-2. Adaptive Radix Tree ([armon/libart](https://github.com/armon/libart))
-3. Skiplist ([MauriceGit/skiplist](https://github.com/MauriceGit/skiplist) - ported to [zig](benchmarks/mempool/skiplist.zig))
-4. Red-black Tree ([ziglang/std-lib-orphanage](https://github.com/ziglang/std-lib-orphanage/blob/master/std/rb.zig))
-5. Radix Tree ([antirez/rax](https://github.com/antirez/rax) - ported to [zig](benchmarks/mempool/rax.zig))
-6. Binary Heap ([ziglang/zig](https://github.com/ziglang/zig/blob/master/lib/std/priority_queue.zig))
-7. Adaptive Radix Tree ([armon/libart](https://github.com/armon/libart) - ported to [zig](benchmarks/mempool/art.zig))
-8. Adaptive Radix Tree ([travisstaloch/art.zig](https://github.com/travisstaloch/art.zig))
+2. B-Tree ([tidwall/btree.c](https://github.com/tidwall/btree.c))
+3. Adaptive Radix Tree ([armon/libart](https://github.com/armon/libart))
+4. Skiplist ([MauriceGit/skiplist](https://github.com/MauriceGit/skiplist) - ported to [zig](benchmarks/mempool/skiplist.zig))
+5. Red-black Tree ([ziglang/std-lib-orphanage](https://github.com/ziglang/std-lib-orphanage/blob/master/std/rb.zig))
+6. Radix Tree ([antirez/rax](https://github.com/antirez/rax) - ported to [zig](benchmarks/mempool/rax.zig))
+7. Binary Heap ([ziglang/zig](https://github.com/ziglang/zig/blob/master/lib/std/priority_queue.zig))
+8. Adaptive Radix Tree ([armon/libart](https://github.com/armon/libart) - ported to [zig](benchmarks/mempool/art.zig))
+9. Adaptive Radix Tree ([travisstaloch/art.zig](https://github.com/travisstaloch/art.zig))
 
 The robin hood hash table showed the highest average overall throughput over the following tests:
 

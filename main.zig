@@ -1458,7 +1458,215 @@ pub const HttpHandler = struct {
         http.router.get("/database/:query", queryDatabase),
 
         http.router.post("/transactions", submitTransaction),
+
+        http.router.put("/whitelist", addToWhitelist),
+        http.router.delete("/whitelist", removeFromWhitelist),
     });
+
+    pub fn addToWhitelist(
+        self: HttpHandler,
+        ctx: *Context,
+        gpa: mem.Allocator,
+        req: http.Request,
+        reader: anytype,
+        writer: anytype,
+        _: []http.router.Param,
+    ) !void {
+        _ = ctx;
+
+        const content_length = for (req.getHeaders()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "content-length")) {
+                break try fmt.parseInt(usize, header.value, 10);
+            }
+        } else return error.ContentLengthExpected;
+
+        if (content_length > 512 * 1024) {
+            return error.ContentLengthMustBeLessThan512kb;
+        }
+
+        const body: []u8 = try reader.readAllAlloc(gpa, content_length);
+        defer gpa.free(body);
+
+        var tokens = std.json.TokenStream.init(body);
+
+        const Request = struct {
+            public_key: [Ed25519.public_length * 2]u8,
+            signature: [Ed25519.signature_length * 2]u8,
+            target_public_key: [Ed25519.public_length * 2]u8,
+            timestamp: i64,
+        };
+
+        const request = try std.json.parse(Request, &tokens, .{});
+        defer std.json.parseFree(Request, request, .{});
+
+        const current_time = @divTrunc(std.time.milliTimestamp(), std.time.ms_per_s);
+        const lower_bound = try std.math.sub(i64, current_time, 10 * std.time.s_per_min);
+        const upper_bound = try std.math.add(i64, current_time, 10 * std.time.s_per_min);
+        if (request.timestamp < lower_bound) return error.RequestTooOld;
+        if (request.timestamp > upper_bound) return error.RequestTooNew;
+
+        var public_key: [Ed25519.public_length]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&public_key, &request.public_key);
+
+        var signature: [Ed25519.signature_length]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&signature, &request.signature);
+
+        var target_public_key: [Ed25519.public_length]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&target_public_key, &request.target_public_key);
+
+        const message = mem.nativeToLittle(i64, request.timestamp);
+        try Ed25519.verify(signature, mem.asBytes(&message), public_key);
+
+        const is_whitelisted = is_whitelisted: {
+            var conn = try self.node.chain.store.acquireConnection();
+            defer self.node.chain.store.releaseConnection(&conn);
+
+            runtime.startCpuBoundOperation();
+            defer runtime.endCpuBoundOperation();
+
+            break :is_whitelisted self.node.chain.store.isPublicKeyWhitelisted(&conn, public_key);
+        };
+
+        if (!is_whitelisted) {
+            return error.UserNotWhitelisted;
+        }
+
+        {
+            var conn = try self.node.chain.store.acquireConnection();
+            defer self.node.chain.store.releaseConnection(&conn);
+
+            runtime.startCpuBoundOperation();
+            defer runtime.endCpuBoundOperation();
+
+            try self.node.chain.store.addPublicKeyToWhitelist(&conn, target_public_key);
+        }
+
+        const response_message = "{\"status: \"ok\"}";
+
+        const response: http.Response = .{
+            .status_code = 200,
+            .message = "OK",
+            .headers = &[_]http.Header{
+                .{ .name = "Content-Type", .value = "application/json" },
+                .{ .name = "Content-Length", .value = std.fmt.comptimePrint("{d}", .{response_message.len}) },
+            },
+            .num_headers = 2,
+        };
+
+        try writer.print("{}", .{response});
+        try writer.writeAll(response_message);
+    }
+
+    pub fn removeFromWhitelist(
+        self: HttpHandler,
+        ctx: *Context,
+        gpa: mem.Allocator,
+        req: http.Request,
+        reader: anytype,
+        writer: anytype,
+        _: []http.router.Param,
+    ) !void {
+        _ = ctx;
+
+        const content_length = for (req.getHeaders()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "content-length")) {
+                break try fmt.parseInt(usize, header.value, 10);
+            }
+        } else return error.ContentLengthExpected;
+
+        if (content_length > 512 * 1024) {
+            return error.ContentLengthMustBeLessThan512kb;
+        }
+
+        const body: []u8 = try reader.readAllAlloc(gpa, content_length);
+        defer gpa.free(body);
+
+        var tokens = std.json.TokenStream.init(body);
+
+        const Request = struct {
+            public_key: [Ed25519.public_length * 2]u8,
+            signature: [Ed25519.signature_length * 2]u8,
+            target_public_key: [Ed25519.public_length * 2]u8,
+            timestamp: i64,
+        };
+
+        const request = try std.json.parse(Request, &tokens, .{});
+        defer std.json.parseFree(Request, request, .{});
+
+        const current_time = @divTrunc(std.time.milliTimestamp(), std.time.ms_per_s);
+        const lower_bound = try std.math.sub(i64, current_time, 10 * std.time.s_per_min);
+        const upper_bound = try std.math.add(i64, current_time, 10 * std.time.s_per_min);
+        if (request.timestamp < lower_bound) return error.RequestTooOld;
+        if (request.timestamp > upper_bound) return error.RequestTooNew;
+
+        var public_key: [Ed25519.public_length]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&public_key, &request.public_key);
+
+        var signature: [Ed25519.signature_length]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&signature, &request.signature);
+
+        var target_public_key: [Ed25519.public_length]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&target_public_key, &request.target_public_key);
+
+        const message = mem.nativeToLittle(i64, request.timestamp);
+        try Ed25519.verify(signature, mem.asBytes(&message), public_key);
+
+        const is_whitelisted = is_whitelisted: {
+            var conn = try self.node.chain.store.acquireConnection();
+            defer self.node.chain.store.releaseConnection(&conn);
+
+            runtime.startCpuBoundOperation();
+            defer runtime.endCpuBoundOperation();
+
+            break :is_whitelisted self.node.chain.store.isPublicKeyWhitelisted(&conn, public_key);
+        };
+
+        if (!is_whitelisted) {
+            return error.UserNotWhitelisted;
+        }
+
+        const deleted = result: {
+            var conn = try self.node.chain.store.acquireConnection();
+            defer self.node.chain.store.releaseConnection(&conn);
+
+            runtime.startCpuBoundOperation();
+            defer runtime.endCpuBoundOperation();
+
+            break :result self.node.chain.store.removePublicKeyFromWhitelist(&conn, target_public_key);
+        };
+
+        if (deleted) {
+            const response_message = "{\"status: \"deleted\"}";
+
+            const response: http.Response = .{
+                .status_code = 200,
+                .message = "OK",
+                .headers = &[_]http.Header{
+                    .{ .name = "Content-Type", .value = "application/json" },
+                    .{ .name = "Content-Length", .value = std.fmt.comptimePrint("{d}", .{response_message.len}) },
+                },
+                .num_headers = 2,
+            };
+
+            try writer.print("{}", .{response});
+            try writer.writeAll(response_message);
+        } else {
+            const response_message = "{\"status: \"public key not whitelisted\"}";
+
+            const response: http.Response = .{
+                .status_code = 200,
+                .message = "OK",
+                .headers = &[_]http.Header{
+                    .{ .name = "Content-Type", .value = "application/json" },
+                    .{ .name = "Content-Length", .value = std.fmt.comptimePrint("{d}", .{response_message.len}) },
+                },
+                .num_headers = 2,
+            };
+
+            try writer.print("{}", .{response});
+            try writer.writeAll(response_message);
+        }
+    }
 
     pub fn index(
         self: HttpHandler,
@@ -1912,6 +2120,20 @@ pub const HttpHandler = struct {
 
         const tx = try Transaction.read(gpa, body.reader());
         defer tx.deinit(gpa);
+
+        const is_whitelisted = is_whitelisted: {
+            var conn = try self.node.chain.store.acquireConnection();
+            defer self.node.chain.store.releaseConnection(&conn);
+
+            runtime.startCpuBoundOperation();
+            defer runtime.endCpuBoundOperation();
+
+            break :is_whitelisted self.node.chain.store.isPublicKeyWhitelisted(&conn, tx.sender);
+        };
+
+        if (!is_whitelisted) {
+            return error.UserNotWhitelisted;
+        }
 
         self.node.verifier.push(ctx, gpa, tx.ref()) catch |err| {
             tx.deinit(gpa);
@@ -3247,8 +3469,8 @@ pub const SqliteStore = struct {
     const get_transaction_ids_by_block_height_query = "select id from transactions where block_height = ?{u64}";
     const get_transactions_by_block_height_query = "select id, sender, signature, sender_nonce, created_at, tag, data from transactions where block_height = ?{u64} limit ?{usize} offset ?{usize}";
     const is_whitelist_filled_query = "select 1 from whitelist";
-    const is_public_key_whitelisted_query = "select 1 from whitelist where public_key = ?{[]const u8} or exists(select 1 from whitelist)";
-    const add_public_key_to_whitelist_query = "insert into whitelist(public_key) values (?{[]const u8})";
+    const is_public_key_whitelisted_query = "select 1 from whitelist where public_key = ?{[]const u8}";
+    const add_public_key_to_whitelist_query = "insert or ignore into whitelist(public_key) values (?{[]const u8})";
     const remove_public_key_from_whitelist_query = "delete from whitelist where public_key = ?{[]const u8}";
 
     pub const PooledConnection = struct {
@@ -3355,19 +3577,36 @@ pub const SqliteStore = struct {
         }
 
         const Authorizer = struct {
-            pub fn check(user_data: ?*c_void, action_code: c_int, param_1: ?[*:0]const u8, param_2: ?[*:0]const u8, param_3: ?[*:0]const u8, param_4: ?[*:0]const u8) callconv(.C) c_int {
+            pub fn check(
+                user_data: ?*anyopaque,
+                action_code: c_int,
+                param_1: ?[*:0]const u8,
+                param_2: ?[*:0]const u8,
+                param_3: ?[*:0]const u8,
+                param_4: ?[*:0]const u8,
+            ) callconv(.C) c_int {
                 _ = user_data;
                 _ = param_2;
                 _ = param_3;
                 _ = param_4;
 
                 switch (action_code) {
+                    sqlite.c.SQLITE_DELETE => {
+                        const table_name = mem.sliceTo(param_1 orelse return sqlite.c.SQLITE_OK, 0);
+                        if (mem.eql(u8, table_name, "blocks") or
+                            mem.eql(u8, table_name, "transactions"))
+                        {
+                            return sqlite.c.SQLITE_DENY;
+                        }
+                    },
                     sqlite.c.SQLITE_UPDATE,
-                    sqlite.c.SQLITE_DELETE,
                     sqlite.c.SQLITE_DROP_TABLE,
                     => {
                         const table_name = mem.sliceTo(param_1 orelse return sqlite.c.SQLITE_OK, 0);
-                        if (mem.eql(u8, table_name, "blocks") or mem.eql(u8, table_name, "transactions") or mem.eql(u8, table_name, "whitelist")) {
+                        if (mem.eql(u8, table_name, "blocks") or
+                            mem.eql(u8, table_name, "transactions") or
+                            mem.eql(u8, table_name, "whitelist"))
+                        {
                             return sqlite.c.SQLITE_DENY;
                         }
                     },
@@ -3377,10 +3616,6 @@ pub const SqliteStore = struct {
                 return sqlite.c.SQLITE_OK;
             }
         };
-
-        if (sqlite.c.sqlite3_set_authorizer(conn.db, Authorizer.check, null) != sqlite.c.SQLITE_OK) {
-            return error.AuthorizerNotInitialized;
-        }
 
         _ = try conn.pragma(void, .{}, "page_size", "32768");
         _ = try conn.pragma(void, .{}, "journal_mode", "WAL");
@@ -3437,6 +3672,10 @@ pub const SqliteStore = struct {
 
         pooled.remove_public_key_from_whitelist = try pooled.conn.prepareWithDiags(remove_public_key_from_whitelist_query, .{ .diags = &diags });
         errdefer pooled.remove_public_key_from_whitelist.deinit();
+
+        if (sqlite.c.sqlite3_set_authorizer(conn.db, Authorizer.check, null) != sqlite.c.SQLITE_OK) {
+            return error.AuthorizerNotInitialized;
+        }
 
         return pooled;
     }
@@ -3816,9 +4055,15 @@ pub const SqliteStore = struct {
 
         pooled.remove_public_key_from_whitelist.reset();
 
-        try pooled.remove_public_key_from_whitelist.exec(
+        pooled.remove_public_key_from_whitelist.exec(
             .{ .diags = &diags },
             .{ .public_key = @as([]const u8, &public_key) },
-        );
+        ) catch return false;
+
+        if (pooled.conn.rowsAffected() == 0) {
+            return false;
+        }
+
+        return true;
     }
 };

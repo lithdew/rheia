@@ -272,7 +272,7 @@ pub const Runtime = struct {
             self.gpa_instance.backing_allocator = std.heap.c_allocator;
         }
         if (builtin.mode != .Debug) {
-            self.gpa = &self.gpa_instance.allocator;
+            self.gpa = self.gpa_instance.allocator();
         } else {
             self.gpa = std.heap.c_allocator;
         }

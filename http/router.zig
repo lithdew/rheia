@@ -34,6 +34,14 @@ pub fn post(comptime path: []const u8, comptime handler: anytype) Route {
     return handle(.post, path, handler);
 }
 
+pub fn put(comptime path: []const u8, comptime handler: anytype) Route {
+    return handle(.put, path, handler);
+}
+
+pub fn delete(comptime path: []const u8, comptime handler: anytype) Route {
+    return handle(.delete, path, handler);
+}
+
 pub fn build(comptime Handler: type, routes: anytype) type {
     comptime var roots: [@typeInfo(http.Method).Enum.fields.len - 1]trie.Node(usize) = undefined;
     inline for (roots) |*root| root.* = .{};
