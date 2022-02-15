@@ -23,6 +23,7 @@
 // SOFTWARE.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const fmt = std.fmt;
 const mem = std.mem;
@@ -341,38 +342,42 @@ const token_char_map = [256]u1{
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0xf0
 };
 
-extern fn @"llvm.x86.sse42.pcmpestri128"(meta.Vector(16, i8), i32, meta.Vector(16, i8), i32, u8) i32;
-
 fn findCharacter(buf_const: [*]const u8, buf_end: [*]const u8, ranges: [*]const u8, ranges_len: usize, found: *bool) [*]const u8 {
     found.* = false;
 
     var buf = buf_const;
-    if (@ptrToInt(buf_end) - @ptrToInt(buf) >= 16) {
-        const ranges16 = @as(meta.Vector(16, u8), ranges[0..16].*);
+    if (comptime std.Target.x86.featureSetHas(builtin.target.cpu.features, .sse4_2)) {
+        const Intrinsic = struct {
+            extern fn @"llvm.x86.sse42.pcmpestri128"(meta.Vector(16, i8), i32, meta.Vector(16, i8), i32, u8) i32;
+        };
 
-        var left = (@ptrToInt(buf_end) - @ptrToInt(buf)) & ~@as(usize, 16 - 1);
-        while (true) {
-            const buf16 = @as(meta.Vector(16, u8), buf[0..16].*);
+        if (@ptrToInt(buf_end) - @ptrToInt(buf) >= 16) {
+            const ranges16 = @as(meta.Vector(16, u8), ranges[0..16].*);
 
-            const r = @"llvm.x86.sse42.pcmpestri128"(
-                @bitCast(meta.Vector(16, i8), ranges16),
-                @intCast(i32, ranges_len),
-                @bitCast(meta.Vector(16, i8), buf16),
-                16,
-                4,
-            );
-            if (r != 16) {
-                buf += @intCast(usize, r);
-                found.* = true;
-                break;
-            }
+            var left = (@ptrToInt(buf_end) - @ptrToInt(buf)) & ~@as(usize, 16 - 1);
+            while (true) {
+                const buf16 = @as(meta.Vector(16, u8), buf[0..16].*);
 
-            buf += 16;
-            left -= 16;
+                const r = Intrinsic.@"llvm.x86.sse42.pcmpestri128"(
+                    @bitCast(meta.Vector(16, i8), ranges16),
+                    @intCast(i32, ranges_len),
+                    @bitCast(meta.Vector(16, i8), buf16),
+                    16,
+                    4,
+                );
+                if (r != 16) {
+                    buf += @intCast(usize, r);
+                    found.* = true;
+                    break;
+                }
 
-            if (left == 0) {
-                @setCold(true);
-                break;
+                buf += 16;
+                left -= 16;
+
+                if (left == 0) {
+                    @setCold(true);
+                    break;
+                }
             }
         }
     }

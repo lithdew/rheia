@@ -174,7 +174,7 @@ fn benchmarkBinaryHeap() !void {
     log("skipping search/delete...", .{});
 }
 
-fn compareBTreeHash(a: ?*const c_void, b: ?*const c_void, _: ?*c_void) callconv(.C) c_int {
+fn compareBTreeHash(a: ?*const anyopaque, b: ?*const anyopaque, _: ?*anyopaque) callconv(.C) c_int {
     return switch (std.mem.order(u8, @ptrCast(*const [32]u8, a.?), @ptrCast(*const [32]u8, b.?))) {
         .lt => -1,
         .eq => 0,
@@ -235,7 +235,7 @@ fn benchmarkLibart() !void {
 
     var timer = try std.time.Timer.start();
     for (keys) |*key| {
-        if (c.art_insert(&tree, key, key.len, @intToPtr(*c_void, 0xdeadbeef)) != null) {
+        if (c.art_insert(&tree, key, key.len, @intToPtr(*anyopaque, 0xdeadbeef)) != null) {
             return error.AlreadyExists;
         }
     }
@@ -270,12 +270,12 @@ fn benchmarkArtTravis() !void {
         key[32] = 0;
     }
 
-    var tree = art_travis.Art(*c_void).init(gpa);
+    var tree = art_travis.Art(*anyopaque).init(gpa);
     defer tree.deinit();
 
     var timer = try std.time.Timer.start();
     for (keys) |*key| {
-        const result = try tree.insert(key, @intToPtr(*c_void, 0xdeadbeef));
+        const result = try tree.insert(key, @intToPtr(*anyopaque, 0xdeadbeef));
         if (result == .found) {
             return error.AlreadyExists;
         }
@@ -311,12 +311,12 @@ fn benchmarkArt() !void {
         rng.random().bytes(key);
     }
 
-    var tree: art.Tree(*c_void) = .{};
+    var tree: art.Tree(*anyopaque) = .{};
     defer tree.deinit(gpa);
 
     var timer = try std.time.Timer.start();
     for (keys) |*key| {
-        if ((try tree.insert(gpa, key, @intToPtr(*c_void, 0xdeadbeef))) != null) {
+        if ((try tree.insert(gpa, key, @intToPtr(*anyopaque, 0xdeadbeef))) != null) {
             return error.AlreadyExists;
         }
     }
@@ -355,7 +355,7 @@ fn benchmarkRax() !void {
 
     var timer = try std.time.Timer.start();
     for (keys) |*key| {
-        if (!try tree.insert(gpa, key, @intToPtr(*c_void, 0xdeadbeef), .{})) {
+        if (!try tree.insert(gpa, key, @intToPtr(*anyopaque, 0xdeadbeef), .{})) {
             return error.AlreadyExists;
         }
     }

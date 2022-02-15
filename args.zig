@@ -26,10 +26,14 @@ const std = @import("std");
 /// - `Spec` is the configuration of the arguments.
 /// - `allocator` is the allocator that is used to allocate all required memory
 /// - `error_handling` defines how parser errors will be handled.
-pub fn parseForCurrentProcess(comptime Spec: type, allocator: std.mem.Allocator, error_handling: ErrorHandling) !ParseArgsResult(Spec) {
-    var args = std.process.args();
+pub fn parseForCurrentProcess(comptime Spec: type, allocator: std.mem.Allocator, error_handling: ErrorHandling) !ParseArgsResult(Spec, null) {
+    // Use argsWithAllocator for portability.
+    // All data allocated by the ArgIterator is freed at the end of the function.
+    // Data returned to the user is always duplicated using the allocator.
+    var args = try std.process.argsWithAllocator(allocator);
+    defer args.deinit();
 
-    const executable_name = (try args.next(allocator)) orelse {
+    const executable_name = args.next() orelse {
         try error_handling.process(error.NoExecutableName, Error{
             .option = "",
             .kind = .missing_executable_name,
@@ -38,37 +42,85 @@ pub fn parseForCurrentProcess(comptime Spec: type, allocator: std.mem.Allocator,
         // we do not assume any more arguments appear here anyways...
         return error.NoExecutableName;
     };
-    errdefer allocator.free(executable_name);
 
-    var result = try parse(Spec, &args, allocator, error_handling);
+    var result = try parseInternal(Spec, null, &args, allocator, error_handling);
 
-    result.executable_name = executable_name;
+    result.executable_name = try allocator.dupeZ(u8, executable_name);
+
+    return result;
+}
+
+/// Parses arguments for the given specification and our current process.
+/// - `Spec` is the configuration of the arguments.
+/// - `allocator` is the allocator that is used to allocate all required memory
+/// - `error_handling` defines how parser errors will be handled.
+pub fn parseWithVerbForCurrentProcess(comptime Spec: type, comptime Verb: type, allocator: std.mem.Allocator, error_handling: ErrorHandling) !ParseArgsResult(Spec, Verb) {
+    // Use argsWithAllocator for portability.
+    // All data allocated by the ArgIterator is freed at the end of the function.
+    // Data returned to the user is always duplicated using the allocator.
+    var args = try std.process.argsWithAllocator(allocator);
+    defer args.deinit();
+
+    const executable_name = args.next() orelse {
+        try error_handling.process(error.NoExecutableName, Error{
+            .option = "",
+            .kind = .missing_executable_name,
+        });
+
+        // we do not assume any more arguments appear here anyways...
+        return error.NoExecutableName;
+    };
+
+    var result = try parseInternal(Spec, Verb, &args, allocator, error_handling);
+
+    result.executable_name = try allocator.dupeZ(u8, executable_name);
 
     return result;
 }
 
 /// Parses arguments for the given specification.
-/// - `Spec` is the configuration of the arguments.
-/// - `args` is an ArgIterator that will yield the command line arguments.
+/// - `Generic` is the configuration of the arguments.
+/// - `args_iterator` is a pointer to an std.process.ArgIterator that will yield the command line arguments.
 /// - `allocator` is the allocator that is used to allocate all required memory
 /// - `error_handling` defines how parser errors will be handled.
 ///
 /// Note that `.executable_name` in the result will not be set!
-pub fn parse(comptime Spec: type, args: *std.process.ArgIterator, allocator: std.mem.Allocator, error_handling: ErrorHandling) !ParseArgsResult(Spec) {
-    var result = ParseArgsResult(Spec){
+pub fn parse(comptime Generic: type, args_iterator: anytype, allocator: std.mem.Allocator, error_handling: ErrorHandling) !ParseArgsResult(Generic, null) {
+    return parseInternal(Generic, null, args_iterator, allocator, error_handling);
+}
+
+/// Parses arguments for the given specification using a `Verb` method.
+/// This means that the first positional argument is interpreted as a verb, that can
+/// be considered a sub-command that provides more specific options.
+/// - `Generic` is the configuration of the arguments.
+/// - `Verb` is the configuration of the verbs.
+/// - `args_iterator` is a pointer to an std.process.ArgIterator that will yield the command line arguments.
+/// - `allocator` is the allocator that is used to allocate all required memory
+/// - `error_handling` defines how parser errors will be handled.
+///
+/// Note that `.executable_name` in the result will not be set!
+pub fn parseWithVerb(comptime Generic: type, comptime Verb: type, args_iterator: anytype, allocator: std.mem.Allocator, error_handling: ErrorHandling) !ParseArgsResult(Generic, Verb) {
+    return parseInternal(Generic, Verb, args_iterator, allocator, error_handling);
+}
+
+/// Same as parse, but with anytype argument for testability
+fn parseInternal(comptime Generic: type, comptime MaybeVerb: ?type, args_iterator: anytype, allocator: std.mem.Allocator, error_handling: ErrorHandling) !ParseArgsResult(Generic, MaybeVerb) {
+    var result = ParseArgsResult(Generic, MaybeVerb){
         .arena = std.heap.ArenaAllocator.init(allocator),
-        .options = Spec{},
+        .options = Generic{},
+        .verb = if (MaybeVerb != null) null else {}, // no verb by default
         .positionals = undefined,
         .executable_name = null,
     };
     errdefer result.arena.deinit();
+    var result_arena_allocator = result.arena.allocator();
 
     var arglist = std.ArrayList([:0]const u8).init(allocator);
     errdefer arglist.deinit();
 
     var last_error: ?anyerror = null;
 
-    while (try args.next(result.arena.allocator())) |item| {
+    while (args_iterator.next()) |item| {
         if (std.mem.startsWith(u8, item, "--")) {
             if (std.mem.eql(u8, item, "--")) {
                 // double hyphen is considered 'everything from here now is positional'
@@ -92,10 +144,37 @@ pub fn parse(comptime Spec: type, args: *std.process.ArgIterator, allocator: std
                 };
 
             var found = false;
-            inline for (std.meta.fields(Spec)) |fld| {
+            inline for (std.meta.fields(Generic)) |fld| {
                 if (std.mem.eql(u8, pair.name, fld.name)) {
-                    try parseOption(Spec, &result, args, error_handling, &last_error, fld.name, pair.value);
+                    try parseOption(Generic, result_arena_allocator, &result.options, args_iterator, error_handling, &last_error, fld.name, pair.value);
                     found = true;
+                }
+            }
+
+            if (MaybeVerb) |Verb| {
+                if (result.verb) |*verb| {
+                    if (!found) {
+                        const Tag = std.meta.Tag(Verb);
+                        inline for (std.meta.fields(Verb)) |verb_info| {
+                            if (verb.* == @field(Tag, verb_info.name)) {
+                                inline for (std.meta.fields(verb_info.field_type)) |fld| {
+                                    if (std.mem.eql(u8, pair.name, fld.name)) {
+                                        try parseOption(
+                                            verb_info.field_type,
+                                            result_arena_allocator,
+                                            &@field(verb.*, verb_info.name),
+                                            args_iterator,
+                                            error_handling,
+                                            &last_error,
+                                            fld.name,
+                                            pair.value,
+                                        );
+                                        found = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -109,17 +188,19 @@ pub fn parse(comptime Spec: type, args: *std.process.ArgIterator, allocator: std
         } else if (std.mem.startsWith(u8, item, "-")) {
             if (std.mem.eql(u8, item, "-")) {
                 // single hyphen is considered a positional argument
-                try arglist.append(item);
+                try arglist.append(try result_arena_allocator.dupeZ(u8, item));
             } else {
-                if (@hasDecl(Spec, "shorthands")) {
-                    for (item[1..]) |char, index| {
-                        var option_name = [2]u8{ '-', char };
-                        var found = false;
-                        inline for (std.meta.fields(@TypeOf(Spec.shorthands))) |fld| {
+                var any_shorthands = false;
+                for (item[1..]) |char, index| {
+                    var option_name = [2]u8{ '-', char };
+                    var found = false;
+                    if (@hasDecl(Generic, "shorthands")) {
+                        any_shorthands = true;
+                        inline for (std.meta.fields(@TypeOf(Generic.shorthands))) |fld| {
                             if (fld.name.len != 1)
                                 @compileError("All shorthand fields must be exactly one character long!");
                             if (fld.name[0] == char) {
-                                const real_name = @field(Spec.shorthands, fld.name);
+                                const real_name = @field(Generic.shorthands, fld.name);
                                 const real_fld_type = @TypeOf(@field(result.options, real_name));
 
                                 // -2 because we stripped of the "-" at the beginning
@@ -130,21 +211,60 @@ pub fn parse(comptime Spec: type, args: *std.process.ArgIterator, allocator: std
                                         .kind = .invalid_placement,
                                     });
                                 } else {
-                                    try parseOption(Spec, &result, args, error_handling, &last_error, real_name, null);
+                                    try parseOption(Generic, result_arena_allocator, &result.options, args_iterator, error_handling, &last_error, real_name, null);
                                 }
 
                                 found = true;
                             }
                         }
-                        if (!found) {
-                            last_error = error.EncounteredUnknownArgument;
-                            try error_handling.process(error.EncounteredUnknownArgument, Error{
-                                .option = &option_name,
-                                .kind = .unknown,
-                            });
+                    }
+
+                    if (MaybeVerb) |Verb| {
+                        if (result.verb) |*verb| {
+                            if (!found) {
+                                const Tag = std.meta.Tag(Verb);
+                                inline for (std.meta.fields(Verb)) |verb_info| {
+                                    const VerbType = verb_info.field_type;
+                                    if (verb.* == @field(Tag, verb_info.name)) {
+                                        const target_value = &@field(verb.*, verb_info.name);
+                                        if (@hasDecl(VerbType, "shorthands")) {
+                                            any_shorthands = true;
+                                            inline for (std.meta.fields(@TypeOf(VerbType.shorthands))) |fld| {
+                                                if (fld.name.len != 1)
+                                                    @compileError("All shorthand fields must be exactly one character long!");
+                                                if (fld.name[0] == char) {
+                                                    const real_name = @field(VerbType.shorthands, fld.name);
+                                                    const real_fld_type = @TypeOf(@field(target_value.*, real_name));
+
+                                                    // -2 because we stripped of the "-" at the beginning
+                                                    if (requiresArg(real_fld_type) and index != item.len - 2) {
+                                                        last_error = error.EncounteredUnexpectedArgument;
+                                                        try error_handling.process(error.EncounteredUnexpectedArgument, Error{
+                                                            .option = &option_name,
+                                                            .kind = .invalid_placement,
+                                                        });
+                                                    } else {
+                                                        try parseOption(VerbType, result_arena_allocator, target_value, args_iterator, error_handling, &last_error, real_name, null);
+                                                    }
+                                                    last_error = null; // we need to reset that error here, as it was set previously
+                                                    found = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
-                } else {
+                    if (!found) {
+                        last_error = error.EncounteredUnknownArgument;
+                        try error_handling.process(error.EncounteredUnknownArgument, Error{
+                            .option = &option_name,
+                            .kind = .unknown,
+                        });
+                    }
+                }
+                if (!any_shorthands) {
                     try error_handling.process(error.EncounteredUnsupportedArgument, Error{
                         .option = item,
                         .kind = .unsupported,
@@ -152,7 +272,27 @@ pub fn parse(comptime Spec: type, args: *std.process.ArgIterator, allocator: std
                 }
             }
         } else {
-            try arglist.append(item);
+            if (MaybeVerb) |Verb| {
+                if (result.verb == null) {
+                    inline for (std.meta.fields(Verb)) |fld| {
+                        if (std.mem.eql(u8, item, fld.name)) {
+                            // found active verb, default-initialize it
+                            result.verb = @unionInit(Verb, fld.name, fld.field_type{});
+                        }
+                    }
+
+                    if (result.verb == null) {
+                        try error_handling.process(error.EncounteredUnknownVerb, Error{
+                            .option = "verb",
+                            .kind = .unsupported,
+                        });
+                    }
+
+                    continue;
+                }
+            }
+
+            try arglist.append(try result_arena_allocator.dupeZ(u8, item));
         }
     }
 
@@ -161,8 +301,8 @@ pub fn parse(comptime Spec: type, args: *std.process.ArgIterator, allocator: std
 
     // This will consume the rest of the arguments as positional ones.
     // Only executes when the above loop is broken.
-    while (try args.next(result.arena.allocator())) |item| {
-        try arglist.append(item);
+    while (args_iterator.next()) |item| {
+        try arglist.append(try result_arena_allocator.dupeZ(u8, item));
     }
 
     result.positionals = arglist.toOwnedSlice();
@@ -170,17 +310,31 @@ pub fn parse(comptime Spec: type, args: *std.process.ArgIterator, allocator: std
 }
 
 /// The return type of the argument parser.
-pub fn ParseArgsResult(comptime Spec: type) type {
+pub fn ParseArgsResult(comptime Generic: type, comptime MaybeVerb: ?type) type {
+    if (@typeInfo(Generic) != .Struct)
+        @compileError("Generic argument definition must be a struct");
+
+    if (MaybeVerb) |Verb| {
+        const ti: std.builtin.TypeInfo = @typeInfo(Verb);
+        if (ti != .Union or ti.Union.tag_type == null)
+            @compileError("Verb must be a tagged union");
+    }
+
     return struct {
         const Self = @This();
 
         /// Exports the type of options.
-        pub const Options = Spec;
+        pub const GenericOptions = Generic;
+        pub const Verbs = MaybeVerb orelse void;
 
         arena: std.heap.ArenaAllocator,
 
         /// The options with either default or set values.
-        options: Spec,
+        options: Generic,
+
+        /// The verb that was parsed or `null` if no first positional was provided.
+        /// Is `void` when verb parsing is disabled
+        verb: if (MaybeVerb) |Verb| ?Verb else void,
 
         /// The positional arguments that were passed to the process.
         positionals: [][:0]const u8,
@@ -210,6 +364,7 @@ fn requiresArg(comptime T: type) bool {
                 .Int, .Float, .Enum => true,
                 .Bool => false,
                 .Struct, .Union => true,
+                .Pointer => true,
                 else => @compileError(@typeName(Type) ++ " is not a supported argument type!"),
             };
         }
@@ -294,12 +449,9 @@ test "parseInt" {
 }
 
 /// Converts an argument value to the target type.
-fn convertArgumentValue(comptime T: type, textInput: []const u8) !T {
-    if (T == []const u8)
-        return textInput;
-
+fn convertArgumentValue(comptime T: type, allocator: std.mem.Allocator, textInput: []const u8) !T {
     switch (@typeInfo(T)) {
-        .Optional => |opt| return try convertArgumentValue(opt.child, textInput),
+        .Optional => |opt| return try convertArgumentValue(opt.child, allocator, textInput),
         .Bool => if (textInput.len > 0)
             return try parseBoolean(textInput)
         else
@@ -320,6 +472,27 @@ fn convertArgumentValue(comptime T: type, textInput: []const u8) !T {
                 @compileError(@typeName(T) ++ " has no public visible `fn parse([]const u8) !T`!");
             }
         },
+        .Pointer => |ptr| switch (ptr.size) {
+            .Slice => {
+                if (ptr.child != u8) {
+                    @compileError(@typeName(T) ++ " is not a supported pointer type, only slices of u8 are supported");
+                }
+
+                // If the type contains a sentinel dupe the text input to a new buffer.
+                // This is equivalent to allocator.dupeZ but works with any sentinel.
+                if (comptime std.meta.sentinel(T)) |sentinel| {
+                    const data = try allocator.alloc(u8, textInput.len + 1);
+                    std.mem.copy(u8, data, textInput);
+                    data[textInput.len] = sentinel;
+
+                    return data[0..textInput.len :sentinel];
+                }
+
+                // Otherwise the type is []const u8 so just return the text input.
+                return textInput;
+            },
+            else => @compileError(@typeName(T) ++ " is not a supported pointer type!"),
+        },
         else => @compileError(@typeName(T) ++ " is not a supported argument type!"),
     }
 }
@@ -327,8 +500,9 @@ fn convertArgumentValue(comptime T: type, textInput: []const u8) !T {
 /// Parses an option value into the correct type.
 fn parseOption(
     comptime Spec: type,
-    result: *ParseArgsResult(Spec),
-    args: *std.process.ArgIterator,
+    arena: std.mem.Allocator,
+    target_struct: *Spec,
+    args: anytype,
     error_handling: ErrorHandling,
     last_error: *?anyerror,
     /// The name of the option that is currently parsed.
@@ -336,13 +510,16 @@ fn parseOption(
     /// Optional pre-defined value for options that use `--foo=bar`
     value: ?[]const u8,
 ) !void {
-    const field_type = @TypeOf(@field(result.options, name));
+    const field_type = @TypeOf(@field(target_struct, name));
 
-    const final_value = if (value) |val|
-        val // use the literal value
-    else if (requiresArg(field_type))
+    const final_value = if (value) |val| blk: {
+        // use the literal value
+        const res = try arena.dupeZ(u8, val);
+        break :blk res;
+    } else if (requiresArg(field_type)) blk: {
         // fetch from parser
-        (try args.next(result.arena.allocator())) orelse {
+        const val = args.next();
+        if (val == null or std.mem.eql(u8, val.?, "--")) {
             last_error.* = error.MissingArgument;
             try error_handling.process(error.MissingArgument, Error{
                 .option = "--" ++ name,
@@ -350,11 +527,15 @@ fn parseOption(
             });
             return;
         }
-    else
-        // argument is "empty"
-        "";
 
-    @field(result.options, name) = convertArgumentValue(field_type, final_value) catch |err| {
+        const res = try arena.dupeZ(u8, val.?);
+        break :blk res;
+    } else blk: {
+        // argument is "empty"
+        break :blk "";
+    };
+
+    @field(target_struct, name) = convertArgumentValue(field_type, arena, final_value) catch |err| {
         last_error.* = err;
         try error_handling.process(err, Error{
             .option = "--" ++ name,
@@ -400,13 +581,7 @@ pub const ErrorCollection = struct {
                     .invalid_value = try self.arena.allocator().dupe(u8, v),
                 },
                 // flat copy
-                .unknown,
-                .out_of_memory,
-                .unsupported,
-                .invalid_placement,
-                .missing_argument,
-                .missing_executable_name,
-                => err.kind,
+                .unknown, .out_of_memory, .unsupported, .invalid_placement, .missing_argument, .missing_executable_name, .unknown_verb => err.kind,
             },
         };
         try self.list.append(dupe);
@@ -435,6 +610,7 @@ pub const Error = struct {
             .missing_argument => try writer.print("Missing argument for option {s}", .{self.option}),
 
             .missing_executable_name => try writer.writeAll("Failed to get executable name from the argument list!"),
+            .unknown_verb => try writer.print("Unknown verb '{s}'.", .{self.option}),
         }
     }
 
@@ -459,6 +635,9 @@ pub const Error = struct {
 
         /// This error has an empty option name and can only happen when parsing the argument list for a process.
         missing_executable_name,
+
+        /// This error has the verb as an option name and will happen when a verb is provided that is not known.
+        unknown_verb,
     };
 };
 
@@ -466,7 +645,7 @@ pub const Error = struct {
 pub const ErrorHandling = union(enum) {
     const Self = @This();
 
-    /// Do not print or process any errors, just 
+    /// Do not print or process any errors, just
     /// return a fitting error on the first argument mismatch.
     silent,
 
@@ -510,4 +689,260 @@ test "ErrorCollection" {
 
     try std.testing.expectEqualStrings("option", ec.errors()[0].option);
     try std.testing.expectEqualStrings("invalid", ec.errors()[0].kind.invalid_value);
+}
+
+const TestIterator = struct {
+    sequence: []const [:0]const u8,
+    index: usize = 0,
+
+    pub fn init(items: []const [:0]const u8) TestIterator {
+        return TestIterator{ .sequence = items };
+    }
+
+    pub fn next(self: *@This()) ?[:0]const u8 {
+        if (self.index >= self.sequence.len)
+            return null;
+        const result = self.sequence[self.index];
+        self.index += 1;
+        return result;
+    }
+};
+
+const TestEnum = enum { default, special, slow, fast };
+
+const TestGenericOptions = struct {
+    output: ?[]const u8 = null,
+    @"with-offset": bool = false,
+    @"with-hexdump": bool = false,
+    @"intermix-source": bool = false,
+    numberOfBytes: ?i32 = null,
+    signed_number: ?i64 = null,
+    unsigned_number: ?u64 = null,
+    mode: TestEnum = .default,
+
+    // This declares short-hand options for single hyphen
+    pub const shorthands = .{
+        .S = "intermix-source",
+        .b = "with-hexdump",
+        .O = "with-offset",
+        .o = "output",
+    };
+};
+
+const TestVerb = union(enum) {
+    magic: MagicOptions,
+    booze: BoozeOptions,
+
+    const MagicOptions = struct { invoke: bool = false };
+    const BoozeOptions = struct {
+        cocktail: bool = false,
+        longdrink: bool = false,
+
+        pub const shorthands = .{
+            .c = "cocktail",
+            .l = "longdrink",
+        };
+    };
+};
+
+test "basic parsing (no verbs)" {
+    var titerator = TestIterator.init(&[_][:0]const u8{
+        "--output",
+        "foobar",
+        "--with-offset",
+        "--numberOfBytes",
+        "-250",
+        "--unsigned_number",
+        "0xFF00FF",
+        "positional 1",
+        "--mode",
+        "special",
+        "positional 2",
+    });
+    var args = try parseInternal(TestGenericOptions, null, &titerator, std.testing.allocator, .print);
+    defer args.deinit();
+
+    try std.testing.expectEqual(@as(?[:0]const u8, null), args.executable_name);
+    try std.testing.expect(void == @TypeOf(args.verb));
+    try std.testing.expectEqual(@as(usize, 2), args.positionals.len);
+    try std.testing.expectEqualStrings("positional 1", args.positionals[0]);
+    try std.testing.expectEqualStrings("positional 2", args.positionals[1]);
+
+    try std.testing.expectEqualStrings("foobar", args.options.output.?);
+
+    try std.testing.expectEqual(@as(?i32, -250), args.options.numberOfBytes);
+    try std.testing.expectEqual(@as(?u64, 0xFF00FF), args.options.unsigned_number);
+    try std.testing.expectEqual(TestEnum.special, args.options.mode);
+
+    try std.testing.expectEqual(@as(?i64, null), args.options.signed_number);
+
+    try std.testing.expectEqual(true, args.options.@"with-offset");
+    try std.testing.expectEqual(false, args.options.@"with-hexdump");
+    try std.testing.expectEqual(false, args.options.@"intermix-source");
+}
+
+test "shorthand parsing (no verbs)" {
+    var titerator = TestIterator.init(&[_][:0]const u8{
+        "-o",
+        "foobar",
+        "-O",
+        "--numberOfBytes",
+        "-250",
+        "--unsigned_number",
+        "0xFF00FF",
+        "positional 1",
+        "--mode",
+        "special",
+        "positional 2",
+    });
+    var args = try parseInternal(TestGenericOptions, null, &titerator, std.testing.allocator, .print);
+    defer args.deinit();
+
+    try std.testing.expectEqual(@as(?[:0]const u8, null), args.executable_name);
+    try std.testing.expect(void == @TypeOf(args.verb));
+    try std.testing.expectEqual(@as(usize, 2), args.positionals.len);
+    try std.testing.expectEqualStrings("positional 1", args.positionals[0]);
+    try std.testing.expectEqualStrings("positional 2", args.positionals[1]);
+
+    try std.testing.expectEqualStrings("foobar", args.options.output.?);
+
+    try std.testing.expectEqual(@as(?i32, -250), args.options.numberOfBytes);
+    try std.testing.expectEqual(@as(?u64, 0xFF00FF), args.options.unsigned_number);
+    try std.testing.expectEqual(TestEnum.special, args.options.mode);
+
+    try std.testing.expectEqual(@as(?i64, null), args.options.signed_number);
+
+    try std.testing.expectEqual(true, args.options.@"with-offset");
+    try std.testing.expectEqual(false, args.options.@"with-hexdump");
+    try std.testing.expectEqual(false, args.options.@"intermix-source");
+}
+
+test "basic parsing (with verbs)" {
+    var titerator = TestIterator.init(&[_][:0]const u8{
+        "--output", // non-verb options can come before or after verb
+        "foobar",
+        "booze", // verb
+        "--with-offset",
+        "--numberOfBytes",
+        "-250",
+        "--unsigned_number",
+        "0xFF00FF",
+        "positional 1",
+        "--mode",
+        "special",
+        "positional 2",
+        "--cocktail",
+    });
+    var args = try parseInternal(TestGenericOptions, TestVerb, &titerator, std.testing.allocator, .print);
+    defer args.deinit();
+
+    try std.testing.expectEqual(@as(?[:0]const u8, null), args.executable_name);
+    try std.testing.expect(?TestVerb == @TypeOf(args.verb));
+    try std.testing.expectEqual(@as(usize, 2), args.positionals.len);
+    try std.testing.expectEqualStrings("positional 1", args.positionals[0]);
+    try std.testing.expectEqualStrings("positional 2", args.positionals[1]);
+
+    try std.testing.expectEqualStrings("foobar", args.options.output.?);
+
+    try std.testing.expectEqual(@as(?i32, -250), args.options.numberOfBytes);
+    try std.testing.expectEqual(@as(?u64, 0xFF00FF), args.options.unsigned_number);
+    try std.testing.expectEqual(TestEnum.special, args.options.mode);
+
+    try std.testing.expectEqual(@as(?i64, null), args.options.signed_number);
+
+    try std.testing.expectEqual(true, args.options.@"with-offset");
+    try std.testing.expectEqual(false, args.options.@"with-hexdump");
+    try std.testing.expectEqual(false, args.options.@"intermix-source");
+
+    try std.testing.expect(args.verb.? == .booze);
+
+    const booze = args.verb.?.booze;
+
+    try std.testing.expectEqual(true, booze.cocktail);
+    try std.testing.expectEqual(false, booze.longdrink);
+}
+
+test "shorthand parsing (with verbs)" {
+    var titerator = TestIterator.init(&[_][:0]const u8{
+        "booze", // verb
+        "-o",
+        "foobar",
+        "-O",
+        "--numberOfBytes",
+        "-250",
+        "--unsigned_number",
+        "0xFF00FF",
+        "positional 1",
+        "--mode",
+        "special",
+        "positional 2",
+        "-c", // --cocktail
+    });
+    var args = try parseInternal(TestGenericOptions, TestVerb, &titerator, std.testing.allocator, .print);
+    defer args.deinit();
+
+    try std.testing.expectEqual(@as(?[:0]const u8, null), args.executable_name);
+    try std.testing.expect(?TestVerb == @TypeOf(args.verb));
+    try std.testing.expectEqual(@as(usize, 2), args.positionals.len);
+    try std.testing.expectEqualStrings("positional 1", args.positionals[0]);
+    try std.testing.expectEqualStrings("positional 2", args.positionals[1]);
+
+    try std.testing.expectEqualStrings("foobar", args.options.output.?);
+
+    try std.testing.expectEqual(@as(?i32, -250), args.options.numberOfBytes);
+    try std.testing.expectEqual(@as(?u64, 0xFF00FF), args.options.unsigned_number);
+    try std.testing.expectEqual(TestEnum.special, args.options.mode);
+
+    try std.testing.expectEqual(@as(?i64, null), args.options.signed_number);
+
+    try std.testing.expectEqual(true, args.options.@"with-offset");
+    try std.testing.expectEqual(false, args.options.@"with-hexdump");
+    try std.testing.expectEqual(false, args.options.@"intermix-source");
+
+    try std.testing.expect(args.verb.? == .booze);
+
+    const booze = args.verb.?.booze;
+
+    try std.testing.expectEqual(true, booze.cocktail);
+    try std.testing.expectEqual(false, booze.longdrink);
+}
+
+test "strings with sentinel" {
+    var titerator = TestIterator.init(&[_][:0]const u8{
+        "--output",
+        "foobar",
+    });
+    var args = try parseInternal(
+        struct {
+            output: ?[:0]const u8 = null,
+        },
+        null,
+        &titerator,
+        std.testing.allocator,
+        .print,
+    );
+    defer args.deinit();
+
+    try std.testing.expectEqual(@as(?[:0]const u8, null), args.executable_name);
+    try std.testing.expect(void == @TypeOf(args.verb));
+    try std.testing.expectEqual(@as(usize, 0), args.positionals.len);
+
+    try std.testing.expectEqualStrings("foobar", args.options.output.?);
+}
+
+test "option argument --" {
+    var titerator = TestIterator.init(&[_][:0]const u8{
+        "--output",
+        "--",
+    });
+
+    try std.testing.expectError(error.MissingArgument, parseInternal(
+        struct {
+            output: ?[:0]const u8 = null,
+        },
+        null,
+        &titerator,
+        std.testing.allocator,
+        .silent,
+    ));
 }

@@ -96,7 +96,7 @@ pub const Arguments = struct {
         .s = "secret-key",
     };
 
-    pub fn parse(gpa: mem.Allocator) !args.ParseArgsResult(Arguments) {
+    pub fn parse(gpa: mem.Allocator) !args.ParseArgsResult(Arguments, null) {
         return args.parseForCurrentProcess(Arguments, gpa, .print);
     }
 };

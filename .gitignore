@@ -6,3 +6,4 @@ rheia_bench
 
 *.php
 *.json
+*.nix

@@ -12,7 +12,7 @@ comptime {
     assert(@sizeOf(Node) == @sizeOf(u32));
 }
 
-pub const Data = *c_void;
+pub const Data = *anyopaque;
 
 /// (| Header (32-bit) | Data ([*]u8) | Data Padding ([*]u8) |) Compressed/Uncompressed Children (*Node or [*]*Node) | Key (Data) Pointer If Not Null ([*]const u8)
 ///
@@ -26,7 +26,7 @@ pub const Node = packed struct {
     size: u29,
 
     pub fn init(gpa: mem.Allocator, num_children: u29, holds_data: bool) !*Node {
-        var size: usize = mem.alignForward(@sizeOf(Node) + num_children, @alignOf(*c_void)) + @sizeOf(*Node) * num_children;
+        var size: usize = mem.alignForward(@sizeOf(Node) + num_children, @alignOf(*anyopaque)) + @sizeOf(*Node) * num_children;
         if (holds_data) size += @sizeOf(Data);
 
         const node = @ptrCast(*Node, (try gpa.alloc(u8, size)).ptr);
@@ -35,7 +35,7 @@ pub const Node = packed struct {
     }
 
     pub fn initCompressed(gpa: mem.Allocator, num_children: u29, holds_data: bool) !*Node {
-        var size: usize = mem.alignForward(@sizeOf(Node) + num_children, @alignOf(*c_void)) + @sizeOf(*Node);
+        var size: usize = mem.alignForward(@sizeOf(Node) + num_children, @alignOf(*anyopaque)) + @sizeOf(*Node);
         if (holds_data) size += @sizeOf(Data);
 
         const node = @ptrCast(*Node, (try gpa.alloc(u8, size)).ptr);
@@ -154,7 +154,7 @@ pub const Node = packed struct {
         // remove child ptr from parent's children
 
         // const shift: usize = if (mem.alignBackward(@sizeOf(Node) + self.size, @alignOf(*c_void)) == @sizeOf(Node) + self.size + 1) 1 else 0;
-        const shift: usize = if ((self.size + 4) % @sizeOf(*c_void) == 1) 1 else 0;
+        const shift: usize = if ((self.size + 4) % @sizeOf(*anyopaque) == 1) 1 else 0;
         if (shift != 0) {
             mem.copy(*Node, (parent_children.ptr - shift)[0 .. self.size - tail_len - 1], parent_children[0 .. self.size - tail_len - 1]);
         }
@@ -179,7 +179,7 @@ pub const Node = packed struct {
         child.* = try Node.init(gpa, 0, false);
         errdefer child.*.deinit(gpa);
 
-        var new_size = mem.alignForward(@sizeOf(Node) + node_path.len, @alignOf(*c_void)) + @sizeOf(*Node);
+        var new_size = mem.alignForward(@sizeOf(Node) + node_path.len, @alignOf(*anyopaque)) + @sizeOf(*Node);
         var maybe_data: ?Data = if (self.is_key and !self.is_null) self.data().* else null;
         if (maybe_data != null) new_size += @sizeOf(Data);
 
@@ -214,7 +214,7 @@ pub const Node = packed struct {
     }
 
     pub fn firstChild(self: *Node) [*]*Node {
-        return @intToPtr([*]*Node, mem.alignForward(@ptrToInt(self) + @sizeOf(Node) + self.size, @alignOf(*c_void)));
+        return @intToPtr([*]*Node, mem.alignForward(@ptrToInt(self) + @sizeOf(Node) + self.size, @alignOf(*anyopaque)));
     }
 
     pub fn lastChild(self: *Node) [*]*Node {
@@ -227,7 +227,7 @@ pub const Node = packed struct {
     }
 
     pub fn length(self: *Node) usize {
-        var result = mem.alignForward(@sizeOf(Node) + self.size, @alignOf(*c_void));
+        var result = mem.alignForward(@sizeOf(Node) + self.size, @alignOf(*anyopaque));
         if (self.is_compressed) {
             result += @sizeOf(*Node);
         } else {

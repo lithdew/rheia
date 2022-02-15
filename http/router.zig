@@ -11,34 +11,42 @@ const meta = std.meta;
 const Uri = @import("uri.zig").Uri;
 const Context = runtime.Context;
 
-pub const Route = struct {
-    method: http.Method,
-    path: []const u8,
-    handler: anytype,
-};
+pub fn Route(comptime Handler: type) type {
+    return struct {
+        method: http.Method,
+        path: []const u8,
+        handler: Handler,
+    };
+}
+
+// pub const Route = struct {
+//     method: http.Method,
+//     path: []const u8,
+//     handler: anytype,
+// };
 
 pub const Param = struct {
     key: []const u8,
     value: []const u8,
 };
 
-pub fn handle(comptime method: http.Method, comptime path: []const u8, comptime handler: anytype) Route {
+pub fn handle(comptime method: http.Method, comptime path: []const u8, comptime handler: anytype) Route(@TypeOf(handler)) {
     return .{ .method = method, .path = path, .handler = handler };
 }
 
-pub fn get(comptime path: []const u8, comptime handler: anytype) Route {
+pub fn get(comptime path: []const u8, comptime handler: anytype) Route(@TypeOf(handler)) {
     return handle(.get, path, handler);
 }
 
-pub fn post(comptime path: []const u8, comptime handler: anytype) Route {
+pub fn post(comptime path: []const u8, comptime handler: anytype) Route(@TypeOf(handler)) {
     return handle(.post, path, handler);
 }
 
-pub fn put(comptime path: []const u8, comptime handler: anytype) Route {
+pub fn put(comptime path: []const u8, comptime handler: anytype) Route(@TypeOf(handler)) {
     return handle(.put, path, handler);
 }
 
-pub fn delete(comptime path: []const u8, comptime handler: anytype) Route {
+pub fn delete(comptime path: []const u8, comptime handler: anytype) Route(@TypeOf(handler)) {
     return handle(.delete, path, handler);
 }
 

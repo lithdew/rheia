@@ -962,7 +962,7 @@ test "insert" {
 test "stress insert" {
     const tree_size: usize = 5000;
 
-    var tree: Tree(*c_void) = .{};
+    var tree: Tree(*anyopaque) = .{};
     defer tree.deinit(testing.allocator);
 
     var rng = std.rand.DefaultPrng.init(1);
@@ -976,7 +976,7 @@ test "stress insert" {
     }
 
     for (keys) |*key| {
-        _ = try tree.insert(testing.allocator, key, @intToPtr(*c_void, 0xdeadbeef));
+        _ = try tree.insert(testing.allocator, key, @intToPtr(*anyopaque, 0xdeadbeef));
     }
 
     try testing.expectEqual(tree_size, tree.size);
