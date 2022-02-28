@@ -273,8 +273,8 @@ pub fn run() !void {
     var http_listener_frame = async startHttpListener(&ctx, options, &node);
     defer await http_listener_frame catch |err| log.warn("http listener error: {}", .{err});
 
-    var stats_frame = async reportStatistics(&ctx);
-    defer await stats_frame catch |err| log.warn("stats error: {}", .{err});
+    // var stats_frame = async reportStatistics(&ctx);
+    // defer await stats_frame catch |err| log.warn("stats error: {}", .{err});
 
     for (options.bootstrap_addresses) |bootstrap_address| {
         const client = node.getOrCreateClient(&ctx, runtime.getAllocator(), bootstrap_address) catch |err| {
