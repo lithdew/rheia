@@ -1,8 +1,6 @@
 zig-cache/
+zig-out/
 .vscode/
-
-rheia
-rheia_bench
 
 *.php
 *.json

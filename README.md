@@ -56,9 +56,9 @@ $ git submodule update --init --recursive
 - Build rheia
 
 ```console
-$ zig build-exe main.zig zig-sqlite/c/sqlite3.c -I zig-sqlite/c --name rheia -lc -O ReleaseFast
+$ zig build -Drelease-fast
 
-$ ./rheia --help
+$ zig-out/bin/rheia --help
 rheia
 
 Usage:
@@ -89,9 +89,7 @@ To spawn and bootstrap a three-node Rheia cluster:
 Rheia comes with a benchmark tool which creates, signs, and submits no-op transactions to 127.0.0.1:9000.
 
 ```console
-$ zig build-exe bench.zig --name rheia_bench -lc -O ReleaseFast
-
-$ ./rheia_bench
+$ zig-out/bin/rheia_bench
 debug(main): public key: e29b474107bb2d19a8e4f3d0d6d0ccca54a0d8c21859761faa8d0913c375c26f
 debug(main): secret key: d2f1a365520ea9f3f57ee804ccdba9b159238d1a0efa5da0c6af2b2343737c1e
 info(main): sending transactions to 127.0.0.1:9000...

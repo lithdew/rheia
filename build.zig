@@ -4,8 +4,9 @@ pub fn build(b: *std.build.Builder) void {
     const target = b.standardTargetOptions(.{});
     const mode = b.standardReleaseOptions();
 
-    const exe = b.addExecutable("rheia", "main.zig");
-    for ([_]*std.build.LibExeObjStep{exe}) |step| {
+    const node = b.addExecutable("rheia", "main.zig");
+    const benchmark = b.addExecutable("rheia-bench", "bench.zig");
+    for ([_]*std.build.LibExeObjStep{ node, benchmark }) |step| {
         step.addCSourceFile("zig-sqlite/c/sqlite3.c", &.{});
         step.addIncludePath("zig-sqlite/c");
         step.linkLibC();
